@@ -5,6 +5,11 @@
 
 struct common_speculative;
 
+struct common_speculative_token_dist {
+    llama_tokens ids;
+    std::vector<float> probs;
+};
+
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 
@@ -55,6 +60,12 @@ struct common_speculative_draft_params {
 
     int32_t n_min = -1;
     float   p_min = -1.0f;
+
+    // optional sparse proposal distributions, one per draft token
+    std::vector<common_speculative_token_dist> * dists = nullptr;
+
+    float temperature = 0.0f;
+    uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -93,6 +104,20 @@ void common_speculative_shift_state(common_speculative * spec, llama_seq_id seq_
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
+
+// max number of draft tokens across all enabled speculative types
+int32_t common_speculative_n_max(const common_params_speculative * spec);
+
+// derive the draft context params from the base params
+common_params common_base_params_to_speculative(const common_params & params);
+
+struct common_speculative_output_limits {
+    int32_t total   = 0;
+    int32_t per_seq = 0;
+};
+
+common_speculative_output_limits common_speculative_get_output_limits(
+        int32_t n_batch, int32_t n_parallel, int32_t n_draft);
 
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
