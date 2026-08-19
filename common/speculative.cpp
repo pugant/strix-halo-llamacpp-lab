@@ -3083,6 +3083,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             // mode, ctx_dft in legacy mono mode), never on the external draft model
             common_speculative_config config_mtp(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params);
             config_mtp.params.draft.ctx_dft = ctx_dft_mtp;
+            // spec-route (spec §3.1 T4): in dual mode the global --spec-draft-n-max
+            // is sized on the largest drafter (7); the MTP arm runs at its production
+            // optimum instead. The ctor's chain_heads clamp does not apply to
+            // single-head nextn models (e.g. Qwen3.8), so clamp here - dual mode
+            // only, mono keeps honoring the requested value verbatim.
+            //
+            // dual_mtp_n_max: production-optimal MTP draft size for the dual
+            // configuration, measured on Qwen3.8-27B in the T7 A/B benchmarks
+            // (spec §1: "MTP n6", 19.6-21.0 tok/s on prose) - the value the dual
+            // boot marker of spec §6 reports as well.
+            constexpr int32_t dual_mtp_n_max = 6;
+            if (has_draft_dflash || has_draft_dspark || has_draft_eagle3) {
+                config_mtp.params.draft.n_max = std::min(config_mtp.params.draft.n_max, dual_mtp_n_max);
+            }
             configs.push_back(std::move(config_mtp));
         }
         if (has_draft_dflash) {

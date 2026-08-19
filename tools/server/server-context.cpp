@@ -1276,9 +1276,12 @@ private:
             const bool ext_loaded = spec_types_loaded.count(ext_requested) > 0;
 
             if (mtp_loaded && ext_loaded) {
+                // spec §6: the boot marker names the external drafter with its full
+                // type string ("draft-dflash"), unlike the short names used in the
+                // per-task lines and in the degraded warning below
                 SRV_INF("spec-route: dual mode active: draft-mtp (nextn, n_max=%d) + %s (%s, n_max=%d)\n",
                         common_speculative_n_max_type(spec.get(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP),
-                        server_slot::spec_route_short_name(ext_requested).c_str(),
+                        common_speculative_type_to_str(ext_requested).c_str(),
                         params_base.speculative.draft.mparams.path.c_str(),
                         common_speculative_n_max_type(spec.get(), ext_requested));
             } else {
