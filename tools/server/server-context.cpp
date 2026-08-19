@@ -735,6 +735,19 @@ private:
     // modes, where ctx_dft alone carries the (external or MTP) draft context.
     llama_context_ptr ctx_dft_mtp;
 
+    // spec-route (spec §3.1): promoted from load_model locals so the per-request
+    // routing can consume them. spec_dual = external drafter + in-target MTP both
+    // active; spec_dft_ext = any external-draft-model type (eagle3/dflash/dspark).
+    bool spec_dft_ext = false;
+    bool spec_dual    = false;
+
+    // spec-route: draft types that produced a drafting context on this server.
+    // spec_active_type is the single loaded type for non-dual servers (identity
+    // policy); NONE when zero or several implementations are loaded keeps the
+    // legacy no-routing behavior, so those servers stay byte-identical.
+    std::set<common_speculative_type> spec_types_loaded;
+    common_speculative_type spec_active_type = COMMON_SPECULATIVE_TYPE_NONE;
+
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
@@ -777,6 +790,12 @@ private:
         ctx_dft.reset();
         ctx_dft_mtp.reset();
         model_dft.reset();
+
+        // spec-route: no drafter is loaded while sleeping
+        spec_types_loaded.clear();
+        spec_active_type = COMMON_SPECULATIVE_TYPE_NONE;
+        spec_dft_ext     = false;
+        spec_dual        = false;
 
         llama_init.reset();
 
@@ -888,12 +907,13 @@ private:
                                            params_base.speculative.types.end(),
                                            COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
         // types that draft from the external draft model
-        const bool spec_dft_ext = spec_eagle3 || spec_dflash || spec_dspark;
+        // (spec-route: class members - the per-request routing consumes them)
+        spec_dft_ext = spec_eagle3 || spec_dflash || spec_dspark;
 
         // dual mode: an external draft model (e.g. DFlash) AND in-target MTP are
         // requested together - both draft contexts must exist: ctx_dft for the
         // external model, ctx_dft_mtp for the MTP context on the target model
-        const bool spec_dual = params_base.speculative.has_dft() && spec_mtp && spec_dft_ext;
+        spec_dual = params_base.speculative.has_dft() && spec_mtp && spec_dft_ext;
 
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
@@ -1096,6 +1116,22 @@ private:
             ctx_dft.reset();
             ctx_dft_mtp.reset();
         }
+
+        // spec-route: which drafters this server can route to - derived from the
+        // implementations the harness actually instantiated (reflecting the
+        // draft-simple auto-enable and any init failure), not from the request
+        // params. A concrete spec_active_type only when exactly one implementation
+        // is loaded - with several NONE keeps every implementation eligible to
+        // draft, i.e. the pre-routing behavior.
+        spec_types_loaded.clear();
+        if (spec) {
+            for (const auto t : common_speculative_types(spec.get())) {
+                spec_types_loaded.insert(t);
+            }
+        }
+        spec_active_type = spec_types_loaded.size() == 1
+            ? *spec_types_loaded.begin()
+            : COMMON_SPECULATIVE_TYPE_NONE;
 
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
@@ -1449,7 +1485,74 @@ private:
         return output;
     }
 
+    // spec-route (spec §3.1): short drafter name for error messages
+    // ("draft-dflash" -> "dflash", matching the "spec_drafter" body values)
+    static std::string spec_route_type_name(common_speculative_type type) {
+        std::string name = common_speculative_type_to_str(type);
+        if (name.rfind("draft-", 0) == 0) {
+            name = name.substr(strlen("draft-"));
+        }
+        return name;
+    }
+
+    // spec-route (spec §3.1): draft context of the active drafter - in dual mode
+    // MTP has its own context, every other configuration uses ctx_dft
+    llama_context * spec_route_ctx_dft(common_speculative_type drafter) const {
+        return (spec_dual && drafter == COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+            ? ctx_dft_mtp.get()
+            : ctx_dft.get();
+    }
+
+    // spec-route (spec §3.1): resolve the drafter for a task
+    // - dual mode: per-request selection - the body override or the tools signal
+    //   when that drafter is loaded, otherwise the conservative MTP default
+    // - any other server: the single active draft type (identity policy). NONE
+    //   when zero or several implementations are loaded keeps the legacy
+    //   no-routing behavior, so mono servers behave exactly as before.
+    common_speculative_type spec_route_resolve(const server_task & task) const {
+        if (!spec_dual) {
+            return spec_active_type;
+        }
+
+        // -1 is the "no selection" sentinel: the policy defaults below apply
+        const auto requested = (common_speculative_type) task.params.spec_drafter;
+
+        if (task.params.spec_drafter != -1 && spec_types_loaded.count(requested) > 0) {
+            return requested;
+        }
+
+        return COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // spec-route (spec §5): an explicit "spec_drafter" override must either be
+        // satisfied or rejected - never a silent fallback to another drafter
+        // (spec_drafter_is_override implies spec_drafter holds a concrete type)
+        if (task.params.spec_drafter_is_override) {
+            if (spec == nullptr) {
+                send_error(task, "spec_drafter requested but speculative decoding is not enabled", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+
+            const auto override_type = (common_speculative_type) task.params.spec_drafter;
+
+            if (spec_types_loaded.count(override_type) == 0) {
+                std::string active_str;
+                for (const auto t : spec_types_loaded) {
+                    if (!active_str.empty()) {
+                        active_str += "+";
+                    }
+                    active_str += spec_route_type_name(t);
+                }
+                if (active_str.empty()) {
+                    active_str = "none";
+                }
+
+                send_error(task, "drafter " + spec_route_type_name(override_type) + " not loaded; active: " + active_str, ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -1556,6 +1659,28 @@ private:
         } else {
             slot.smpl.reset();
         }
+
+        // spec-route: resolve and publish the per-task drafter BEFORE the prompt is
+        // decoded. common_speculative_process() gates the per-seq ingestion of the
+        // prompt batches by dp.drafter, and nothing resets the per-seq state between
+        // tasks on the same slot: a stale value left by the previous task would keep
+        // the non-matching drafter's context out of sync with the target for the
+        // whole task. The dp initializer in update_slots() re-asserts the same value
+        // at every new draft phase (constant within the task).
+        const common_speculative_type spec_drafter = spec_route_resolve(task);
+
+        if (spec != nullptr) {
+            common_speculative_get_draft_params(spec.get(), slot.id).drafter = spec_drafter;
+        }
+
+        // repoint the slot's draft context to the active drafter for the whole task:
+        // it orients the post-launch consumers (checkpoint restore, post-accept
+        // rollback/trim, idle prompt_save after release). This task's cache load
+        // already ran at slot selection with the previous pointer - on a drafter
+        // switch with cache hit the newly routed ctx only receives the salvaged
+        // tail (degraded drafts, correct output); per-drafter cache tagging starts
+        // with the entry this task saves.
+        slot.ctx_dft = spec_route_ctx_dft(spec_drafter);
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -2566,12 +2691,23 @@ private:
 
                         const auto & sd = slot.task->params.speculative.draft;
 
+                        // spec-route: re-assert the per-task drafter. The primary write
+                        // happens at launch (launch_slot_with_task), before the prompt is
+                        // decoded, because common_speculative_process() gates the per-seq
+                        // prompt ingestion by this field; this redundancy re-resolves the
+                        // same task-constant value at every new draft phase in case any
+                        // path touched the per-seq state in between (set_state does not
+                        // reset `drafter`, see the Task 1 note).
+                        const common_speculative_type spec_drafter = spec_route_resolve(*slot.task);
+
+                        // idem for the slot's draft-context repoint (see launch)
+                        slot.ctx_dft = spec_route_ctx_dft(spec_drafter);
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             // note: this list is positional - keep the order in sync with
-                            // common_speculative_draft_params. No per-seq drafter selection
-                            // here: NONE keeps every implementation eligible to draft.
-                            /* .drafter  = */ COMMON_SPECULATIVE_TYPE_NONE,
+                            // common_speculative_draft_params
+                            /* .drafter  = */ spec_drafter,
                             /* .n_max    = */ std::min(n_draft_max, sd.n_max),
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             // M-RoPE-aware position for the draft-mtp boundary and

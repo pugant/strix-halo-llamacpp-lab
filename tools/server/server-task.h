@@ -75,6 +75,23 @@ struct task_params {
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 
+    // spec-route: per-request drafter selection (spec §3.1 T5)
+    // -1 = no override and no tools signal: the server routing policy applies
+    // (mono: identity; dual: default MTP). Otherwise a resolved
+    // COMMON_SPECULATIVE_TYPE_DRAFT_* - either the explicit "spec_drafter" body
+    // override or the tools/tool_choice signal policy (-> DFLASH).
+    int spec_drafter = -1;
+
+    // spec-route: true only when spec_drafter came from a valid explicit
+    // "spec_drafter" body override - gates the no-silent-fallback rejection
+    // (spec §5). The tools-signal policy never sets it.
+    bool spec_drafter_is_override = false;
+
+    // spec-route: why spec_drafter got its value - "tools" (policy signal),
+    // "none" (no signal) or "override:<val>" (explicit body override).
+    // Purely diagnostic: consumed by logging only, never by control flow.
+    std::string spec_drafter_signal;
+
     // response formatting
     bool               verbose  = false;
     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;

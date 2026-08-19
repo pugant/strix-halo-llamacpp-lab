@@ -3180,6 +3180,19 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     return spec->dparams[seq_id];
 }
 
+std::vector<common_speculative_type> common_speculative_types(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return {};
+    }
+
+    std::vector<common_speculative_type> types;
+    types.reserve(spec->impls.size());
+    for (const auto & impl : spec->impls) {
+        types.push_back(impl->type);
+    }
+    return types;
+}
+
 static bool common_speculative_routing_active(const common_speculative_draft_params_vec & dparams) {
     return std::any_of(dparams.begin(), dparams.end(),
             [](const common_speculative_draft_params & dp) {

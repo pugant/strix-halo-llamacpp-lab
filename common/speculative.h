@@ -76,6 +76,11 @@ struct common_speculative_draft_params {
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
+// types of the implementations instantiated for this context, in priority order
+// (spec-route: the per-request routing validates against these, not against the
+// request params - the harness may auto-enable types or skip failed ones)
+std::vector<enum common_speculative_type> common_speculative_types(const common_speculative * spec);
+
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 

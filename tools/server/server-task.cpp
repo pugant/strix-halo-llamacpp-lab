@@ -321,6 +321,60 @@ task_params server_task::params_from_json_cmpl(
     params.speculative.draft.n_min = std::max(params.speculative.draft.n_min, 0);
     params.speculative.draft.n_max = std::max(params.speculative.draft.n_max, 0);
 
+    // spec-route: per-request drafter selection (spec §3.1 T5)
+    // policy: tools/tool_choice non-empty -> DFLASH; default -> MTP (conservative)
+    // override: body "spec_drafter" in {"mtp", "dflash", "auto"}; auto == absent
+    {
+        // strict type check: a non-string or empty "spec_drafter" must be rejected,
+        // not silently treated as absent (json_value would fall back to the default)
+        if (data.contains("spec_drafter")) {
+            const json & spec_drafter_body = data.at("spec_drafter");
+            if (!spec_drafter_body.is_string() || spec_drafter_body.get<std::string>().empty()) {
+                throw std::runtime_error("spec_drafter must be one of: mtp, dflash, auto");
+            }
+        }
+
+        const std::string spec_drafter_str = json_value(data, "spec_drafter", std::string());
+
+        if (!spec_drafter_str.empty()) {
+            if (spec_drafter_str == "mtp") {
+                params.spec_drafter            = COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+                params.spec_drafter_is_override = true;
+                params.spec_drafter_signal     = "override:mtp";
+            } else if (spec_drafter_str == "dflash") {
+                params.spec_drafter            = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+                params.spec_drafter_is_override = true;
+                params.spec_drafter_signal     = "override:dflash";
+            } else if (spec_drafter_str != "auto") {
+                throw std::runtime_error("spec_drafter must be one of: mtp, dflash, auto");
+            }
+        }
+
+        if (params.spec_drafter == -1) {
+            // override absent or "auto": resolve the tools signal here, while the
+            // chat body is available - non-chat bodies carry no signal and stay -1
+            bool spec_tools_signal = false;
+
+            if (data.contains("tools") && data.at("tools").is_array() && !data.at("tools").empty()) {
+                spec_tools_signal = true;
+            }
+
+            if (data.contains("tool_choice")) {
+                const json & tool_choice = data.at("tool_choice");
+                if (!tool_choice.is_null() && !(tool_choice.is_string() && tool_choice == "none")) {
+                    spec_tools_signal = true;
+                }
+            }
+
+            if (spec_tools_signal) {
+                params.spec_drafter        = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+                params.spec_drafter_signal = "tools";
+            } else {
+                params.spec_drafter_signal = "none";
+            }
+        }
+    }
+
     // TODO: to keep things simple, we disable further speculative parameter adjustments for now
 #if 0
     // for debugging and research purposes
