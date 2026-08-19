@@ -36,6 +36,12 @@ struct common_speculative_draft_params {
     // at the end of the draft() call, all drafting flags will be reset to false
     bool drafting = false;
 
+    // per-seq active drafter for request routing:
+    // NONE = no routing (mono mode) - every implementation may draft the sequence, as before;
+    // otherwise only the implementation matching this type drafts the sequence.
+    // note: the routing only gates draft() - see the note in common_speculative_process()
+    common_speculative_type drafter = COMMON_SPECULATIVE_TYPE_NONE;
+
     // overrides individual configurations (-1 disabled)
     // can be used to constraint the max draft based on the remaining context size
     int32_t n_max = -1;

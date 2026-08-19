@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <numeric> // std::iota
 #include <random>
 #include <stdexcept>
 
@@ -155,6 +156,17 @@ struct common_speculative_impl {
     const common_speculative_type type;
 
     uint32_t n_seq;
+
+    // per-seq drafter routing (nullptr = no routing active): points at the owner's
+    // per-seq draft params, indexed by seq_id, and is set by common_speculative_begin()
+    // / common_speculative_process() right before the call - not set for draft(),
+    // which is routed via the `drafting` stash in common_speculative_draft(). The
+    // vector is never resized after the ctor and the use sites index it with
+    // seq_id < n_seq as guaranteed by their asserts. Implementations that
+    // mirror the target batch into their own draft context (DFlash/DSpark) use it to
+    // skip the sequences drafted by another implementation; the others (e.g. MTP)
+    // must ignore it and always observe every sequence.
+    const common_speculative_draft_params_vec * dparams_routing = nullptr;
 
     size_t n_call_begin  = 0; // number of times this implementation was called for refresh.
     size_t n_call_draft  = 0; // number of times this implementation was called for generation.
@@ -1157,6 +1169,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_reset[seq_id] = true;
 
+        if (dparams_routing != nullptr) {
+            const common_speculative_type drafter = (*dparams_routing)[seq_id].drafter;
+            if (drafter != COMMON_SPECULATIVE_TYPE_NONE && drafter != type) {
+                // this sequence is drafted by another implementation and never
+                // advances in this context - the pos_max check below would always trip
+                return;
+            }
+        }
+
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
@@ -1181,25 +1202,59 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // indices, within each chunk, of the tokens this implementation ingests:
+        // with per-seq drafter routing active, only the sequences routed here (or
+        // unrouted) advance in this external draft context - the others are drafted
+        // by another implementation. Without routing the mapping is the identity,
+        // i.e. the pre-routing behavior.
+        std::vector<int32_t> sel;
+
         // Flatten token-wise encoder work into shared chunks while preserving each row's position and sequence.
         for (int32_t offset = 0; offset < n_tokens; offset += n_ubatch) {
             const int32_t n_chunk = std::min(n_ubatch, n_tokens - offset);
-            features_buf.resize((size_t) n_chunk * n_embd_enc);
+
+            sel.clear();
+            if (dparams_routing == nullptr) {
+                sel.resize(n_chunk);
+                std::iota(sel.begin(), sel.end(), 0);
+            } else {
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    const int32_t j = offset + i;
+                    GGML_ASSERT(batch_in.n_seq_id[j] == 1);
+                    const llama_seq_id seq_id = batch_in.seq_id[j][0];
+                    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
+                    const common_speculative_type drafter = (*dparams_routing)[seq_id].drafter;
+                    if (drafter == COMMON_SPECULATIVE_TYPE_NONE || drafter == type) {
+                        sel.push_back(i);
+                    }
+                }
+            }
+
+            if (sel.empty()) {
+                // no sequence of this chunk is drafted by this implementation
+                continue;
+            }
+
+            const int32_t n_sel = (int32_t) sel.size();
+
+            // note: the compaction below is always between distinct buffers
+            // (features_buf vs the target embedding buffer), so memcpy is safe
+            features_buf.resize((size_t) n_sel * n_embd_enc);
             for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                 const int32_t layer_id = target_layer_ids_adjusted[k];
                 const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) layer_id);
                 if (!layer) {
                     GGML_ABORT("DFlash: target layer %d input not extracted.", layer_id);
                 }
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                    const float * src = layer + (size_t) (offset + i) * n_embd_tgt;
+                for (int32_t s = 0; s < n_sel; ++s) {
+                    float       * dst = features_buf.data() + (size_t) s * n_embd_enc + k * (size_t) n_embd_tgt;
+                    const float * src = layer + (size_t) (offset + sel[s]) * n_embd_tgt;
                     std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                 }
             }
 
             llama_batch enc_batch = {
-                /*.n_tokens =*/ n_chunk,
+                /*.n_tokens =*/ n_sel,
                 /*.token    =*/ nullptr,
                 /*.embd     =*/ features_buf.data(),
                 /*.pos      =*/ nullptr,
@@ -1211,30 +1266,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             int32_t rc = llama_encode(ctx_dft, enc_batch);
             if (rc != 0) {
                 LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                        __func__, rc, (int) n_chunk, (int) offset);
+                        __func__, rc, (int) n_sel, (int) offset);
                 return false;
             }
 
             const float * inp_g = llama_get_embeddings_pre_norm(ctx_dft);
             GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
-            batch_inject.n_tokens = n_chunk;
-            std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
-            for (int32_t i = 0; i < n_chunk; ++i) {
-                const int32_t j = offset + i;
+            batch_inject.n_tokens = n_sel;
+            std::memcpy(batch_inject.embd, inp_g, (size_t) n_sel * n_embd_dec * sizeof(float));
+            for (int32_t s = 0; s < n_sel; ++s) {
+                const int32_t j = offset + sel[s];
                 GGML_ASSERT(batch_in.n_seq_id[j] == 1);
                 const llama_seq_id seq_id = batch_in.seq_id[j][0];
                 GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
-                batch_inject.pos[i]       = batch_in.pos[j];
-                batch_inject.n_seq_id[i]  = 1;
-                batch_inject.seq_id[i][0] = seq_id;
-                batch_inject.logits[i]    = false;
+                batch_inject.pos[s]       = batch_in.pos[j];
+                batch_inject.n_seq_id[s]  = 1;
+                batch_inject.seq_id[s][0] = seq_id;
+                batch_inject.logits[s]    = false;
             }
 
             rc = llama_decode(ctx_dft, batch_inject);
             if (rc != 0) {
                 LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                        __func__, rc, (int) n_chunk, (int) offset);
+                        __func__, rc, (int) n_sel, (int) offset);
                 return false;
             }
             // The server may switch contexts before the next draft decode.
@@ -2946,9 +3001,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
         bool has_draft_model_path = !params.draft.mparams.path.empty();
 
+        // dual mode: the MTP implementation runs on its own context (on the target
+        // model), while ctx_dft stays bound to the external draft model (e.g. DFlash);
+        // in legacy mono-MTP mode ctx_dft_mtp is not set and ctx_dft is used instead
+        llama_context * ctx_dft_mtp = params.draft.ctx_dft_mtp != nullptr ? params.draft.ctx_dft_mtp : params.draft.ctx_dft;
+
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3)) && params.draft.ctx_dft != nullptr;
-        bool has_draft_mtp    = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP))    && params.draft.ctx_dft != nullptr;
+        bool has_draft_mtp    = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP))    && ctx_dft_mtp != nullptr;
         bool has_draft_dflash = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) && params.draft.ctx_dft != nullptr;
         bool has_draft_dspark = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) && params.draft.ctx_dft != nullptr;
 
@@ -2999,7 +3059,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params));
         }
         if (has_draft_mtp) {
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
+            // the MTP implementation always runs on the MTP context (its own in dual
+            // mode, ctx_dft in legacy mono mode), never on the external draft model
+            common_speculative_config config_mtp(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params);
+            config_mtp.params.draft.ctx_dft = ctx_dft_mtp;
+            configs.push_back(std::move(config_mtp));
         }
         if (has_draft_dflash) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params));
@@ -3116,12 +3180,23 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     return spec->dparams[seq_id];
 }
 
+static bool common_speculative_routing_active(const common_speculative_draft_params_vec & dparams) {
+    return std::any_of(dparams.begin(), dparams.end(),
+            [](const common_speculative_draft_params & dp) {
+                return dp.drafter != COMMON_SPECULATIVE_TYPE_NONE;
+            });
+}
+
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {
     if (spec == nullptr) {
         return;
     }
 
+    const bool routing_active = common_speculative_routing_active(spec->dparams);
+
     for (auto & impl : spec->impls) {
+        impl->dparams_routing = routing_active ? &spec->dparams : nullptr;
+
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
@@ -3135,7 +3210,18 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
         return result;
     }
 
+    // per-seq drafter routing (see common_speculative_draft_params::drafter): while
+    // active, the implementations that mirror the target batch into their own draft
+    // context (DFlash/DSpark) skip the sequences drafted by another implementation.
+    // note: MTP's process() must observe every sequence of the batch, including the
+    // ones routed to another drafter: it captures the per-seq boundary that the
+    // server relies on when saving the prompt cache - gating it per-seq would
+    // silently drop cache entries for the routed-away sequences
+    const bool routing_active = common_speculative_routing_active(spec->dparams);
+
     for (auto & impl : spec->impls) {
+        impl->dparams_routing = routing_active ? &spec->dparams : nullptr;
+
         result = result && impl->process(batch);
     }
 
@@ -3194,10 +3280,48 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        // per-seq drafter routing (see common_speculative_draft_params::drafter):
+        // a sequence with an active drafter is drafted only by the matching
+        // implementation. The `drafting` flag is the only per-seq input that the
+        // implementations consume, so the routing is applied by stashing the flag
+        // of the sequences owned by another implementation for the duration of the
+        // call and restoring it right after - the chaining logic below operates on
+        // the true flags and is unaffected. With no routing (NONE on every seq)
+        // the behavior is identical to before.
+        int n_drafting_impl = 0;
+        std::vector<llama_seq_id> seq_routed;
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+            auto & dp = dparams[seq_id];
+
+            if (!dp.drafting) {
+                continue;
+            }
+
+            if (dp.drafter == COMMON_SPECULATIVE_TYPE_NONE || dp.drafter == impl->type) {
+                n_drafting_impl++;
+            } else {
+                seq_routed.push_back(seq_id);
+            }
+        }
+
+        if (n_drafting_impl == 0) {
+            // every drafting sequence is routed to another implementation
+            continue;
+        }
+
+        for (const llama_seq_id seq_id : seq_routed) {
+            dparams[seq_id].drafting = false;
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
             impl->n_call_draft++;
+        }
+
+        for (const llama_seq_id seq_id : seq_routed) {
+            dparams[seq_id].drafting = true;
         }
 
         int n_drafting = 0;
