@@ -731,6 +731,10 @@ private:
     llama_model_ptr model_dft;
     llama_context_ptr ctx_dft;
 
+    // dual mode: MTP context on the target model (nextn layers). Null in mono
+    // modes, where ctx_dft alone carries the (external or MTP) draft context.
+    llama_context_ptr ctx_dft_mtp;
+
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
@@ -771,6 +775,7 @@ private:
     void destroy() {
         spec.reset();
         ctx_dft.reset();
+        ctx_dft_mtp.reset();
         model_dft.reset();
 
         llama_init.reset();
@@ -869,6 +874,27 @@ private:
             }
         }
 
+        // requested speculative draft types (decide which draft contexts to create)
+        const bool spec_mtp    = std::find(params_base.speculative.types.begin(),
+                                            params_base.speculative.types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        const bool spec_eagle3 = std::find(params_base.speculative.types.begin(),
+                                           params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params_base.speculative.types.end();
+        const bool spec_dflash = std::find(params_base.speculative.types.begin(),
+                                           params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
+        const bool spec_dspark = std::find(params_base.speculative.types.begin(),
+                                           params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
+        // types that draft from the external draft model
+        const bool spec_dft_ext = spec_eagle3 || spec_dflash || spec_dspark;
+
+        // dual mode: an external draft model (e.g. DFlash) AND in-target MTP are
+        // requested together - both draft contexts must exist: ctx_dft for the
+        // external model, ctx_dft_mtp for the MTP context on the target model
+        const bool spec_dual = params_base.speculative.has_dft() && spec_mtp && spec_dft_ext;
+
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
             const auto & params_spec = params_base.speculative.draft;
@@ -900,26 +926,17 @@ private:
 
             auto cparams = common_context_params_to_llama(params_dft);
 
-            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                            params_base.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-            const bool spec_eagle3 = std::find(params_base.speculative.types.begin(),
-                                               params_base.speculative.types.end(),
-                                               COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params_base.speculative.types.end();
-            const bool spec_dflash = std::find(params_base.speculative.types.begin(),
-                                               params_base.speculative.types.end(),
-                                               COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
-            const bool spec_dspark = std::find(params_base.speculative.types.begin(),
-                                               params_base.speculative.types.end(),
-                                               COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
-            if (spec_mtp) {
+            if (spec_mtp && !spec_dft_ext) {
                 // NOTE: do NOT set ctx_other = ctx_tgt for a separate-model MTP draft.
                 // MTP reads the target's pre-norm hidden states via ctx_tgt directly
                 // (see speculative.cpp). Setting ctx_other here would make the draft
                 // ctor mis-detect is_mem_shared (gemma4-style shared KV) and disable
                 // chain_heads for multi-head Step MTP3 drafts, breaking draft KV resets.
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-            } else if (spec_eagle3 || spec_dflash || spec_dspark) {
+            } else if (spec_dft_ext) {
+                // external draft model (eagle3 / dflash / dspark). In dual mode the
+                // external model is not the MTP drafter - the MTP context lives on
+                // the target model and is created separately below.
                 cparams.ctx_other = ctx_tgt;
             }
 
@@ -932,12 +949,15 @@ private:
                 return false;
             }
 
-            ctx_dft_seq_rm_type = spec_mtp ? COMMON_CONTEXT_SEQ_RM_TYPE_NO : common_context_can_seq_rm(ctx_dft.get());
+            ctx_dft_seq_rm_type = (spec_mtp && !spec_dft_ext) ? COMMON_CONTEXT_SEQ_RM_TYPE_NO : common_context_can_seq_rm(ctx_dft.get());
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
-        } else if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
-                             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) {
+        }
+
+        // dual mode (external draft model + in-target MTP), or legacy mono-MTP
+        // (no external draft model): create the MTP context against the target model
+        if (spec_dual || (!params_base.speculative.has_dft() && spec_mtp)) {
             SRV_INF("creating MTP draft context against the target model '%s'\n",
                     params_base.model.path.c_str());
 
@@ -948,16 +968,29 @@ private:
             cparams_mtp.type_v   = params_base.speculative.draft.cache_type_v;
             cparams_mtp.n_rs_seq = 0;
 
-            ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
-            if (ctx_dft == nullptr) {
-                SRV_ERR("%s", "failed to create MTP context\n");
-                return false;
+            if (spec_dual) {
+                // dual mode: the MTP context has its own owner, ctx_dft stays bound
+                // to the external draft model
+                ctx_dft_mtp.reset(llama_init_from_model(model_tgt, cparams_mtp));
+                if (ctx_dft_mtp == nullptr) {
+                    SRV_ERR("%s", "failed to create MTP context\n");
+                    return false;
+                }
+
+                params_base.speculative.draft.ctx_tgt    = ctx_tgt;
+                params_base.speculative.draft.ctx_dft_mtp = ctx_dft_mtp.get();
+            } else {
+                ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
+                if (ctx_dft == nullptr) {
+                    SRV_ERR("%s", "failed to create MTP context\n");
+                    return false;
+                }
+
+                ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = ctx_dft.get();
             }
-
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
-
-            params_base.speculative.draft.ctx_tgt = ctx_tgt;
-            params_base.speculative.draft.ctx_dft = ctx_dft.get();
         }
 
         std::string & mmproj_path = params_base.mmproj.path;
@@ -1061,6 +1094,7 @@ private:
             SRV_INF("%s", "speculative decoding context initialized\n");
         } else {
             ctx_dft.reset();
+            ctx_dft_mtp.reset();
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -2592,6 +2626,14 @@ private:
                     slot.spec_i_batch.clear();
                     draft.clear();
                 }
+            }
+
+            // dual mode: trim the MTP context past the accepted boundary as well -
+            // stale rows beyond it must not survive a future drafter switch (position
+            // collisions). In mono-MTP mode ctx_dft is the MTP context and is already
+            // trimmed above, so this only covers the dual mode.
+            if (ctx_dft_mtp) {
+                common_context_seq_rm(ctx_dft_mtp.get(), slot.id, ckpt.pos_max + 1, -1);
             }
 
             if (!draft.empty()) {
