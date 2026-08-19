@@ -2534,6 +2534,10 @@ private:
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
+                            // note: this list is positional - keep the order in sync with
+                            // common_speculative_draft_params. No per-seq drafter selection
+                            // here: NONE keeps every implementation eligible to draft.
+                            /* .drafter  = */ COMMON_SPECULATIVE_TYPE_NONE,
                             /* .n_max    = */ std::min(n_draft_max, sd.n_max),
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             // M-RoPE-aware position for the draft-mtp boundary and

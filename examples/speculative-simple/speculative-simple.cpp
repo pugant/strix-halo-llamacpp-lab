@@ -183,6 +183,10 @@ int main(int argc, char ** argv) {
             // generate a new draft
             common_speculative_get_draft_params(spec, seq_id) = {
                 /* .drafting   = */ true,
+                // note: this list is positional - keep the order in sync with
+                // common_speculative_draft_params. No per-seq drafter selection
+                // here: NONE keeps every implementation eligible to draft.
+                /* .drafter    = */ COMMON_SPECULATIVE_TYPE_NONE,
                 /* .n_max      = */ -1,
                 /* .n_past     = */ n_past,
                 /* .pos_next   = */ n_past, // no M-RoPE media here: position == token count
