@@ -213,6 +213,10 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_pre_norm() const { return false; }
+
+    // spec-route: effective (post-clamp) max draft size this implementation will
+    // use (its own clamped params copy); -1 = no draft-size notion
+    virtual int32_t draft_n_max() const { return -1; }
 };
 
 static void common_speculative_batch_add_one_seq(
@@ -444,6 +448,10 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
     bool need_embd() const override {
         return false;
+    }
+
+    int32_t draft_n_max() const override {
+        return std::max(0, params.n_max);
     }
 };
 
@@ -991,6 +999,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     bool need_embd() const override {
         return false;
     }
+
+    int32_t draft_n_max() const override {
+        return std::max(0, params.n_max);
+    }
 };
 
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
@@ -1480,6 +1492,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool need_embd() const override {
         return false;
+    }
+
+    int32_t draft_n_max() const override {
+        return std::max(0, params.n_max);
     }
 };
 
@@ -2383,6 +2399,10 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     bool need_embd_pre_norm() const override {
         return true;
     }
+
+    int32_t draft_n_max() const override {
+        return std::max(0, params.n_max);
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -3191,6 +3211,20 @@ std::vector<common_speculative_type> common_speculative_types(const common_specu
         types.push_back(impl->type);
     }
     return types;
+}
+
+int32_t common_speculative_n_max_type(const common_speculative * spec, common_speculative_type type) {
+    if (spec == nullptr) {
+        return -1;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (impl->type == type) {
+            return impl->draft_n_max();
+        }
+    }
+
+    return -1;
 }
 
 static bool common_speculative_routing_active(const common_speculative_draft_params_vec & dparams) {

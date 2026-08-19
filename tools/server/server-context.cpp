@@ -61,7 +61,19 @@ struct server_slot {
     int id;
 
     llama_context * ctx_tgt = nullptr;
+    // draft context of the ACTIVE drafter - repointed at task launch (dual mode
+    // keeps one draft context per drafter: the external model's ctx_dft and the
+    // in-target MTP ctx_dft_mtp)
     llama_context * ctx_dft = nullptr;
+    // spec-route: the other dual-mode draft context (null outside dual mode) -
+    // hygiene operations (prompt_clear, boundary trims) must cover it too, or
+    // stale rows would survive a drafter switch
+    llama_context * ctx_dft_other = nullptr;
+
+    // spec-route: drafter this slot's current state was produced with (one task =
+    // one drafter; set at launch). Tags prompt-cache saves/checkpoints and
+    // orients their restores. NONE = no routing information (legacy behavior).
+    common_speculative_type spec_drafter_active = COMMON_SPECULATIVE_TYPE_NONE;
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -128,6 +140,17 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // spec-route: short drafter name for logs/counters ("draft-dflash" -> "dflash",
+    // matching the "spec_drafter" body values; common_speculative_type_to_str
+    // never returns an empty string)
+    static std::string spec_route_short_name(common_speculative_type type) {
+        std::string name = common_speculative_type_to_str(type);
+        if (name.rfind("draft-", 0) == 0) {
+            name = name.substr(strlen("draft-"));
+        }
+        return name;
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -143,6 +166,12 @@ struct server_slot {
         SRV_WRN(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        // spec-route (spec §4.2): the "required speculative state unavailable" gate
+        // below must not trip for DFlash-routed sequences on a dual server - the MTP
+        // implementation still observes every sequence (its process() is ungated,
+        // exactly so this stateful blob stays available), so get_state() succeeds
+        // regardless of the routing. The blob rides along on DFlash-tagged entries
+        // as dead weight (~KB); entries are NOT cleaned (spec §4.1 note).
         std::vector<uint8_t> state_spec;
         const bool spec_state_required = common_speculative_state_required(spec);
         const bool have_spec_state = common_speculative_get_state(spec, id, state_spec);
@@ -151,16 +180,58 @@ struct server_slot {
             return false;
         }
 
-        return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id, state_spec);
+        // spec-route (spec §4.1): save the KV of the drafter that produced this
+        // state (ctx_dft points at it since the task launch) and tag the entry
+        // with it - the bytes are only restorable into that drafter's context
+        return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id, state_spec, spec_drafter_active);
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, bool spec_trailing_rm) {
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, bool spec_trailing_rm,
+            std::string * rebuild_kind = nullptr) {
         const bool spec_state_required = common_speculative_state_required(spec);
         bool cache_hit = false;
         uint64_t disk_entry_id = 0;
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec_state_required, spec_trailing_rm, &cache_hit, &disk_entry_id);
+        bool tag_mismatch = false;
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec_state_required, spec_trailing_rm,
+                &cache_hit, &disk_entry_id, spec_drafter_active, &tag_mismatch);
         if (res && cache_hit) {
-            if (spec_state_required && prompt.data.spec.empty()) {
+            if (tag_mismatch) {
+                // spec-route (spec §4.1-4.3): the entry's draft/spec payload belongs to
+                // another drafter. The target KV was restored; the active drafter's own
+                // context keeps whatever valid prefix it has and rebuilds from there as
+                // the delta tokens are processed - there is NO re-encode of the restored
+                // prefix (the implementations only ever see the delta batches), so the
+                // honest kind reports what is actually missing/resyncing:
+                //  - mtp-resync: the stateful MTP impl (whose process() is ungated and
+                //    therefore usually already in sync) does not get its blob restored
+                //    and resyncs as the new batches arrive
+                //  - dflash-prefix-miss: the external draft context may lack P tokens of
+                //    the restored prefix - its drafts condition on a shorter history
+                //    (degraded drafts, correct output)
+                if (spec_drafter_active == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                    SLT_INF(*this, "spec-route: cache tag mismatch (entry=%s, active=mtp) seq %d: target restored, draft rebuild=mtp-resync\n",
+                            spec_route_short_name(prompt.drafter).c_str(), id);
+                    if (rebuild_kind != nullptr) {
+                        *rebuild_kind = "mtp-resync";
+                    }
+                } else {
+                    const llama_pos pos_max_dft = ctx_dft
+                        ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id)
+                        : -1;
+                    const int n_missing = std::max(0, (int) prompt.tokens.pos_next() - (int) (pos_max_dft + 1));
+                    const std::string kind = spec_route_short_name(spec_drafter_active) + "-prefix-miss";
+
+                    SLT_INF(*this, "spec-route: cache tag mismatch (entry=%s, active=%s) seq %d: target restored, draft rebuild=%s (%d tok)\n",
+                            spec_route_short_name(prompt.drafter).c_str(),
+                            spec_route_short_name(spec_drafter_active).c_str(), id, kind.c_str(), n_missing);
+                    if (rebuild_kind != nullptr) {
+                        *rebuild_kind = kind;
+                    }
+                }
+            } else if (spec_state_required && prompt.data.spec.empty()) {
+                // spec-route (spec §4.2): the full-cold rejection is now restricted to
+                // a genuine target/spec boundary problem - a drafter mismatch above
+                // no longer fails the load (target restored + draft rebuild)
                 SLT_WRN(*this, "%s", "failed to load required speculative state from prompt cache\n");
                 res = false;
             } else if (!prompt.data.spec.empty() && !common_speculative_set_state(spec, id, prompt.data.spec)) {
@@ -195,6 +266,13 @@ struct server_slot {
         common_context_seq_rm(ctx_tgt, id, -1, -1);
         if (ctx_dft) {
             common_context_seq_rm(ctx_dft, id, -1, -1);
+        }
+        // spec-route dual mode: the inactive draft context's rows must not survive
+        // a task change either (they would collide with the next routing of this
+        // slot's sequence). In mono modes ctx_dft_other is null and ctx_dft above
+        // already cleared the only draft context.
+        if (ctx_dft_other && ctx_dft_other != ctx_dft) {
+            common_context_seq_rm(ctx_dft_other, id, -1, -1);
         }
         common_speculative_set_state(spec, id, {});
 
@@ -640,8 +718,27 @@ struct server_metrics {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    // spec-route (spec §6): routing counters, exported on /metrics as
+    // spec_route_requests_total{drafter}, spec_route_override_total and
+    // spec_route_cache_rebuild_total{kind} (label maps, absent labels not sent)
+    std::map<std::string, uint64_t> spec_route_requests       = {};
+    std::map<std::string, uint64_t> spec_route_cache_rebuilds = {};
+    uint64_t spec_route_overrides_total = 0;
+
     void init() {
         t_start = ggml_time_us();
+    }
+
+    void on_spec_route_request(common_speculative_type drafter) {
+        spec_route_requests[server_slot::spec_route_short_name(drafter)]++;
+    }
+
+    void on_spec_route_override() {
+        spec_route_overrides_total++;
+    }
+
+    void on_spec_route_cache_rebuild(const std::string & kind) {
+        spec_route_cache_rebuilds[kind]++;
     }
 
     void on_prompt_eval(const server_slot & slot) {
@@ -915,6 +1012,13 @@ private:
         // external model, ctx_dft_mtp for the MTP context on the target model
         spec_dual = params_base.speculative.has_dft() && spec_mtp && spec_dft_ext;
 
+        // spec-route (spec §5): boot fallback - when the external draft model cannot
+        // be loaded (missing/corrupt file) and draft-dflash is the only type that
+        // needs it, drop the type instead of aborting the server: the remaining
+        // drafters continue (the dual mtp+dflash configuration degrades to mono
+        // MTP-nextn). Any other configuration keeps the hard error.
+        bool spec_dft_dropped = false;
+
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
             const auto & params_spec = params_base.speculative.draft;
@@ -940,39 +1044,63 @@ private:
 
             model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
             if (model_dft == nullptr) {
-                SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
-                return false;
+                if (spec_dflash && !spec_eagle3 && !spec_dspark) {
+                    SRV_WRN("spec-route: draft model load failed, dropping draft-dflash, continuing mono (WARNING), path='%s'\n",
+                            params_dft.model.path.c_str());
+
+                    // remove the type, then recompute the routing flags that were
+                    // derived from the requested types above: after the drop no
+                    // external-draft type remains, so the server is not dual and the
+                    // MTP-context block below takes the legacy mono-MTP path (the
+                    // speculative impls are instantiated later from the updated
+                    // types, so spec_types_loaded/spec_active_type follow for free)
+                    auto & spec_types = params_base.speculative.types;
+                    spec_types.erase(std::remove(spec_types.begin(), spec_types.end(),
+                                COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH), spec_types.end());
+                    params_base.speculative.draft.mparams.path.clear();
+                    params_base.speculative.draft.mparams.hf_repo.clear();
+
+                    spec_dft_ext = false;
+                    spec_dual    = false;
+
+                    spec_dft_dropped = true;
+                } else {
+                    SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
+                    return false;
+                }
             }
 
-            auto cparams = common_context_params_to_llama(params_dft);
+            if (!spec_dft_dropped) {
+                auto cparams = common_context_params_to_llama(params_dft);
 
-            if (spec_mtp && !spec_dft_ext) {
-                // NOTE: do NOT set ctx_other = ctx_tgt for a separate-model MTP draft.
-                // MTP reads the target's pre-norm hidden states via ctx_tgt directly
-                // (see speculative.cpp). Setting ctx_other here would make the draft
-                // ctor mis-detect is_mem_shared (gemma4-style shared KV) and disable
-                // chain_heads for multi-head Step MTP3 drafts, breaking draft KV resets.
-                cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-            } else if (spec_dft_ext) {
-                // external draft model (eagle3 / dflash / dspark). In dual mode the
-                // external model is not the MTP drafter - the MTP context lives on
-                // the target model and is created separately below.
-                cparams.ctx_other = ctx_tgt;
+                if (spec_mtp && !spec_dft_ext) {
+                    // NOTE: do NOT set ctx_other = ctx_tgt for a separate-model MTP draft.
+                    // MTP reads the target's pre-norm hidden states via ctx_tgt directly
+                    // (see speculative.cpp). Setting ctx_other here would make the draft
+                    // ctor mis-detect is_mem_shared (gemma4-style shared KV) and disable
+                    // chain_heads for multi-head Step MTP3 drafts, breaking draft KV resets.
+                    cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                } else if (spec_dft_ext) {
+                    // external draft model (eagle3 / dflash / dspark). In dual mode the
+                    // external model is not the MTP drafter - the MTP context lives on
+                    // the target model and is created separately below.
+                    cparams.ctx_other = ctx_tgt;
+                }
+
+                // note: for small models maybe we can set this to the maximum possible draft from all speculative types
+                //       the extra memory for small models is likely negligible?
+                cparams.n_rs_seq = 0;
+                ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+                if (ctx_dft == nullptr) {
+                    SRV_ERR("failed to create draft context, '%s'\n", params_dft.model.path.c_str());
+                    return false;
+                }
+
+                ctx_dft_seq_rm_type = (spec_mtp && !spec_dft_ext) ? COMMON_CONTEXT_SEQ_RM_TYPE_NO : common_context_can_seq_rm(ctx_dft.get());
+
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = ctx_dft.get();
             }
-
-            // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-            //       the extra memory for small models is likely negligible?
-            cparams.n_rs_seq = 0;
-            ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
-            if (ctx_dft == nullptr) {
-                SRV_ERR("failed to create draft context, '%s'\n", params_dft.model.path.c_str());
-                return false;
-            }
-
-            ctx_dft_seq_rm_type = (spec_mtp && !spec_dft_ext) ? COMMON_CONTEXT_SEQ_RM_TYPE_NO : common_context_can_seq_rm(ctx_dft.get());
-
-            params_base.speculative.draft.ctx_tgt = ctx_tgt;
-            params_base.speculative.draft.ctx_dft = ctx_dft.get();
         }
 
         // dual mode (external draft model + in-target MTP), or legacy mono-MTP
@@ -1133,12 +1261,55 @@ private:
             ? *spec_types_loaded.begin()
             : COMMON_SPECULATIVE_TYPE_NONE;
 
+        // spec-route (spec §6): boot line for the dual configuration, with the
+        // effective (post-clamp) draft sizes of the loaded implementations. The
+        // degraded warning fires only when one of the two REQUESTED drafters did
+        // not instantiate (a dual config that never requested draft-dflash, e.g.
+        // mtp+eagle3, is not degraded), and names the drafter the conservative
+        // default of spec_route_resolve() will actually route to.
+        if (spec_dual) {
+            const bool mtp_loaded = spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) > 0;
+            // the external type of this dual configuration (dflash/dspark/eagle3)
+            const common_speculative_type ext_requested = spec_dflash
+                ? COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+                : (spec_dspark ? COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK : COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3);
+            const bool ext_loaded = spec_types_loaded.count(ext_requested) > 0;
+
+            if (mtp_loaded && ext_loaded) {
+                SRV_INF("spec-route: dual mode active: draft-mtp (nextn, n_max=%d) + %s (%s, n_max=%d)\n",
+                        common_speculative_n_max_type(spec.get(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP),
+                        server_slot::spec_route_short_name(ext_requested).c_str(),
+                        params_base.speculative.draft.mparams.path.c_str(),
+                        common_speculative_n_max_type(spec.get(), ext_requested));
+            } else {
+                // mirrors the spec_route_resolve() default: MTP when loaded, else
+                // the other loaded drafter, else no routing at all
+                common_speculative_type default_drafter = COMMON_SPECULATIVE_TYPE_NONE;
+                if (mtp_loaded) {
+                    default_drafter = COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+                } else if (!spec_types_loaded.empty()) {
+                    default_drafter = *spec_types_loaded.begin();
+                }
+
+                SRV_WRN("spec-route: dual mode degraded: draft-mtp loaded=%s, %s loaded=%s - unresolved requests default to %s\n",
+                        mtp_loaded ? "true" : "false",
+                        server_slot::spec_route_short_name(ext_requested).c_str(),
+                        ext_loaded ? "true" : "false",
+                        default_drafter != COMMON_SPECULATIVE_TYPE_NONE
+                            ? server_slot::spec_route_short_name(default_drafter).c_str()
+                            : "none (no routing)");
+            }
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
-            slot.ctx_dft = ctx_dft.get();
+            // dual mode: every slot starts on the external drafter's context (the
+            // per-task routing repoints at launch); ctx_dft_other tracks the other
+            // dual context for the hygiene paths (prompt_clear, boundary trims)
+            spec_route_repoint_slot(slot, spec_active_type);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
 
@@ -1414,21 +1585,36 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                // spec-route: the save must happen BEFORE the repoint below - it
+                // stores the previous task's state, which lives in the drafter that
+                // task was routed to (slot.ctx_dft / spec_drafter_active still hold it)
                 ret->prompt_save(*prompt_cache);
 
+                // spec-route: switch the slot to the incoming task's drafter BEFORE
+                // the load, so a tag-matching entry restores its draft KV into the
+                // context this task will draft from (the launch re-asserts the same
+                // pointers; a mismatching entry only restores the target KV)
+                spec_route_repoint_slot(*ret, spec_route_resolve(task));
+
                 // dense KV or bounded RS recurrent state on both contexts allows salvaging
-                // cache entries whose tail diverges from the new prompt (spec-boundary)
+                // cache entries whose tail diverges from the new prompt (spec-boundary).
+                // spec-route: computed AFTER the repoint so the draft capability is the
+                // ACTIVE drafter's (identical to before in every non-dual mode)
+                const common_context_seq_rm_type dft_rm_type = spec_route_ctx_rm_type(*ret);
                 const bool spec_trailing_rm =
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
                      ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) &&
-                    (!ctx_dft ||
-                     ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
-                     ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS);
+                    (!ret->ctx_dft ||
+                     dft_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                     dft_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens, spec_trailing_rm)) {
+                std::string rebuild_kind;
+                if (!ret->prompt_load(*prompt_cache, task.tokens, spec_trailing_rm, &rebuild_kind)) {
                     ret->prompt_clear(false);
                     SRV_INF("prompt cache cold fallback: slot=%d reason=target-draft-restore-rejected target_and_draft_cleared=true\n",
                             ret->id);
+                } else if (!rebuild_kind.empty()) {
+                    metrics.on_spec_route_cache_rebuild(rebuild_kind);
                 }
 
                 prompt_cache->update();
@@ -1485,22 +1671,41 @@ private:
         return output;
     }
 
-    // spec-route (spec §3.1): short drafter name for error messages
-    // ("draft-dflash" -> "dflash", matching the "spec_drafter" body values)
-    static std::string spec_route_type_name(common_speculative_type type) {
-        std::string name = common_speculative_type_to_str(type);
-        if (name.rfind("draft-", 0) == 0) {
-            name = name.substr(strlen("draft-"));
-        }
-        return name;
-    }
-
     // spec-route (spec §3.1): draft context of the active drafter - in dual mode
     // MTP has its own context, every other configuration uses ctx_dft
+    // (drafter short names use the single helper server_slot::spec_route_short_name)
     llama_context * spec_route_ctx_dft(common_speculative_type drafter) const {
         return (spec_dual && drafter == COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
             ? ctx_dft_mtp.get()
             : ctx_dft.get();
+    }
+
+    // spec-route: seq_rm capability of the ACTIVE drafter's context - the
+    // load_model derivation for the external context (ctx_dft_seq_rm_type) when
+    // the slot is on it, and NO for the dual MTP context, exactly like the
+    // legacy mono-MTP assignment (its draft rows are managed by the MTP
+    // implementation). In every non-dual mode slot.ctx_dft is the external/only
+    // draft context, so this returns the pre-routing value byte-identically.
+    common_context_seq_rm_type spec_route_ctx_rm_type(const server_slot & slot) const {
+        if (slot.ctx_dft == nullptr) {
+            return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        }
+        if (slot.ctx_dft == ctx_dft.get()) {
+            return ctx_dft_seq_rm_type;
+        }
+        return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    }
+
+    // spec-route: repoint a slot to a drafter - the active draft context, its
+    // tag, and the OTHER dual-mode context (null outside dual mode). Hygiene
+    // operations (prompt_clear, boundary trims) must cover the other context as
+    // well, or stale rows of this slot's sequence would survive a routing switch.
+    void spec_route_repoint_slot(server_slot & slot, common_speculative_type drafter) const {
+        slot.ctx_dft = spec_route_ctx_dft(drafter);
+        slot.spec_drafter_active = drafter;
+        slot.ctx_dft_other = spec_dual
+            ? (slot.ctx_dft == ctx_dft_mtp.get() ? ctx_dft.get() : ctx_dft_mtp.get())
+            : nullptr;
     }
 
     // spec-route (spec §3.1): resolve the drafter for a task
@@ -1521,7 +1726,17 @@ private:
             return requested;
         }
 
-        return COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        // conservative default: MTP - but never route to a drafter that did not
+        // load (dual server with a partially failed init): fall back to the other
+        // loaded drafter, or NONE when nothing loaded (no routing, no misleading
+        // logs/counters attributing tasks to a drafter that cannot draft)
+        if (spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) > 0) {
+            return COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        }
+        if (!spec_types_loaded.empty()) {
+            return *spec_types_loaded.begin();
+        }
+        return COMMON_SPECULATIVE_TYPE_NONE;
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
@@ -1542,13 +1757,13 @@ private:
                     if (!active_str.empty()) {
                         active_str += "+";
                     }
-                    active_str += spec_route_type_name(t);
+                    active_str += server_slot::spec_route_short_name(t);
                 }
                 if (active_str.empty()) {
                     active_str = "none";
                 }
 
-                send_error(task, "drafter " + spec_route_type_name(override_type) + " not loaded; active: " + active_str, ERROR_TYPE_INVALID_REQUEST);
+                send_error(task, "drafter " + server_slot::spec_route_short_name(override_type) + " not loaded; active: " + active_str, ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
         }
@@ -1675,12 +1890,28 @@ private:
 
         // repoint the slot's draft context to the active drafter for the whole task:
         // it orients the post-launch consumers (checkpoint restore, post-accept
-        // rollback/trim, idle prompt_save after release). This task's cache load
-        // already ran at slot selection with the previous pointer - on a drafter
-        // switch with cache hit the newly routed ctx only receives the salvaged
-        // tail (degraded drafts, correct output); per-drafter cache tagging starts
-        // with the entry this task saves.
-        slot.ctx_dft = spec_route_ctx_dft(spec_drafter);
+        // rollback/trim, idle prompt_save after release). get_available_slot()
+        // already switched the pointers at slot selection when the prompt cache ran
+        // (this re-assert is the authoritative one for every launch path);
+        // per-drafter cache tagging starts with the entry this task saves.
+        //
+        // spec-route (spec §4.3): the active drafter of the whole task - one task =
+        // one drafter. Tags the prompt-cache saves and orients the checkpoint
+        // update/load call sites of this slot.
+        spec_route_repoint_slot(slot, spec_drafter);
+
+        // spec-route (spec §6): per-task routing diagnostics and counters. The
+        // signal is purely diagnostic (tools policy / explicit body override); a
+        // NONE drafter (spec off or no routing decision) is not counted.
+        if (spec_drafter != COMMON_SPECULATIVE_TYPE_NONE) {
+            SLT_INF(slot, "spec-route: task %d seq %d: signal=%s → drafter=%s\n",
+                    task.id, slot.id, task.params.spec_drafter_signal.c_str(),
+                    server_slot::spec_route_short_name(spec_drafter).c_str());
+            metrics.on_spec_route_request(spec_drafter);
+            if (task.params.spec_drafter_is_override) {
+                metrics.on_spec_route_override();
+            }
+        }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -2197,7 +2428,13 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-        cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+
+        // spec-route (spec §4.4): label the checkpoint with the task's drafter and
+        // snapshot the draft bytes from the ACTIVE drafter's context - a later task
+        // routed to another drafter must not restore them into its own (different
+        // model's) context; the restore sites check the label
+        cur.drafter = slot.spec_drafter_active;
+        cur.update_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
         // snapshot the speculative-impl state (MTP boundary rows) at the same
         // position, so a checkpoint restore can also rewind the draft bookkeeping
@@ -2345,6 +2582,11 @@ private:
 
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
+
+                    // spec-route (spec §6): per-drafter routing counters
+                    res->spec_route_requests       = metrics.spec_route_requests;
+                    res->spec_route_cache_rebuilds = metrics.spec_route_cache_rebuilds;
+                    res->spec_route_overrides_total = metrics.spec_route_overrides_total;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -2575,9 +2817,17 @@ private:
                 common_context_seq_rm (ctx_tgt, slot.id, n_keep            , n_keep + n_discard);
                 common_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
-                if (ctx_dft) {
-                    common_context_seq_rm (ctx_dft.get(), slot.id, n_keep            , n_keep + n_discard);
-                    common_context_seq_add(ctx_dft.get(), slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                // spec-route: the same discard/rebase pair must reach the ACTIVE
+                // drafter's context - and, best-effort, the other dual context, so
+                // its surviving prefix stays position-aligned with the target for a
+                // future routing switch (a clear would throw the valid prefix away)
+                if (slot.ctx_dft) {
+                    common_context_seq_rm (slot.ctx_dft, slot.id, n_keep            , n_keep + n_discard);
+                    common_context_seq_add(slot.ctx_dft, slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                }
+                if (slot.ctx_dft_other && slot.ctx_dft_other != slot.ctx_dft) {
+                    common_context_seq_rm (slot.ctx_dft_other, slot.id, n_keep            , n_keep + n_discard);
+                    common_context_seq_add(slot.ctx_dft_other, slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
                 }
 
                 common_speculative_shift_state(spec.get(), slot.id, -n_discard);
@@ -2630,7 +2880,10 @@ private:
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-                const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                // spec-route: capability of the ACTIVE drafter's context (see
+                // spec_route_ctx_rm_type - identical to ctx_dft_seq_rm_type in
+                // every non-dual mode)
+                const bool use_ckpt_dft = spec_route_ctx_rm_type(slot) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 int n_draft_max = slot.get_n_draft_max();
 
@@ -2676,6 +2929,11 @@ private:
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
+                        // spec-route (spec §4.4): label the speculative checkpoint with
+                        // the task's drafter - its data_dft is only restorable into that
+                        // drafter's context
+                        slot.spec_ckpt.drafter = slot.spec_drafter_active;
+
                         // snapshot the speculative-impl state (MTP boundary rows) at the
                         // same point as the KV checkpoint, so both can be rewound together
                         if (common_speculative_state_required(spec.get())) {
@@ -2684,7 +2942,10 @@ private:
                         }
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                            // spec-route: snapshot from the ACTIVE drafter's context - the
+                            // speculative checkpoint must be restorable into the same ctx
+                            // (labeled at create time by slot.spec_drafter_active)
+                            slot.spec_ckpt.update_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -2700,8 +2961,9 @@ private:
                         // reset `drafter`, see the Task 1 note).
                         const common_speculative_type spec_drafter = spec_route_resolve(*slot.task);
 
-                        // idem for the slot's draft-context repoint (see launch)
-                        slot.ctx_dft = spec_route_ctx_dft(spec_drafter);
+                        // idem for the slot's draft-context repoint, the active-drafter
+                        // tag and the other dual context (see launch)
+                        spec_route_repoint_slot(slot, spec_drafter);
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
@@ -2745,31 +3007,34 @@ private:
             slot.n_draft_total += draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-            const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+            // spec-route: capability of the ACTIVE drafter's context (see above)
+            const bool use_ckpt_dft = spec_route_ctx_rm_type(slot) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-            if (ctx_dft) {
+            // spec-route: restore/trim the ACTIVE drafter's context (the checkpoint
+            // bytes were captured from it within this same task)
+            if (slot.ctx_dft) {
                 bool restored_dft = true;
                 if (use_ckpt_dft) {
-                    restored_dft = ckpt.load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    restored_dft = ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
                 }
 
                 if (restored_dft) {
-                    common_context_seq_rm(ctx_dft.get(), slot.id, ckpt.pos_max + 1, -1);
+                    common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
                 } else {
                     SLT_WRN(slot, "%s", "failed to restore draft speculative checkpoint; disabling speculation for this request\n");
-                    common_context_seq_rm(ctx_dft.get(), slot.id, -1, -1);
+                    common_context_seq_rm(slot.ctx_dft, slot.id, -1, -1);
                     slot.spec_draft.clear();
                     slot.spec_i_batch.clear();
                     draft.clear();
                 }
             }
 
-            // dual mode: trim the MTP context past the accepted boundary as well -
-            // stale rows beyond it must not survive a future drafter switch (position
-            // collisions). In mono-MTP mode ctx_dft is the MTP context and is already
-            // trimmed above, so this only covers the dual mode.
-            if (ctx_dft_mtp) {
-                common_context_seq_rm(ctx_dft_mtp.get(), slot.id, ckpt.pos_max + 1, -1);
+            // dual mode: trim the OTHER draft context past the accepted boundary as
+            // well - stale rows beyond it must not survive a future drafter switch
+            // (position collisions). Null outside dual mode, where the active ctx
+            // above is the only draft context.
+            if (slot.ctx_dft_other && slot.ctx_dft_other != slot.ctx_dft) {
+                common_context_seq_rm(slot.ctx_dft_other, slot.id, ckpt.pos_max + 1, -1);
             }
 
             if (!draft.empty()) {
@@ -2778,7 +3043,7 @@ private:
                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
 
                 const bool use_ckpt_dft =
-                   (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft.get()));
+                   (spec_route_ctx_rm_type(slot) == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(slot.ctx_dft));
 
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
@@ -2795,7 +3060,8 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    // spec-route: snapshot from the ACTIVE drafter's context (see above)
+                    ckpt.update_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
                 }
             }
         }
@@ -2971,9 +3237,16 @@ private:
                                             common_context_seq_rm (ctx_tgt, slot.id, head_p, head_c);
                                             common_context_seq_add(ctx_tgt, slot.id, head_c, head_c + n_match, kv_shift);
 
-                                            if (ctx_dft) {
-                                                common_context_seq_rm (ctx_dft.get(), slot.id, head_p, head_c);
-                                                common_context_seq_add(ctx_dft.get(), slot.id, head_c, head_c + n_match, kv_shift);
+                                            // spec-route: same remove/rebase pair on the ACTIVE
+                                            // drafter's context and, best-effort, the other dual
+                                            // context (see the context-shift pair above)
+                                            if (slot.ctx_dft) {
+                                                common_context_seq_rm (slot.ctx_dft, slot.id, head_p, head_c);
+                                                common_context_seq_add(slot.ctx_dft, slot.id, head_c, head_c + n_match, kv_shift);
+                                            }
+                                            if (slot.ctx_dft_other && slot.ctx_dft_other != slot.ctx_dft) {
+                                                common_context_seq_rm (slot.ctx_dft_other, slot.id, head_p, head_c);
+                                                common_context_seq_add(slot.ctx_dft_other, slot.id, head_c, head_c + n_match, kv_shift);
                                             }
 
                                             for (size_t i = 0; i < n_match; i++) {
@@ -3015,8 +3288,16 @@ private:
                                 bool rolled_back = p0_rm > 0 &&
                                     llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0_rm, -1);
 
-                                if (rolled_back && ctx_dft) {
-                                    rolled_back = llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, p0_rm, -1);
+                                // spec-route: remove the diverging tail from the ACTIVE drafter's
+                                // context (gates the salvage - the draft memory must reach the same
+                                // boundary), then best-effort from the other dual context so stale
+                                // rows do not survive a drafter switch
+                                if (rolled_back && slot.ctx_dft) {
+                                    rolled_back = llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, p0_rm, -1);
+                                }
+
+                                if (rolled_back && slot.ctx_dft_other && slot.ctx_dft_other != slot.ctx_dft) {
+                                    llama_memory_seq_rm(llama_get_memory(slot.ctx_dft_other), slot.id, p0_rm, -1);
                                 }
 
                                 if (rolled_back) {
@@ -3048,7 +3329,13 @@ private:
 
                                     if (it != slot.prompt.checkpoints.rend()) {
                                         const bool restored_tgt = it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-                                        const bool restored_dft = it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                        // spec-route (spec §4.4): draft bytes are restorable only
+                                        // into the drafter's context they were captured from - a
+                                        // checkpoint left by a differently-routed task falls back
+                                        // to the existing full-reprocess path below
+                                        const bool ckpt_drafter_ok = spec_route_tag_compatible(it->drafter, slot.spec_drafter_active);
+                                        const bool restored_dft = ckpt_drafter_ok &&
+                                            it->load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
                                         if (restored_tgt && restored_dft && !it->data_spec.empty()) {
                                             const llama_pos pos_c = std::max(it->pos_min + 1, it->pos_max);
@@ -3172,7 +3459,11 @@ private:
                                         // restore the context checkpoint
 
                                         const bool restored_tgt = it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-                                        const bool restored_dft = it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                        // spec-route (spec §4.4): draft bytes only into the drafter's
+                                        // own context (see the cache-salvage restore above)
+                                        const bool ckpt_drafter_ok = spec_route_tag_compatible(it->drafter, slot.spec_drafter_active);
+                                        const bool restored_dft = ckpt_drafter_ok &&
+                                            it->load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
                                         if (!restored_tgt || !restored_dft) {
                                             SLT_WRN(slot,
@@ -3264,8 +3555,17 @@ private:
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
                     common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
-                    if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                    // spec-route (A→B→A mitigation): this boundary trim is what keeps a
+                    // draft context free of stale rows past the ingestion point of the
+                    // new task (a leftover row at a position the task is about to write
+                    // can fail process() on an unhandled path). In dual mode BOTH draft
+                    // contexts must receive it: the newly-routed one would otherwise
+                    // inherit rows of the same slot's sequence from before the switch.
+                    if (slot.ctx_dft) {
+                        common_context_seq_rm(slot.ctx_dft, slot.id, p0, -1);
+                    }
+                    if (slot.ctx_dft_other && slot.ctx_dft_other != slot.ctx_dft) {
+                        common_context_seq_rm(slot.ctx_dft_other, slot.id, p0, -1);
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -3311,11 +3611,12 @@ private:
                             continue;
                         }
 
-                        if (ctx_dft) {
+                        if (slot.ctx_dft) {
                             // TODO: in the future, figure out how to infuse target embeddings to the images
                             //       for now, we skip this for simplicity
                             //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
-                            res = input_tokens.process_chunk(ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                            // spec-route: the image chunk becomes rows of the ACTIVE drafter's context
+                            res = input_tokens.process_chunk(slot.ctx_dft, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
                             if (res != 0) {
                                 GGML_ABORT("failed to process multi-modal data on draft context\n");
                             }
@@ -4623,7 +4924,43 @@ void server_routes::init_routes() {
             }}}
         };
 
+        // spec-route (spec §6): routing counters, following the counter pattern
+        // above. The labeled ones emit one sample per label value (absent label
+        // values are not sent); on a mono server each map holds the single active
+        // drafter/kind.
+        {
+            auto & counter_defs = all_metrics_def["counter"];
+
+            for (const auto & [drafter, count] : res_task->spec_route_requests) {
+                counter_defs.push_back({
+                    {"name",   "spec_route_requests_total"},
+                    {"help",   "Number of tasks routed to each drafter."},
+                    {"labels", json::array({ json {{ "name", "drafter" }, { "value", drafter }} })},
+                    {"value",  count},
+                });
+            }
+
+            counter_defs.push_back({
+                {"name",  "spec_route_override_total"},
+                {"help",  "Number of tasks launched with an explicit spec_drafter override."},
+                {"value", res_task->spec_route_overrides_total},
+            });
+
+            for (const auto & [kind, count] : res_task->spec_route_cache_rebuilds) {
+                counter_defs.push_back({
+                    {"name",   "spec_route_cache_rebuild_total"},
+                    {"help",   "Number of prompt-cache drafter tag mismatches by rebuild kind."},
+                    {"labels", json::array({ json {{ "name", "kind" }, { "value", kind }} })},
+                    {"value",  count},
+                });
+            }
+        }
+
         std::stringstream prometheus;
+
+        // a labeled family spans several entries - its HELP/TYPE lines must be
+        // emitted only once
+        std::set<std::string> metric_families_emitted;
 
         for (const auto & el : all_metrics_def.items()) {
             const auto & type        = el.key();
@@ -4634,9 +4971,37 @@ void server_routes::init_routes() {
                 const std::string help = metric_def.at("help");
 
                 auto value = json_value(metric_def, "value", 0.);
-                prometheus << "# HELP llamacpp:" << name << " " << help  << "\n"
-                            << "# TYPE llamacpp:" << name << " " << type  << "\n"
-                            << "llamacpp:"        << name << " " << value << "\n";
+
+                // HELP/TYPE are per-family: skip them for the follow-up samples of a
+                // labeled family (spec-route counters)
+                if (metric_families_emitted.insert(name).second) {
+                    prometheus << "# HELP llamacpp:" << name << " " << help  << "\n"
+                                << "# TYPE llamacpp:" << name << " " << type  << "\n";
+                }
+
+                // optional labels, rendered as the Prometheus text-format set
+                // (llamacpp:name{label="value"} value). Label values are internal
+                // enum-derived tokens (drafter/kind names: [a-z0-9-]), so no
+                // escaping is applied - arbitrary values would need the Prometheus
+                // escaping rules (backslash, quote, newline) here.
+                std::string label_str;
+                if (metric_def.contains("labels")) {
+                    label_str = "{";
+                    bool first_label = true;
+                    for (const auto & label : metric_def.at("labels")) {
+                        if (!first_label) {
+                            label_str += ",";
+                        }
+                        label_str += label.at("name").get<std::string>();
+                        label_str += "=\"";
+                        label_str += label.at("value").get<std::string>();
+                        label_str += "\"";
+                        first_label = false;
+                    }
+                    label_str += "}";
+                }
+
+                prometheus << "llamacpp:" << name << label_str << " " << value << "\n";
             }
         }
 

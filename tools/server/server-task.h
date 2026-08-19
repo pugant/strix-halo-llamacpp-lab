@@ -543,6 +543,12 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    // spec-route counters (label -> count): drafter = resolved drafter of the
+    // task, kind = cache rebuild reason on a drafter tag mismatch
+    std::map<std::string, uint64_t> spec_route_requests       = {};
+    std::map<std::string, uint64_t> spec_route_cache_rebuilds = {};
+    uint64_t spec_route_overrides_total = 0;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
@@ -597,6 +603,11 @@ struct server_prompt {
 
     server_prompt_data data;
 
+    // spec-route: drafter whose context produced data.drft - the draft KV is only
+    // restorable into that drafter's context (a dual server keeps one draft
+    // context per drafter). NONE = untagged (legacy/pre-routing), restored as before.
+    common_speculative_type drafter = COMMON_SPECULATIVE_TYPE_NONE;
+
     std::list<common_prompt_checkpoint> checkpoints;
 
     size_t size() const {
@@ -619,6 +630,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             data,
+            drafter,
             checkpoints,
         };
     }
@@ -639,6 +651,9 @@ struct server_prompt_disk_state {
     std::vector<server_prompt_checkpoint_meta> checkpoints;
     std::vector<uint8_t> spec;
 
+    // spec-route: drafter whose context produced path_drft (see server_prompt::drafter)
+    common_speculative_type drafter = COMMON_SPECULATIVE_TYPE_NONE;
+
     std::string path_main;
     std::string path_drft;
 
@@ -656,6 +671,22 @@ struct server_prompt_disk_state {
         return tokens.size();
     }
 };
+
+// spec-route: may an entry's draft/spec payload be restored into the drafter the
+// incoming task routed to? NONE on either side means "no routing information" and
+// keeps the legacy restore behavior (wildcard).
+static inline bool spec_route_tag_compatible(common_speculative_type entry, common_speculative_type active) {
+    return entry == active ||
+        entry == COMMON_SPECULATIVE_TYPE_NONE || active == COMMON_SPECULATIVE_TYPE_NONE;
+}
+
+// spec-route: strict drafter identity for the cache bookkeeping (dedup / disk
+// touch / obsolete-prefix reclaim): an entry of another drafter - untagged ones
+// included - never contains this state's draft KV, so it must neither suppress a
+// save nor be superseded by it.
+static inline bool spec_route_same_drafter(common_speculative_type a, common_speculative_type b) {
+    return a == b;
+}
 
 struct server_prompt_cache {
     server_prompt_cache(
@@ -714,13 +745,15 @@ struct server_prompt_cache {
               llama_context * ctx_main,
               llama_context * ctx_drft,
                llama_seq_id   id_slot,
-        const std::vector<uint8_t> & state_spec);
+        const std::vector<uint8_t> & state_spec,
+        common_speculative_type drafter);
 
     server_prompt * alloc(
         const server_prompt & prompt,
                     size_t state_size_main,
                     size_t state_size_drft,
-        const std::vector<uint8_t> & state_spec);
+        const std::vector<uint8_t> & state_spec,
+        common_speculative_type drafter);
 
     bool load(
               server_prompt & prompt,
@@ -731,7 +764,12 @@ struct server_prompt_cache {
                        bool   spec_state_required,
                        bool   spec_trailing_rm,
                        bool * cache_hit,
-                   uint64_t * disk_entry_id);
+                   uint64_t * disk_entry_id,
+              // spec-route: drafter the incoming task routed to - on a tag
+              // mismatch the target KV is still restored, the entry's
+              // draft/spec payload is not (set on mismatch, cleared otherwise)
+              common_speculative_type drafter_active,
+                    bool * tag_mismatch);
 
     // Called when a stateful speculative implementation rejects a blob after
     // the target/draft files themselves restored successfully.
@@ -747,7 +785,8 @@ private:
               llama_context * ctx_main,
               llama_context * ctx_drft,
                llama_seq_id   id_slot,
-        const std::vector<uint8_t> & state_spec);
+        const std::vector<uint8_t> & state_spec,
+        common_speculative_type drafter);
 
     bool load_disk(
         std::list<server_prompt_disk_state>::iterator it,
@@ -756,7 +795,9 @@ private:
         llama_context * ctx_drft,
          llama_seq_id   id_slot,
               size_t   lcp,
-            uint64_t * entry_id_out);
+            uint64_t * entry_id_out,
+        common_speculative_type drafter_active,
+              bool * tag_mismatch);
 
     bool erase_disk_state(std::list<server_prompt_disk_state>::iterator it, bool eviction, const char * reason);
 

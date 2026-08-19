@@ -2068,6 +2068,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoin
     pos_max(other.pos_max),
     data_tgt(other.data_tgt),
     data_dft(other.data_dft),
+    drafter(other.drafter),
     data_spec(other.data_spec),
     storage_tgt(llama_state_seq_storage_clone(other.storage_tgt)),
     storage_dft(llama_state_seq_storage_clone(other.storage_dft)) {
@@ -2084,6 +2085,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prom
 
     data_tgt = other.data_tgt;
     data_dft = other.data_dft;
+    drafter  = other.drafter;
     data_spec = other.data_spec;
 
     llama_state_seq_storage_free(storage_tgt);
@@ -2100,6 +2102,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && o
     pos_max(other.pos_max),
     data_tgt(std::move(other.data_tgt)),
     data_dft(std::move(other.data_dft)),
+    drafter(other.drafter),
     data_spec(std::move(other.data_spec)),
     storage_tgt(other.storage_tgt),
     storage_dft(other.storage_dft) {
@@ -2121,6 +2124,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
 
     data_tgt = std::move(other.data_tgt);
     data_dft = std::move(other.data_dft);
+    drafter  = other.drafter;
     data_spec = std::move(other.data_spec);
 
     storage_tgt = other.storage_tgt;
@@ -2152,6 +2156,7 @@ void common_prompt_checkpoint::clear() {
 
     data_tgt.clear();
     data_dft.clear();
+    drafter = COMMON_SPECULATIVE_TYPE_NONE;
     data_spec.clear();
 
     llama_state_seq_storage_free(storage_tgt);

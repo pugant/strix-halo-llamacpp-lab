@@ -1080,6 +1080,12 @@ struct common_prompt_checkpoint {
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
+    // spec-route: drafter active when data_dft was captured - the draft bytes are
+    // only restorable into that drafter's context (a dual server keeps one draft
+    // context per drafter, on different models). NONE = untagged (no draft bytes
+    // or no routing information, restorable as before).
+    common_speculative_type drafter = COMMON_SPECULATIVE_TYPE_NONE;
+
     // speculative-impl state at the checkpoint position (e.g. MTP boundary rows),
     // so a checkpoint restore can also rewind the draft bookkeeping
     std::vector<uint8_t> data_spec;

@@ -2420,11 +2420,12 @@ bool server_prompt_cache::save(
               llama_context * ctx_main,
               llama_context * ctx_drft,
                llama_seq_id   id_slot,
-        const std::vector<uint8_t> & state_spec) {
+        const std::vector<uint8_t> & state_spec,
+        common_speculative_type drafter) {
     bool saved = false;
 
     if (!disk_owned_path.empty()) {
-        saved = save_disk(prompt, ctx_main, ctx_drft, id_slot, state_spec) || saved;
+        saved = save_disk(prompt, ctx_main, ctx_drft, id_slot, state_spec, drafter) || saved;
     }
 
     if (!ram_enabled) {
@@ -2434,7 +2435,7 @@ bool server_prompt_cache::save(
     const size_t state_size_main = llama_state_seq_get_size_ext(ctx_main, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
     const size_t state_size_drft = ctx_drft ? llama_state_seq_get_size_ext(ctx_drft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
-    auto * cur = alloc(prompt, state_size_main, state_size_drft, state_spec);
+    auto * cur = alloc(prompt, state_size_main, state_size_drft, state_spec, drafter);
     if (cur == nullptr) {
         return saved;
     }
@@ -2465,7 +2466,8 @@ bool server_prompt_cache::save_disk(
               llama_context * ctx_main,
               llama_context * ctx_drft,
                llama_seq_id   id_slot,
-        const std::vector<uint8_t> & state_spec) {
+        const std::vector<uint8_t> & state_spec,
+        common_speculative_type drafter) {
     if (disk_owned_path.empty() || disk_limit_size == 0 || prompt.tokens.empty()) {
         return false;
     }
@@ -2488,9 +2490,12 @@ bool server_prompt_cache::save_disk(
 
         const int lcp = it->tokens.get_common_prefix(prompt.tokens);
         const bool exact_tokens = lcp == (int) prompt.tokens.size() && it->tokens.size() == prompt.tokens.size();
-        const bool can_touch = state_spec.empty()
+        // spec-route: only touch an entry of the SAME drafter - another drafter's
+        // entry does not contain this state's draft bytes and must not suppress
+        // the save (a fresh entry is written instead)
+        const bool can_touch = spec_route_same_drafter(it->drafter, drafter) && (state_spec.empty()
             ? lcp == (int) prompt.tokens.size()
-            : exact_tokens;
+            : exact_tokens);
         if (!can_touch) {
             ++it;
             continue;
@@ -2673,6 +2678,7 @@ bool server_prompt_cache::save_disk(
     state.size_main = n_main;
     state.size_drft = n_drft;
     state.spec      = state_spec;
+    state.drafter   = drafter;
     state.id        = entry_id;
     state.usable    = true;
     state.checkpoints.reserve(prompt.checkpoints.size());
@@ -2693,7 +2699,9 @@ bool server_prompt_cache::save_disk(
     if (state_spec.empty()) {
         for (auto it = disk_states.begin(); it != new_entry;) {
             const int lcp = it->tokens.get_common_prefix(prompt.tokens);
-            if (lcp == (int) it->tokens.size()) {
+            // spec-route: only supersede prefixes of the SAME drafter (see the
+            // touch check above)
+            if (lcp == (int) it->tokens.size() && spec_route_same_drafter(it->drafter, drafter)) {
                 auto obsolete = it++;
                 if (!erase_disk_state(obsolete, false, "obsolete-prefix")) {
                     disable_disk_saves("obsolete-reclaim", disk_owned_path);
@@ -2738,15 +2746,20 @@ server_prompt * server_prompt_cache::alloc(
         const server_prompt & prompt,
                     size_t state_size_tgt,
                     size_t state_size_dft,
-        const std::vector<uint8_t> & state_spec) {
+        const std::vector<uint8_t> & state_spec,
+        common_speculative_type drafter) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
         const bool exact_tokens = cur_lcp_len == (int) prompt.tokens.size() &&
             it->tokens.size() == prompt.tokens.size();
-        const bool cached_boundary = state_spec.empty()
+        // spec-route: only an entry of the SAME drafter contains this state's
+        // draft KV - a same-token entry of another drafter must not suppress the
+        // save (nor be reclaimed below: it stays useful for that drafter's tasks)
+        const bool same_drafter = spec_route_same_drafter(it->drafter, drafter);
+        const bool cached_boundary = same_drafter && (state_spec.empty()
             ? cur_lcp_len == (int) prompt.tokens.size()
-            : exact_tokens && !it->data.spec.empty();
+            : exact_tokens && !it->data.spec.empty());
 
         if (cached_boundary) {
             SRV_INF("%s", " - prompt is already in the cache, skipping\n");
@@ -2775,7 +2788,8 @@ server_prompt * server_prompt_cache::alloc(
         for (auto it = states.begin(); it != states.end();) {
             const int len = it->tokens.get_common_prefix(prompt.tokens);
 
-            if (len == (int) it->tokens.size()) {
+            // spec-route: only supersede prefixes of the SAME drafter (see above)
+            if (len == (int) it->tokens.size() && spec_route_same_drafter(it->drafter, drafter)) {
                 SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
 
                 it = states.erase(it);
@@ -2821,6 +2835,7 @@ server_prompt * server_prompt_cache::alloc(
             /*.drft =*/ std::move(state_data_dft),
             /*.spec =*/ state_spec,
         },
+        /*.drafter     =*/ drafter,
         /*.checkpoints =*/ prompt.checkpoints,
     });
 
@@ -2834,9 +2849,22 @@ bool server_prompt_cache::load_disk(
         llama_context * ctx_dft,
          llama_seq_id   id_slot,
               size_t   lcp,
-            uint64_t * entry_id_out) {
+            uint64_t * entry_id_out,
+        common_speculative_type drafter_active,
+              bool * tag_mismatch) {
     if (entry_id_out != nullptr) {
         *entry_id_out = 0;
+    }
+    if (tag_mismatch != nullptr) {
+        *tag_mismatch = false;
+    }
+
+    // spec-route: an entry tagged with a different (concrete) drafter still has
+    // a perfectly valid target payload - only its draft file belongs to another
+    // model's context and must not be restored into the active drafter's context
+    const bool tag_match = spec_route_tag_compatible(it->drafter, drafter_active);
+    if (!tag_match && tag_mismatch != nullptr) {
+        *tag_mismatch = true;
     }
 
     const uint64_t entry_id = it->id;
@@ -2867,7 +2895,7 @@ bool server_prompt_cache::load_disk(
                 entry_id, target_bytes, actual_main, path_main.c_str());
         return reject_entry("target-size-mismatch");
     }
-    if (!path_drft.empty()) {
+    if (!path_drft.empty() && tag_match) {
         if (ctx_dft == nullptr || draft_bytes == 0 ||
             !server_prompt_cache_disk_size_exact(path_drft, draft_bytes, &actual_drft)) {
             SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=draft reason=size-mismatch expected_bytes=%zu actual_bytes=%zu path=%s\n",
@@ -2897,7 +2925,7 @@ bool server_prompt_cache::load_disk(
     }
 
     size_t nread_drft = 0;
-    if (!path_drft.empty()) {
+    if (!path_drft.empty() && tag_match) {
         llama_tokens tokens_drft(n_tokens_expected);
         size_t n_tokens_drft = 0;
         nread_drft = llama_state_seq_load_file(
@@ -2918,6 +2946,7 @@ bool server_prompt_cache::load_disk(
     server_prompt restored;
     restored.tokens = it->tokens.clone();
     restored.data.spec = it->spec;
+    restored.drafter = it->drafter;
     // Intentionally do not recreate common_prompt_checkpoint payloads. The
     // disk entry retained only their small positions, not cloned host/device
     // state. Fresh checkpoints are created as processing continues.
@@ -3057,12 +3086,17 @@ bool server_prompt_cache::load(
                        bool   spec_state_required,
                        bool   spec_trailing_rm,
                        bool * cache_hit,
-                   uint64_t * disk_entry_id) {
+                   uint64_t * disk_entry_id,
+              common_speculative_type drafter_active,
+                    bool * tag_mismatch) {
     if (cache_hit != nullptr) {
         *cache_hit = false;
     }
     if (disk_entry_id != nullptr) {
         *disk_entry_id = 0;
+    }
+    if (tag_mismatch != nullptr) {
+        *tag_mismatch = false;
     }
 
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
@@ -3110,6 +3144,12 @@ bool server_prompt_cache::load(
     size_t spec_boundary_best = base_boundary_valid ? prompt.tokens.size() : 0;
     bool ram_loaded = false;
 
+    // spec-route note: the drafter tag deliberately does NOT take part in the
+    // best-entry selection below - the target KV is drafter-independent and is
+    // the prefill that actually counts; a tag mismatch only costs the (cheap)
+    // draft rebuild of the active drafter, so the longest valid boundary always
+    // wins regardless of which drafter saved it.
+    //
     // Find the most similar RAM prompt first. On an equal match, the hot RAM
     // copy wins and avoids SSD I/O.
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -3190,7 +3230,7 @@ bool server_prompt_cache::load(
     if (it_best_disk != disk_states.end()) {
         SRV_INF(" - found better disk prompt with f_keep = %.3f, sim = %.3f, lcp = %zu\n",
                 f_keep_best, sim_best, lcp_selected);
-        const bool loaded = load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, disk_entry_id);
+        const bool loaded = load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, disk_entry_id, drafter_active, tag_mismatch);
         if (loaded && cache_hit != nullptr) {
             *cache_hit = true;
         }
@@ -3218,17 +3258,29 @@ bool server_prompt_cache::load(
         {
             auto & data = it_best_ram->data.drft;
 
+            // spec-route: on a drafter tag mismatch the draft KV belongs to another
+            // drafter's context - drop it without restoring (the active drafter
+            // rebuilds from the tokens it processes next)
+            const bool tag_match = spec_route_tag_compatible(it_best_ram->drafter, drafter_active);
+            if (!tag_match && tag_mismatch != nullptr) {
+                *tag_mismatch = true;
+            }
+
             if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
+                if (tag_match) {
+                    GGML_ASSERT(ctx_dft);
 
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
+                    const size_t size = data.size();
+                    const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                    if (n != size) {
+                        SRV_WRN("failed to restore state with size %zu\n", size);
 
-                    return false;
+                        return false;
+                    }
                 }
 
+                // the entry is consumed either way - mismatched draft bytes are
+                // dropped without restoring
                 data.clear();
                 data.shrink_to_fit();
             }

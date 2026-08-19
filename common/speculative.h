@@ -81,6 +81,12 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // request params - the harness may auto-enable types or skip failed ones)
 std::vector<enum common_speculative_type> common_speculative_types(const common_speculative * spec);
 
+// spec-route: effective (post-clamp) max draft size of the loaded implementation
+// for the given type, as the implementation itself will use it (e.g. MTP clamps
+// to its trained head count, DFlash to its block size). -1 = type not loaded or
+// no draft-size notion.
+int32_t common_speculative_n_max_type(const common_speculative * spec, enum common_speculative_type type);
+
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
