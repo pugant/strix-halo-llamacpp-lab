@@ -565,9 +565,14 @@ task_params server_task::params_from_json_cmpl(
             // chiusura, anche un '\n' DOPO il messaggio (il trim dell'estratto rimuove i
             // whitespace di coda, quindi il resend ricompone esattamente '\n' + messaggio
             // + '\n' + end_tag); senza di cio' un turno tagliato dal budget non round-trippa
-            // nel resend del client e la prompt cache diverge alla chiusura
+            // nel resend del client e la prompt cache diverge alla chiusura.
+            // [emendamento 19/08, caveat residuo documentato nel piano 15/08] la CODA
+            // conta: il template emette '\n\n' ANCHE DOPO l'end tag, e se il modello non
+            // li emette da se' il resend diverge di 1-2 token (osservato Δ=2 su T3 S1-a:
+            // lcp=cached-2). La sequenza forzata include il '\n\n' finale cosi' il round-
+            // trip e' esatto a prescindere dal contenuto che il modello produce dopo.
             params.sampling.reasoning_budget_forced = common_tokenize(
-                vocab, "\n" + message + (message.empty() ? "" : "\n") + end_tag, false, true);
+                vocab, "\n" + message + (message.empty() ? "" : "\n") + end_tag + "\n\n", false, true);
 
             SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
                 budget, params.sampling.generation_prompt.c_str(),
