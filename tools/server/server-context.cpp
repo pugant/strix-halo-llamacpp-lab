@@ -4127,6 +4127,20 @@ private:
                                 common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
                             }
 
+                            // spec-route: in dual mode the ungated MTP process() mirrors
+                            // every batch - including the just-rejected verify rows - into
+                            // its own context. The replay below re-decodes from
+                            // ckpt.pos_max + 1, so those stale rows must go from the OTHER
+                            // draft context too, or its first replayed llama_decode fails
+                            // the X <= Y KV position check and aborts the server. The
+                            // checkpoint bytes are not restorable into it (they were
+                            // captured from the active drafter's context, spec §4.4), but
+                            // the trim is sufficient: rows <= ckpt.pos_max are still valid
+                            // there and are never re-ingested below that boundary.
+                            if (slot.ctx_dft_other && slot.ctx_dft_other != slot.ctx_dft) {
+                                common_context_seq_rm(slot.ctx_dft_other, slot.id, ckpt.pos_max + 1, -1);
+                            }
+
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);
                             slot.smpl = std::move(smpl_save);
 
