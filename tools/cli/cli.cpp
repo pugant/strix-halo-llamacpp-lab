@@ -111,14 +111,16 @@ struct cli_context {
                 }
                 task.params.sampling.reasoning_budget_end =
                     common_tokenize(vocab, chat_params.thinking_end_tag, false, true);
-                // '\n' before the end tag (and after a non-empty wrap-up message): chat
+                // '\n' before the end tag (and after a non-empty wrap-up message), plus
+                // the trailing '\n\n' the template emits AFTER the end tag: chat
                 // templates re-render an assistant turn as '<think>\n' +
-                // reasoning_content|trim + '\n</think>\n\n', so without it a
+                // reasoning_content|trim + '\n</think>\n\n', so without both a
                 // budget-truncated turn does not round-trip on session resend
+                // (server-side twin: tools/server/server-task.cpp)
                 task.params.sampling.reasoning_budget_forced =
                     common_tokenize(vocab, "\n" + defaults.sampling.reasoning_budget_message
                         + (defaults.sampling.reasoning_budget_message.empty() ? "" : "\n")
-                        + chat_params.thinking_end_tag, false, true);
+                        + chat_params.thinking_end_tag + "\n\n", false, true);
             }
 
             rd.post_task({std::move(task)});
