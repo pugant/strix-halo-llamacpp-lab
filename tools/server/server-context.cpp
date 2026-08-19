@@ -720,13 +720,26 @@ struct server_metrics {
 
     // spec-route (spec §6): routing counters, exported on /metrics as
     // spec_route_requests_total{drafter}, spec_route_override_total and
-    // spec_route_cache_rebuild_total{kind} (label maps, absent labels not sent)
+    // spec_route_cache_rebuild_total{kind} (label maps, absent labels not sent;
+    // the known rebuild kinds are pre-registered at zero in init() so the family
+    // exists on /metrics from boot)
     std::map<std::string, uint64_t> spec_route_requests       = {};
     std::map<std::string, uint64_t> spec_route_cache_rebuilds = {};
     uint64_t spec_route_overrides_total = 0;
 
     void init() {
         t_start = ggml_time_us();
+
+        // spec-route (spec §6, controller decision 19/08): pre-register the known
+        // cache-rebuild kinds at zero so spec_route_cache_rebuild_total is present
+        // on /metrics from boot - the observability contract of the three spec §6
+        // families must not depend on a rebuild happening first. Keep in sync with
+        // the kinds produced by server_slot::prompt_load() on a drafter tag
+        // mismatch: "mtp-resync" (active drafter is MTP) and
+        // "<drafter>-prefix-miss" for the external drafters (dflash today).
+        for (const char * kind : {"mtp-resync", "dflash-prefix-miss"}) {
+            spec_route_cache_rebuilds[kind] += 0;
+        }
     }
 
     void on_spec_route_request(common_speculative_type drafter) {
