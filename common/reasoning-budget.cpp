@@ -179,13 +179,31 @@ static struct llama_sampler * common_reasoning_budget_init_state(
 
 static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
     const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
-    return common_reasoning_budget_init_state(
+
+    struct llama_sampler * clone = common_reasoning_budget_init_state(
         ctx->vocab,
         ctx->start_matcher.tokens,
         ctx->end_matcher.tokens,
         ctx->forced_tokens,
         ctx->budget,
         ctx->state);
+
+    // carry the full mutable state: the remaining budget, the matchers'
+    // positions and the forcing position. common_sampler_clone() snapshots the
+    // sampler before every speculative verify round and the server restores the
+    // snapshot on each partial rejection: a clone that resets `remaining` to
+    // the full budget silently refills the cap on every rollback, so it never
+    // fires. This is observable whenever the restore path is taken on every
+    // partial rejection (ctx seq_rm type FULL, e.g. any draft-dflash config -
+    // ~46% acceptance means most rounds reject), while mono-MTP (PART type,
+    // no sampler restore) enforces it fine.
+    auto * cctx = (common_reasoning_budget_ctx *) clone->ctx;
+    cctx->remaining         = ctx->remaining;
+    cctx->start_matcher.pos = ctx->start_matcher.pos;
+    cctx->end_matcher.pos   = ctx->end_matcher.pos;
+    cctx->force_pos         = ctx->force_pos;
+
+    return clone;
 }
 
 static void common_reasoning_budget_free(struct llama_sampler * smpl) {
