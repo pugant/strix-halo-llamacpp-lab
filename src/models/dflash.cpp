@@ -538,6 +538,12 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         res->t_embd = inp_g;
 
         ggml_build_forward_expand(gf, inp_g);
+
+        // KV-injection decode: no logits, no selector lattice. Clear the stale
+        // pointer left over from the encoder graph, or the post-decode pre-norm
+        // extraction would dereference a tensor from a graph that was never
+        // scheduled in this decode (backend == nullptr assert).
+        res->t_h_pre_norm = nullptr;
         return;
     }
 
@@ -723,6 +729,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     if (model.dspark_markov_w1) {
         build_dspark_markov_head(*this, model, inp_tokens);
     }
+
+    // DFlash2: build the selector lattice on top of the block logits. No-op for
+    // DFlash1/DSpark (no selector tensors), and skipped for embd (KV-injection)
+    // batches, which return above before reaching here.
+    build_post_sampling();
 }
 
 template <bool is_enc>
@@ -1023,6 +1034,12 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
         res->t_embd = inp_g;
         ggml_build_forward_expand(gf, inp_g);
+
+        // KV-injection decode: no logits, no selector lattice. Clear the stale
+        // pointer left over from the encoder graph, or the post-decode pre-norm
+        // extraction would dereference a tensor from a graph that was never
+        // scheduled in this decode (backend == nullptr assert).
+        res->t_h_pre_norm = nullptr;
         return;
     }
 

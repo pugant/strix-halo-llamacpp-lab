@@ -1268,7 +1268,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
+                // NOTE: unlike upstream, request logits on every noise position
+                // also for DFlash2: build_post_sampling() reads the full-block
+                // logits to build the selector lattice (t_logits->ne[1] must
+                // equal n_tokens).
+                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
             }
         }
 
@@ -1276,11 +1280,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
-        if (!is_dspark) {
+        // DFlash1 needs no pre-norm output during the noise-block decode; DFlash2
+        // instead reads its selector lattice from the unmasked pre-norm rows of
+        // exactly this decode, so the flag must stay on (set in the constructor).
+        if (!is_dspark && !is_dflash2) {
             llama_set_embeddings_pre_norm(ctx_dft, false, /*masked*/ false);
         }
         int ret = llama_decode(ctx_dft, batch);
-        if (!is_dspark) {
+        if (!is_dspark && !is_dflash2) {
             llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
         }
         if (ret != 0) {
