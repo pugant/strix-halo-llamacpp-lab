@@ -1,0 +1,602 @@
+From 560c4d468a303ae8434173fa70343701983c6161 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Sat, 15 Aug 2026 17:01:47 +0200
+Subject: [PATCH 3/4] speculative/server: bounded trailing rollback with MTP
+ boundary ring
+
+v3: the checkpoint-based salvage (v2) restored PARTIAL_ONLY state that
+does not carry the attention KV of hybrid models, so resuming
+mid-sequence read stale memory and produced nondeterministic output
+(reproduced: two identical rollback sequences in one container gave
+different completions).
+
+Instead extend the MTP speculative state with a ring of the last RING_N
+boundary h-rows (serialized in the state blob, format v3): after a
+bounded trailing llama_memory_seq_rm on target and draft (the same
+primitive used by verification rollback), rewind pending_h to the last
+kept position via the ring and reprocess only the remaining tokens.
+Entries whose divergence exceeds the RS snapshot bound or the ring keep
+falling back to cold reprocessing as before.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ common/common.cpp               |   7 --
+ common/common.h                 |   4 -
+ common/speculative.cpp          | 165 +++++++++++++++++++++++++++++++-
+ common/speculative.h            |   6 ++
+ tools/server/server-context.cpp |  81 +++++++---------
+ tools/server/server-task.cpp    |  35 +++----
+ tools/server/server-task.h      |   1 +
+ 7 files changed, 220 insertions(+), 79 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index 17adcce..5b92940 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2068,7 +2068,6 @@ common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoin
+     pos_max(other.pos_max),
+     data_tgt(other.data_tgt),
+     data_dft(other.data_dft),
+-    data_spec(other.data_spec),
+     storage_tgt(llama_state_seq_storage_clone(other.storage_tgt)),
+     storage_dft(llama_state_seq_storage_clone(other.storage_dft)) {
+ }
+@@ -2084,7 +2083,6 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prom
+ 
+     data_tgt = other.data_tgt;
+     data_dft = other.data_dft;
+-    data_spec = other.data_spec;
+ 
+     llama_state_seq_storage_free(storage_tgt);
+     llama_state_seq_storage_free(storage_dft);
+@@ -2100,7 +2098,6 @@ common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && o
+     pos_max(other.pos_max),
+     data_tgt(std::move(other.data_tgt)),
+     data_dft(std::move(other.data_dft)),
+-    data_spec(std::move(other.data_spec)),
+     storage_tgt(other.storage_tgt),
+     storage_dft(other.storage_dft) {
+     other.storage_tgt = nullptr;
+@@ -2121,7 +2118,6 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
+ 
+     data_tgt = std::move(other.data_tgt);
+     data_dft = std::move(other.data_dft);
+-    data_spec = std::move(other.data_spec);
+ 
+     storage_tgt = other.storage_tgt;
+     storage_dft = other.storage_dft;
+@@ -2135,7 +2131,6 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
+ size_t common_prompt_checkpoint::size() const {
+     return data_tgt.size() +
+            data_dft.size() +
+-           data_spec.size() +
+            llama_state_seq_storage_size(storage_tgt) +
+            llama_state_seq_storage_size(storage_dft);
+ }
+@@ -2152,8 +2147,6 @@ void common_prompt_checkpoint::clear() {
+ 
+     data_tgt.clear();
+     data_dft.clear();
+-    data_spec.clear();
+-    data_spec.shrink_to_fit();
+ 
+     llama_state_seq_storage_free(storage_tgt);
+     llama_state_seq_storage_free(storage_dft);
+diff --git a/common/common.h b/common/common.h
+index a24a985..4084470 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1074,10 +1074,6 @@ struct common_prompt_checkpoint {
+ 
+     std::vector<uint8_t> data_tgt;
+     std::vector<uint8_t> data_dft;
+-    // speculative-impl state (e.g. MTP boundary rows) coherent with the
+-    // checkpoint position: captured right after the batch decoded so far,
+-    // so the pending boundary sits at pos_max
+-    std::vector<uint8_t> data_spec;
+ 
+     llama_state_seq_storage * storage_tgt = nullptr;
+     llama_state_seq_storage * storage_dft = nullptr;
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index bbfd349..145ceec 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -183,6 +183,10 @@ struct common_speculative_impl {
+     virtual bool state_required() const { return false; }
+     virtual void shift_state(llama_seq_id /*seq_id*/, llama_pos /*delta*/) {}
+ 
++    // (optional) rewind the per-seq state to a previously seen position after a
++    // bounded memory rollback; see common_speculative_rollback_state
++    virtual bool rollback_state(llama_seq_id /*seq_id*/, llama_pos /*pos*/) { return false; }
++
+     // true if this implementation requires the target context to extract post-norm embeddings
+     virtual bool need_embd() const = 0;
+ 
+@@ -1371,6 +1375,16 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // Ring of the most recent boundary h-rows per seq, so that a bounded
++    // memory rollback (prompt-cache boundary salvage, see the server) can
++    // rewind pending_h to any of the last RING_N positions without a full
++    // cold reprocessing.
++    static constexpr uint32_t RING_N = 8;
++    std::vector<std::vector<float>> ring_h;      // [n_seq][RING_N * n_embd]
++    std::vector<std::vector<llama_pos>> ring_pos; // [n_seq][RING_N]
++    std::vector<uint32_t> ring_len;              // [n_seq]
++    std::vector<uint32_t> ring_head;             // [n_seq] next write slot
++
+     common_speculative_state_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
+         , params(params.draft)
+@@ -1456,6 +1470,11 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+         pending_h_pos.assign(n_seq, -1);
+         pending_h_prev_pos.assign(n_seq, -1);
+ 
++        ring_h.assign(n_seq, std::vector<float>((size_t) RING_N * n_embd, 0.0f));
++        ring_pos.assign(n_seq, std::vector<llama_pos>(RING_N, -1));
++        ring_len.assign(n_seq, 0);
++        ring_head.assign(n_seq, 0);
++
+         process_boundary_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+         process_boundary_valid.assign(n_seq, 0);
+         process_boundary_pos.assign(n_seq, -1);
+@@ -1682,6 +1701,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+                 std::memcpy(pending_h[seq_id].data(), h_last, row_bytes);
+                 pending_h_valid[seq_id] = 1;
+                 pending_h_pos[seq_id] = pos_last;
++                ring_push(seq_id, pos_last, pending_h[seq_id].data());
+                 continue;
+             }
+ 
+@@ -1699,6 +1719,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+             std::memcpy(pending_h[seq_id].data(), h_last, row_bytes);
+             pending_h_valid[seq_id] = 1;
+             pending_h_pos[seq_id] = pos_last;
++            ring_push(seq_id, pos_last, pending_h[seq_id].data());
+         }
+ 
+         return true;
+@@ -1898,6 +1919,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+         }
+         pending_h_valid[seq_id] = 1;
+         pending_h_pos[seq_id] = verify_pos_first[seq_id] + i_h;
++        ring_push(seq_id, pending_h_pos[seq_id], pending_h[seq_id].data());
+ 
+         if (i_h == 0) {
+             if (process_boundary_valid[seq_id]) {
+@@ -1918,11 +1940,81 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+     }
+ 
+     static constexpr uint32_t MTP_STATE_MAGIC       = 0x3250544d; // "MTP2" in little-endian byte order
+-    static constexpr uint16_t MTP_STATE_VERSION     = 2;
++    static constexpr uint16_t MTP_STATE_VERSION     = 3;
+     static constexpr uint16_t MTP_STATE_CURRENT     = 1u << 0;
+     static constexpr uint16_t MTP_STATE_PREVIOUS    = 1u << 1;
+     static constexpr size_t   MTP_STATE_HEADER      = sizeof(uint32_t) + 2*sizeof(uint16_t) + sizeof(uint32_t) + 2*sizeof(llama_pos);
+ 
++    void ring_push(llama_seq_id seq_id, llama_pos pos, const float * row) {
++        const size_t row_bytes = (size_t) n_embd * sizeof(float);
++
++        std::memcpy(ring_h[seq_id].data() + (size_t) ring_head[seq_id] * n_embd, row, row_bytes);
++        ring_pos[seq_id][ring_head[seq_id]] = pos;
++        ring_head[seq_id] = (ring_head[seq_id] + 1) % RING_N;
++        ring_len[seq_id] = std::min(ring_len[seq_id] + 1, RING_N);
++    }
++
++    const float * ring_get(llama_seq_id seq_id, llama_pos pos) const {
++        for (uint32_t i = 0; i < ring_len[seq_id]; ++i) {
++            const uint32_t idx = (ring_head[seq_id] + RING_N - 1 - i) % RING_N;
++            if (ring_pos[seq_id][idx] == pos) {
++                return ring_h[seq_id].data() + (size_t) idx * n_embd;
++            }
++        }
++        return nullptr;
++    }
++
++    bool rollback_state(llama_seq_id seq_id, llama_pos pos) override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pos < 0) {
++            return false;
++        }
++
++        const float * row = ring_get(seq_id, pos);
++        if (row == nullptr) {
++            return false;
++        }
++
++        const size_t row_bytes = (size_t) n_embd * sizeof(float);
++
++        std::memcpy(pending_h[seq_id].data(), row, row_bytes);
++        pending_h_valid[seq_id] = 1;
++        pending_h_pos[seq_id] = pos;
++
++        if (pos >= 1) {
++            if (const float * prev = ring_get(seq_id, pos - 1)) {
++                std::memcpy(pending_h_prev[seq_id].data(), prev, row_bytes);
++                pending_h_prev_valid[seq_id] = 1;
++                pending_h_prev_pos[seq_id] = pos - 1;
++            } else {
++                std::fill(pending_h_prev[seq_id].begin(), pending_h_prev[seq_id].end(), 0.0f);
++                pending_h_prev_valid[seq_id] = 0;
++                pending_h_prev_pos[seq_id] = -1;
++            }
++        } else {
++            std::fill(pending_h_prev[seq_id].begin(), pending_h_prev[seq_id].end(), 0.0f);
++            pending_h_prev_valid[seq_id] = 0;
++            pending_h_prev_pos[seq_id] = -1;
++        }
++
++        // generation-time bookkeeping refers to positions beyond the rollback point
++        process_boundary_valid[seq_id] = 0;
++        process_boundary_pos[seq_id] = -1;
++        verify_h[seq_id].clear();
++        verify_h_rows[seq_id] = 0;
++        verify_pos_first[seq_id] = -1;
++        last_n_drafted[seq_id] = 0;
++
++        // drop ring entries beyond the rollback point: their rows belong to
++        // tokens that are about to be reprocessed with new content
++        for (uint32_t i = 0; i < RING_N; ++i) {
++            if (ring_pos[seq_id][i] > pos) {
++                ring_pos[seq_id][i] = -1;
++            }
++        }
++
++        return true;
++    }
++
+     void reset_seq_state(llama_seq_id seq_id) {
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+             return;
+@@ -1940,6 +2032,10 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+         verify_h[seq_id].clear();
+         verify_h_rows[seq_id] = 0;
+         verify_pos_first[seq_id] = -1;
++
++        std::fill(ring_pos[seq_id].begin(), ring_pos[seq_id].end(), -1);
++        ring_len[seq_id] = 0;
++        ring_head[seq_id] = 0;
+         last_n_drafted[seq_id] = 0;
+         drafting[seq_id] = 0;
+         i_last[seq_id] = -1;
+@@ -1958,7 +2054,19 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+             (pending_h_prev_valid[seq_id] ? MTP_STATE_PREVIOUS : 0);
+         const uint32_t width = (uint32_t) n_embd;
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+-        data.resize(MTP_STATE_HEADER + 2*row_bytes);
++
++        // ring entries, oldest first
++        std::vector<std::pair<llama_pos, const float *>> ring_entries;
++        for (uint32_t i = 0; i < ring_len[seq_id]; ++i) {
++            const uint32_t idx = (ring_head[seq_id] + RING_N - (ring_len[seq_id] - i)) % RING_N;
++            if (ring_pos[seq_id][idx] >= 0) {
++                ring_entries.emplace_back(ring_pos[seq_id][idx], ring_h[seq_id].data() + (size_t) idx * n_embd);
++            }
++        }
++
++        const uint32_t ring_count = (uint32_t) ring_entries.size();
++
++        data.resize(MTP_STATE_HEADER + 2*row_bytes + sizeof(uint32_t) + (size_t) ring_count * (sizeof(llama_pos) + row_bytes));
+ 
+         size_t off = 0;
+         std::memcpy(data.data() + off, &MTP_STATE_MAGIC,   sizeof(MTP_STATE_MAGIC));   off += sizeof(MTP_STATE_MAGIC);
+@@ -1968,7 +2076,13 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+         std::memcpy(data.data() + off, &pending_h_pos[seq_id],      sizeof(llama_pos)); off += sizeof(llama_pos);
+         std::memcpy(data.data() + off, &pending_h_prev_pos[seq_id], sizeof(llama_pos)); off += sizeof(llama_pos);
+         std::memcpy(data.data() + off, pending_h[seq_id].data(), row_bytes); off += row_bytes;
+-        std::memcpy(data.data() + off, pending_h_prev[seq_id].data(), row_bytes);
++        std::memcpy(data.data() + off, pending_h_prev[seq_id].data(), row_bytes); off += row_bytes;
++
++        std::memcpy(data.data() + off, &ring_count, sizeof(ring_count)); off += sizeof(ring_count);
++        for (const auto & entry : ring_entries) {
++            std::memcpy(data.data() + off, &entry.first, sizeof(llama_pos)); off += sizeof(llama_pos);
++            std::memcpy(data.data() + off, entry.second, row_bytes); off += row_bytes;
++        }
+         return true;
+     }
+ 
+@@ -2001,16 +2115,37 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+             (flags & MTP_STATE_CURRENT) == 0 || (flags & ~(MTP_STATE_CURRENT | MTP_STATE_PREVIOUS)) != 0 ||
+             width != (uint32_t) n_embd || pos_current < 0 ||
+             ((flags & MTP_STATE_PREVIOUS) != 0 && pos_previous < 0) ||
+-            data.size() != MTP_STATE_HEADER + 2*row_bytes) {
++            data.size() < MTP_STATE_HEADER + 2*row_bytes + sizeof(uint32_t)) {
+             return false;
+         }
+ 
+         std::memcpy(pending_h[seq_id].data(), data.data() + off, row_bytes); off += row_bytes;
+-        std::memcpy(pending_h_prev[seq_id].data(), data.data() + off, row_bytes);
++        std::memcpy(pending_h_prev[seq_id].data(), data.data() + off, row_bytes); off += row_bytes;
+         pending_h_valid[seq_id] = 1;
+         pending_h_prev_valid[seq_id] = (flags & MTP_STATE_PREVIOUS) != 0;
+         pending_h_pos[seq_id] = pos_current;
+         pending_h_prev_pos[seq_id] = pending_h_prev_valid[seq_id] ? pos_previous : -1;
++
++        // v3: trailing ring of recent boundary rows, oldest first
++        uint32_t ring_count = 0;
++        std::memcpy(&ring_count, data.data() + off, sizeof(ring_count)); off += sizeof(ring_count);
++
++        if (ring_count > RING_N ||
++            data.size() != off + (size_t) ring_count * (sizeof(llama_pos) + row_bytes)) {
++            return false;
++        }
++
++        ring_len[seq_id] = 0;
++        ring_head[seq_id] = 0;
++        for (uint32_t i = 0; i < ring_count; ++i) {
++            llama_pos pos = -1;
++            std::memcpy(&pos, data.data() + off, sizeof(pos)); off += sizeof(pos);
++            std::memcpy(ring_h[seq_id].data() + (size_t) i * n_embd, data.data() + off, row_bytes); off += row_bytes;
++
++            ring_pos[seq_id][i] = pos;
++            ring_len[seq_id] = i + 1;
++        }
++        ring_head[seq_id] = ring_count % RING_N;
+         return true;
+     }
+ 
+@@ -2035,6 +2170,11 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+         if (verify_h_rows[seq_id] > 0 && verify_pos_first[seq_id] >= 0) {
+             verify_pos_first[seq_id] += delta;
+         }
++        for (auto & p : ring_pos[seq_id]) {
++            if (p >= 0) {
++                p += delta;
++            }
++        }
+     }
+ 
+     bool need_embd() const override {
+@@ -2956,6 +3096,21 @@ bool common_speculative_state_required(const common_speculative * spec) {
+     return false;
+ }
+ 
++bool common_speculative_rollback_state(common_speculative * spec, llama_seq_id seq_id, llama_pos pos) {
++    if (spec == nullptr) {
++        return false;
++    }
++
++    bool ok = true;
++
++    for (auto & impl : spec->impls) {
++        const bool rolled = impl->rollback_state(seq_id, pos);
++        ok = ok && (!impl->state_required() || rolled);
++    }
++
++    return ok;
++}
++
+ void common_speculative_shift_state(common_speculative * spec, llama_seq_id seq_id, llama_pos delta) {
+     if (spec == nullptr || delta == 0) {
+         return;
+diff --git a/common/speculative.h b/common/speculative.h
+index 6ce82e5..1218fbc 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -73,6 +73,12 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
+ bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+ bool common_speculative_state_required(const common_speculative * spec);
+ 
++// (optional) rewind the internal state to a previously seen position, so that
++// processing can resume from there after the target/draft memories rolled back
++// (bounded prompt-cache boundary salvage). Returns false when the position is
++// not recoverable.
++bool common_speculative_rollback_state(common_speculative * spec, llama_seq_id seq_id, llama_pos pos);
++
+ // rebase per-sequence positions after the corresponding target/draft contexts shift
+ void common_speculative_shift_state(common_speculative * spec, llama_seq_id seq_id, llama_pos delta);
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 741a977..a33ec4e 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -153,11 +153,11 @@ struct server_slot {
+         return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id, state_spec);
+     }
+ 
+-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
++    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, bool spec_trailing_rm) {
+         const bool spec_state_required = common_speculative_state_required(spec);
+         bool cache_hit = false;
+         uint64_t disk_entry_id = 0;
+-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec_state_required, &cache_hit, &disk_entry_id);
++        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec_state_required, spec_trailing_rm, &cache_hit, &disk_entry_id);
+         if (res && cache_hit) {
+             if (spec_state_required && prompt.data.spec.empty()) {
+                 SLT_WRN(*this, "%s", "failed to load required speculative state from prompt cache\n");
+@@ -1344,7 +1344,16 @@ private:
+ 
+                 ret->prompt_save(*prompt_cache);
+ 
+-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
++                // dense KV or bounded RS recurrent state on both contexts allows salvaging
++                // cache entries whose tail diverges from the new prompt (spec-boundary)
++                const bool spec_trailing_rm =
++                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
++                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) &&
++                    (!ctx_dft ||
++                     ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
++                     ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS);
++
++                if (!ret->prompt_load(*prompt_cache, task.tokens, spec_trailing_rm)) {
+                     ret->prompt_clear(false);
+                     SRV_INF("prompt cache cold fallback: slot=%d reason=target-draft-restore-rejected target_and_draft_cleared=true\n",
+                             ret->id);
+@@ -2029,16 +2038,6 @@ private:
+         cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+         cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+ 
+-        // snapshot the speculative-impl state together with the contexts: the
+-        // checkpoint is taken before the pending batch is decoded, so the MTP
+-        // boundary rows (pending_h) sit exactly at pos_max and stay coherent
+-        // with the restored target/draft state. May remain empty when the
+-        // implementation has no state available (then the checkpoint cannot be
+-        // used for a spec-boundary rollback, only for the non-spec paths).
+-        if (spec && common_speculative_state_required(spec.get())) {
+-            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+-        }
+-
+         SLT_INF(slot,
+                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+@@ -2802,47 +2801,35 @@ private:
+                             // boundaries, so the speculative state is only valid at an exact cache
+                             // boundary. When the new prompt shares a strictly shorter prefix
+                             // (lcp < cached_tokens, e.g. a client re-sending a normalized
+-                            // conversation), try to salvage the cache by restoring the newest
+-                            // context checkpoint that stays within the common prefix AND carries
+-                            // a speculative boundary row coherent with its position: target and
+-                            // draft state come back together, and only the tokens after the
+-                            // checkpoint are reprocessed. If no usable checkpoint exists, keep
+-                            // the previous behavior and reprocess cold. Full-prefix extension
+-                            // and the exact-hit one-token replay below remain supported.
++                            // conversation), try to salvage the cache with a bounded trailing
++                            // rollback: remove the diverging tail from the target and draft
++                            // memories (the same primitive the verification path uses, bounded
++                            // by the recurrent snapshot window), then rewind the speculative
++                            // boundary to the last kept position via its state ring. Only the
++                            // tokens after the boundary are reprocessed. If any step is not
++                            // possible, keep the previous behavior and reprocess cold.
++                            // Full-prefix extension and the exact-hit one-token replay below
++                            // remain supported.
+                             if (common_speculative_state_required(spec.get()) &&
+                                 n_past > 0 && n_past < slot.prompt.n_tokens()) {
+-                                bool rolled_back = false;
+-
+-                                // newest checkpoint with a coherent speculative state that does
+-                                // not extend beyond the common prefix
+-                                const auto it_ckpt_ok = std::find_if(
+-                                    slot.prompt.checkpoints.rbegin(),
+-                                    slot.prompt.checkpoints.rend(),
+-                                    [&](const common_prompt_checkpoint & cur) {
+-                                        return cur.n_tokens <= (int64_t) n_past && !cur.data_spec.empty();
+-                                    });
+-
+-                                if (it_ckpt_ok != slot.prompt.checkpoints.rend()) {
+-                                    const bool restored_tgt = it_ckpt_ok->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+-                                    const bool restored_dft = it_ckpt_ok->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++                                const llama_pos p0_rm = slot.prompt.tokens.pos_next(n_past);
+ 
+-                                    if (restored_tgt && restored_dft && common_speculative_set_state(spec.get(), slot.id, it_ckpt_ok->data_spec)) {
+-                                        n_past = (int) it_ckpt_ok->n_tokens;
++                                bool rolled_back = p0_rm > 0 &&
++                                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0_rm, -1);
+ 
+-                                        SLT_INF(slot,
+-                                                "prompt cache checkpoint rollback: lcp=%d cached_tokens=%d ckpt_n_tokens=%" PRId64 " ckpt_pos_max=%d request_tokens=%d\n",
+-                                                n_past, slot.prompt.n_tokens(), it_ckpt_ok->n_tokens, it_ckpt_ok->pos_max, slot.task->n_tokens());
++                                if (rolled_back && ctx_dft) {
++                                    rolled_back = llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, p0_rm, -1);
++                                }
+ 
+-                                        rolled_back = true;
+-                                    } else {
+-                                        SLT_WRN(slot,
+-                                                "failed to restore context checkpoint for spec-boundary rollback (target=%d draft=%d, pos_min = %d, pos_max = %d, n_tokens = %" PRId64 "); forcing full prompt re-processing\n",
+-                                                (int) restored_tgt, (int) restored_dft,
+-                                                it_ckpt_ok->pos_min, it_ckpt_ok->pos_max, it_ckpt_ok->n_tokens);
+-                                    }
++                                if (rolled_back) {
++                                    rolled_back = common_speculative_rollback_state(spec.get(), slot.id, p0_rm - 1);
+                                 }
+ 
+-                                if (!rolled_back) {
++                                if (rolled_back) {
++                                    SLT_INF(slot,
++                                            "prompt cache trailing rollback: lcp=%d cached_tokens=%d request_tokens=%d p0=%d\n",
++                                            n_past, slot.prompt.n_tokens(), slot.task->n_tokens(), p0_rm);
++                                } else {
+                                     SLT_INF(slot,
+                                             "prompt cache cold fallback: reason=spec-boundary-mismatch lcp=%d cached_tokens=%d request_tokens=%d\n",
+                                             n_past, slot.prompt.n_tokens(), slot.task->n_tokens());
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index c1353a4..5b75c44 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -2993,6 +2993,7 @@ bool server_prompt_cache::load(
+               llama_context * ctx_dft,
+                     int32_t   id_slot,
+                        bool   spec_state_required,
++                       bool   spec_trailing_rm,
+                        bool * cache_hit,
+                    uint64_t * disk_entry_id) {
+     if (cache_hit != nullptr) {
+@@ -3006,26 +3007,31 @@ bool server_prompt_cache::load(
+ 
+     // With speculative decoding, an entry whose token sequence extends past the
+     // common prefix (lcp < cached_tokens, e.g. a client re-sending a normalized
+-    // conversation) can still be salvaged when a context checkpoint within the
+-    // common prefix carries a speculative boundary row coherent with its
+-    // position: the slot code then restores that checkpoint and reprocesses
+-    // only the tokens after it.
+-    const auto spec_boundary_valid = [&](const std::list<common_prompt_checkpoint> & checkpoints, size_t cached_tokens, int lcp) {
++    // conversation) can still be salvaged when the target and draft memories
++    // support removing the diverging tail: the slot code then performs a bounded
++    // trailing rollback and reprocesses only the new tokens.
++    const auto spec_boundary_valid = [&](size_t cached_tokens, int lcp) {
+         if (!spec_state_required || lcp == (int) cached_tokens) {
+             return true;
+         }
+-        if (lcp < 0 || cached_tokens <= (size_t) lcp) {
++        if (!spec_trailing_rm || lcp < 0 || cached_tokens <= (size_t) lcp) {
+             return false;
+         }
+-        for (const auto & cur : checkpoints) {
+-            if (cur.n_tokens <= (int64_t) lcp && !cur.data_spec.empty()) {
+-                return true;
++        const size_t delta = cached_tokens - (size_t) lcp;
++        // dense KV (n_rs_seq == 0) supports removing any tail; bounded RS state only up to the snapshot bound
++        uint32_t n_rs_min = UINT32_MAX;
++        if (const uint32_t n_rs = llama_n_rs_seq(ctx_tgt); n_rs > 0) {
++            n_rs_min = std::min(n_rs_min, n_rs);
++        }
++        if (ctx_dft) {
++            if (const uint32_t n_rs = llama_n_rs_seq(ctx_dft); n_rs > 0) {
++                n_rs_min = std::min(n_rs_min, n_rs);
+             }
+         }
+-        return false;
++        return n_rs_min == UINT32_MAX || delta <= (size_t) n_rs_min;
+     };
+ 
+-    const bool base_boundary_valid = spec_boundary_valid(prompt.checkpoints, prompt.tokens.size(), lcp_best);
++    const bool base_boundary_valid = spec_boundary_valid(prompt.tokens.size(), lcp_best);
+     float f_keep_best = base_boundary_valid && prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+     float sim_best    = base_boundary_valid ? float(lcp_best) / std::max<size_t>(1, tokens_new.size()) : -1.0f;
+ 
+@@ -3047,7 +3053,7 @@ bool server_prompt_cache::load(
+     for (auto it = states.begin(); it != states.end(); ++it) {
+         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+ 
+-        if (!spec_boundary_valid(it->checkpoints, it->tokens.size(), lcp_cur)) {
++        if (!spec_boundary_valid(it->tokens.size(), lcp_cur)) {
+             SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=ram lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
+                     lcp_cur, it->tokens.size(), tokens_new.size(), it->data.spec.size());
+             continue;
+@@ -3087,10 +3093,7 @@ bool server_prompt_cache::load(
+ 
+         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+ 
+-        // disk states restore without live checkpoints, so the exact-prefix
+-        // rule still applies there
+-        if (spec_state_required &&
+-            lcp_cur != (int) it->tokens.size()) {
++        if (!spec_boundary_valid(it->tokens.size(), lcp_cur)) {
+             SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=disk entry=%" PRIu64 " lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
+                     it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->spec.size());
+             continue;
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index a3ebc1e..efbfcbd 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -712,6 +712,7 @@ struct server_prompt_cache {
+               llama_context * ctx_drft,
+                     int32_t   id_slot,
+                        bool   spec_state_required,
++                       bool   spec_trailing_rm,
+                        bool * cache_hit,
+                    uint64_t * disk_entry_id);
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,779 @@
+From b8ff04bce5dddf69bf987233c0b5c161f25f3e82 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Mon, 17 Aug 2026 20:48:38 +0200
+Subject: [PATCH] =?UTF-8?q?common,server:=20reasoning=20pressure=20?=
+ =?UTF-8?q?=E2=80=94=20notice=20+=20squeeze=20steering=20(0010)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+At start fraction of the reasoning budget a deterministic notice is
+forced into the reasoning (FORCING_NOTA, returns to COUNTING); grace
+tokens later a quadratic squeeze boosts only the matcher's next
+end-token logit. Per-request via reasoning_pressure_* keys. clone()
+now carries the full sampler state (fixes latent force_pos/remaining/
+matcher-pos gaps). Spec: docs/superpowers/specs/2026-08-17-reasoning-pressure-design.md
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ common/arg.cpp                  |  31 ++++++
+ common/common.h                 |   6 +
+ common/reasoning-budget.cpp     | 170 ++++++++++++++++++++++------
+ common/reasoning-budget.h       |  31 +++++-
+ common/sampling.cpp             |  24 +++-
+ tests/test-reasoning-budget.cpp | 189 +++++++++++++++++++++++++++++++-
+ tools/server/server-common.cpp  |  12 ++
+ tools/server/server-common.h    |   4 +
+ tools/server/server-context.cpp |   4 +
+ tools/server/server-task.cpp    |  22 ++++
+ 10 files changed, 452 insertions(+), 41 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 8167097..bf28409 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3179,6 +3179,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.sampling.reasoning_budget_message = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
++    add_opt(common_arg(
++        {"--reasoning-pressure-start"}, "F",
++        "fraction of the reasoning budget (0.0-1.0) at which the pressure notice is forced; 0 = steering disabled (default: 0)",
++        [](common_params & params, const std::string & value) {
++            const double start = std::stod(value);
++            if (start < 0.0 || start > 1.0) { throw std::invalid_argument("invalid value"); } // 0 = off, (0,1] active
++            params.sampling.reasoning_pressure_start = start;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
++    add_opt(common_arg(
++        {"--reasoning-pressure-grace"}, "N",
++        "tokens after the pressure notice before the end-token squeeze begins (default: 200)",
++        [](common_params & params, int value) {
++            if (value < 0) { throw std::invalid_argument("invalid value"); }
++            params.sampling.reasoning_pressure_grace = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
++    add_opt(common_arg(
++        {"--reasoning-pressure-boost"}, "F",
++        "max logit boost for the next end-of-thinking token during the squeeze (default: 9.0)",
++        [](common_params & params, const std::string & value) {
++            params.sampling.reasoning_pressure_boost = std::stod(value);
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
++    add_opt(common_arg(
++        {"--reasoning-pressure-notice"}, "MESSAGE",
++        "notice forced into the reasoning at the pressure start fraction (default: '[Budget notice: wrap up the reasoning and give the final answer]')",
++        [](common_params & params, const std::string & value) {
++            params.sampling.reasoning_pressure_notice = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+     add_opt(common_arg(
+         {"--chat-template"}, "JINJA_TEMPLATE",
+         string_format(
+diff --git a/common/common.h b/common/common.h
+index 3e7cf41..b6c3328 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -280,6 +280,12 @@ struct common_params_sampling {
+     std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
+     std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
+ 
++    double                   reasoning_pressure_start  = 0.0;   // 0 = steering disabled
++    int32_t                  reasoning_pressure_grace  = 200;   // tokens after notice before squeeze
++    double                   reasoning_pressure_boost  = 9.0;   // max logit boost for the end token
++    std::string              reasoning_pressure_notice;         // empty = default notice text
++    std::vector<llama_token> reasoning_pressure_notice_tokens;  // tokenized at request parse
++
+     bool backend_sampling = false;
+ 
+     bool has_logit_bias() const {
+diff --git a/common/reasoning-budget.cpp b/common/reasoning-budget.cpp
+index c6e1f86..fa426b4 100644
+--- a/common/reasoning-budget.cpp
++++ b/common/reasoning-budget.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "log.h"
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <cstdint>
+ #include <string>
+@@ -50,8 +51,37 @@ struct common_reasoning_budget_ctx {
+ 
+     // for forcing
+     size_t force_pos;         // next position in forced_tokens to force
++
++    common_reasoning_pressure pressure;  // patch 0010
++    double     note_from    = 0.0;  // used-token threshold for the notice
++    double     squeeze_from = 0.0;  // used-token threshold for the squeeze
++    bool       note_injected = false;
++    bool       note_pending  = false; // waiting for a complete UTF-8 token
++    size_t     notice_pos    = 0;
+ };
+ 
++// thresholds are a PURE function of (pressure, budget): recomputed everywhere
++// (init, arm, clone passthrough in init_state) — a restored clone can never
++// carry stale or zeroed thresholds (spec §4: soglie carried by clone)
++static void common_reasoning_budget_compute_thresholds(common_reasoning_budget_ctx * ctx) {
++    if (ctx->pressure.enabled() && ctx->budget > 0) {
++        ctx->note_from    = ctx->pressure.start * ctx->budget;
++        ctx->squeeze_from = std::min(ctx->pressure.start * ctx->budget + (double) ctx->pressure.grace,
++                                     (double) ctx->budget - 1.0);
++    } else {
++        ctx->note_from    = 0.0;
++        ctx->squeeze_from = 0.0;
++    }
++}
++
++// reset the per-think-block flags (fresh block or sampler reset)
++static void common_reasoning_budget_arm_pressure(common_reasoning_budget_ctx * ctx) {
++    ctx->note_injected = false;
++    ctx->note_pending  = false;
++    ctx->notice_pos    = 0;
++    common_reasoning_budget_compute_thresholds(ctx);
++}
++
+ static const char * common_reasoning_budget_name(const struct llama_sampler * /*smpl*/) {
+     return "reasoning-budget";
+ }
+@@ -65,6 +95,7 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
+             if (ctx->start_matcher.advance(token)) {
+                 ctx->state = REASONING_BUDGET_COUNTING;
+                 ctx->remaining = ctx->budget;
++                common_reasoning_budget_arm_pressure(ctx);
+                 LOG_INF("reasoning-budget: activated, budget=%d tokens\n", ctx->budget);
+ 
+                 if (ctx->remaining <= 0) {
+@@ -111,6 +142,23 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
+                         LOG_INF("reasoning-budget: budget exhausted, waiting for UTF-8 completion\n");
+                     }
+                 }
++
++                // patch 0010: fire the pressure notice once, at a complete UTF-8 boundary
++                if (ctx->state == REASONING_BUDGET_COUNTING && ctx->pressure.enabled() && !ctx->note_injected) {
++                    const double used = ctx->budget - ctx->remaining;
++                    if (ctx->note_pending || used >= ctx->note_from) {
++                        if (!utf8_complete) {
++                            ctx->note_pending = true;
++                        } else {
++                            ctx->note_injected = true;
++                            ctx->note_pending  = false;
++                            ctx->notice_pos    = 0;
++                            ctx->end_matcher.reset(); // symmetry with FORCING entry: no stale partial match
++                            ctx->state         = REASONING_BUDGET_FORCING_NOTA;
++                            LOG_INF("reasoning-budget: pressure notice at used=%.0f/%d tokens\n", used, ctx->budget);
++                        }
++                    }
++                }
+             }
+             break;
+         }
+@@ -121,12 +169,20 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
+                 LOG_INF("reasoning-budget: forced sequence complete, done\n");
+             }
+             break;
++        case REASONING_BUDGET_FORCING_NOTA:
++            ctx->notice_pos++;
++            if (ctx->notice_pos >= ctx->pressure.notice_tokens.size()) {
++                ctx->state = REASONING_BUDGET_COUNTING;
++                LOG_INF("reasoning-budget: pressure notice complete, back to counting\n");
++            }
++            break;
+         case REASONING_BUDGET_DONE:
+             // Re-arm on a new start tag: some models emit multiple <think> blocks
+             // per response, and each should get a fresh budget window.
+             if (ctx->start_matcher.advance(token)) {
+                 ctx->state = REASONING_BUDGET_COUNTING;
+                 ctx->remaining = ctx->budget;
++                common_reasoning_budget_arm_pressure(ctx);
+                 ctx->end_matcher.reset();
+                 LOG_INF("reasoning-budget: re-activated on new start tag, budget=%d tokens\n", ctx->budget);
+ 
+@@ -140,14 +196,51 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
+     }
+ }
+ 
++// mask every candidate except `token` (shared by FORCING and FORCING_NOTA)
++static void force_only(llama_token_data_array * cur_p, llama_token token) {
++    for (size_t i = 0; i < cur_p->size; i++) {
++        if (cur_p->data[i].id != token) {
++            cur_p->data[i].logit = -INFINITY;
++        }
++    }
++}
++
+ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+ 
+-    if (ctx->state != REASONING_BUDGET_FORCING) {
+-        // passthrough — don't modify logits
++    if (ctx->state == REASONING_BUDGET_FORCING_NOTA) {
++        if (ctx->notice_pos >= ctx->pressure.notice_tokens.size()) {
++            return;
++        }
++        force_only(cur_p, ctx->pressure.notice_tokens[ctx->notice_pos]);
+         return;
+     }
+ 
++    if (ctx->state != REASONING_BUDGET_FORCING) {
++        // patch 0010: squeeze = derived condition while counting (NOT a state):
++        // quadratic boost of ONLY the next end-token expected by the matcher.
++        // NOTE: this apply runs BEFORE grammar and the sampler chain (rbudget
++        // apply order in common_sampler_sample), so the boost sees the full candidate set.
++        if (ctx->state == REASONING_BUDGET_COUNTING && ctx->pressure.enabled() && ctx->note_injected) {
++            const double used = ctx->budget - ctx->remaining;
++            if (used >= ctx->squeeze_from) {
++                double x = (used - ctx->squeeze_from) / ((double) ctx->budget - ctx->squeeze_from);
++                x = std::min(std::max(x, 0.0), 1.0);
++                const double boost = x * x * ctx->pressure.boost;
++                if (boost > 0.0 && ctx->end_matcher.pos < ctx->end_matcher.tokens.size()) {
++                    const llama_token tok = ctx->end_matcher.tokens[ctx->end_matcher.pos];
++                    for (size_t i = 0; i < cur_p->size; i++) {
++                        if (cur_p->data[i].id == tok) {
++                            cur_p->data[i].logit += boost;
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++        return; // passthrough
++    }
++
+     if (ctx->force_pos >= ctx->forced_tokens.size()) {
+         return;
+     }
+@@ -155,11 +248,7 @@ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_tok
+     const llama_token forced = ctx->forced_tokens[ctx->force_pos];
+ 
+     // set all logits to -inf except the forced token
+-    for (size_t i = 0; i < cur_p->size; i++) {
+-        if (cur_p->data[i].id != forced) {
+-            cur_p->data[i].logit = -INFINITY;
+-        }
+-    }
++    force_only(cur_p, forced);
+ }
+ 
+ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
+@@ -169,23 +258,31 @@ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
+     ctx->start_matcher.reset();
+     ctx->end_matcher.reset();
+     ctx->force_pos = 0;
++    common_reasoning_budget_arm_pressure(ctx);
+ }
+ 
+ // forward declaration for use in clone
+ static struct llama_sampler * common_reasoning_budget_init_state(
+-        const struct llama_vocab * vocab, const std::vector<llama_token> & start_tokens,
+-        const std::vector<llama_token> & end_tokens, const std::vector<llama_token> & forced_tokens,
+-        int32_t budget, common_reasoning_budget_state initial_state);
++        const struct llama_vocab             * vocab,
++        const std::vector<llama_token>       & start_tokens, size_t start_pos,
++        const std::vector<llama_token>       & end_tokens,   size_t end_pos,
++        const std::vector<llama_token>       & forced_tokens,
++        int32_t                                budget,   int32_t remaining,
++        const common_reasoning_pressure      & pressure,
++        bool                                   note_injected, bool note_pending, size_t notice_pos,
++        common_reasoning_budget_state          initial_state, size_t force_pos);
+ 
+ static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
+     const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+     return common_reasoning_budget_init_state(
+         ctx->vocab,
+-        ctx->start_matcher.tokens,
+-        ctx->end_matcher.tokens,
++        ctx->start_matcher.tokens, ctx->start_matcher.pos,
++        ctx->end_matcher.tokens,   ctx->end_matcher.pos,
+         ctx->forced_tokens,
+-        ctx->budget,
+-        ctx->state);
++        ctx->budget, ctx->remaining,
++        ctx->pressure,
++        ctx->note_injected, ctx->note_pending, ctx->notice_pos,
++        ctx->state, ctx->force_pos);
+ }
+ 
+ static void common_reasoning_budget_free(struct llama_sampler * smpl) {
+@@ -207,29 +304,36 @@ static struct llama_sampler_i common_reasoning_budget_i = {
+ 
+ static struct llama_sampler * common_reasoning_budget_init_state(
+         const struct llama_vocab             * vocab,
+-        const std::vector<llama_token>       & start_tokens,
+-        const std::vector<llama_token>       & end_tokens,
++        const std::vector<llama_token>       & start_tokens, size_t start_pos,
++        const std::vector<llama_token>       & end_tokens,   size_t end_pos,
+         const std::vector<llama_token>       & forced_tokens,
+-        int32_t                                budget,
+-        common_reasoning_budget_state          initial_state) {
++        int32_t                                budget,   int32_t remaining,
++        const common_reasoning_pressure      & pressure,
++        bool                                   note_injected, bool note_pending, size_t notice_pos,
++        common_reasoning_budget_state          initial_state, size_t force_pos) {
+     // promote COUNTING with budget <= 0 to FORCING
+     if (initial_state == REASONING_BUDGET_COUNTING && budget <= 0) {
+         initial_state = REASONING_BUDGET_FORCING;
+     }
+ 
+-    return llama_sampler_init(
+-        /* .iface = */ &common_reasoning_budget_i,
+-        /* .ctx   = */ new common_reasoning_budget_ctx {
+-            /* .vocab         = */ vocab,
+-            /* .start_matcher = */ { start_tokens, 0 },
+-            /* .end_matcher   = */ { end_tokens, 0 },
+-            /* .forced_tokens = */ forced_tokens,
+-            /* .budget        = */ budget,
+-            /* .remaining     = */ budget,
+-            /* .state         = */ initial_state,
+-            /* .force_pos     = */ 0,
+-        }
+-    );
++    common_reasoning_budget_ctx * ctx = new common_reasoning_budget_ctx {
++        /* .vocab          = */ vocab,
++        /* .start_matcher  = */ { start_tokens, start_pos },
++        /* .end_matcher    = */ { end_tokens,   end_pos },
++        /* .forced_tokens  = */ forced_tokens,
++        /* .budget         = */ budget,
++        /* .remaining      = */ remaining,
++        /* .state          = */ initial_state,
++        /* .force_pos      = */ force_pos,
++        /* .pressure       = */ pressure,
++        /* .note_from      = */ 0.0,           // ricalcolate sotto
++        /* .squeeze_from   = */ 0.0,           // ricalcolate sotto
++        /* .note_injected  = */ note_injected, // passthrough clone
++        /* .note_pending   = */ note_pending,  // passthrough clone
++        /* .notice_pos     = */ notice_pos,    // passthrough clone
++    };
++    common_reasoning_budget_compute_thresholds(ctx);
++    return llama_sampler_init(&common_reasoning_budget_i, ctx);
+ }
+ 
+ struct llama_sampler * common_reasoning_budget_init(
+@@ -238,8 +342,10 @@ struct llama_sampler * common_reasoning_budget_init(
+         const std::vector<llama_token> & end_tokens,
+         const std::vector<llama_token> & forced_tokens,
+         int32_t                          budget,
++        const common_reasoning_pressure & pressure,
+         common_reasoning_budget_state    initial_state) {
+-    return common_reasoning_budget_init_state(vocab, start_tokens, end_tokens, forced_tokens, budget, initial_state);
++    return common_reasoning_budget_init_state(vocab, start_tokens, 0, end_tokens, 0, forced_tokens,
++        budget, budget, pressure, false, false, 0, initial_state, 0);
+ }
+ 
+ common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl) {
+diff --git a/common/reasoning-budget.h b/common/reasoning-budget.h
+index ef37f46..c88bbc5 100644
+--- a/common/reasoning-budget.h
++++ b/common/reasoning-budget.h
+@@ -10,18 +10,37 @@ enum common_reasoning_budget_state {
+     REASONING_BUDGET_COUNTING,     // counting down tokens
+     REASONING_BUDGET_FORCING,      // forcing budget message + end sequence
+     REASONING_BUDGET_WAITING_UTF8, // budget exhausted, waiting for UTF-8 completion
++    REASONING_BUDGET_FORCING_NOTA, // forcing the pressure notice, then back to COUNTING
+     REASONING_BUDGET_DONE,         // passthrough forever
+ };
+ 
++// Soft steering of the reasoning budget (patch 0010, spec 2026-08-17-reasoning-pressure):
++// at `start` fraction of the budget a deterministic notice is forced into the reasoning
++// (token-by-token, same masking as FORCING) and counting resumes; `grace` tokens later a
++// quadratic squeeze begins, boosting only the logit of the next end-token expected by the
++// matcher, up to `boost`. Inert when start == 0 or notice_tokens is empty.
++struct common_reasoning_pressure {
++    double       start  = 0.0;
++    int32_t      grace  = 0;
++    double       boost  = 0.0;
++    std::vector<llama_token> notice_tokens;
++
++    bool enabled() const { return start > 0.0 && !notice_tokens.empty(); }
++};
++
++// default notice text (shared by the server parse and the common fallback)
++inline const char * COMMON_REASONING_PRESSURE_DEFAULT_NOTICE = "[Budget notice: wrap up the reasoning and give the final answer]";
++
+ // Creates a reasoning budget sampler that limits token generation inside a
+ // reasoning block (e.g. between <think> and </think>).
+ //
+ // State machine: IDLE -> COUNTING -> WAITING_UTF8 -> FORCING -> DONE
+-//   IDLE:         passthrough, watching for start_tokens sequence
+-//   COUNTING:     counting down remaining tokens, watching for natural end_tokens
+-//   WAITING_UTF8: budget exhausted, allowing tokens to complete a UTF-8 sequence
+-//   FORCING:      forces forced_tokens token-by-token (all other logits -> -inf)
+-//   DONE:         passthrough forever
++//   IDLE:          passthrough, watching for start_tokens sequence
++//   COUNTING:      counting down remaining tokens, watching for natural end_tokens
++//   WAITING_UTF8:  budget exhausted, allowing tokens to complete a UTF-8 sequence
++//   FORCING:       forces forced_tokens token-by-token (all other logits -> -inf)
++//   FORCING_NOTA:  forces pressure.notice_tokens token-by-token, then back to COUNTING
++//   DONE:          passthrough forever
+ //
+ // Parameters:
+ //   vocab          - vocabulary (used for UTF-8 boundary detection; can be nullptr)
+@@ -29,6 +48,7 @@ enum common_reasoning_budget_state {
+ //   end_tokens     - token sequence for natural deactivation
+ //   forced_tokens  - token sequence forced when budget expires
+ //   budget         - max tokens allowed in the reasoning block
++//   pressure       - soft steering params (see common_reasoning_pressure), inert when disabled
+ //   initial_state  - initial state
+ //
+ struct llama_sampler * common_reasoning_budget_init(
+@@ -37,6 +57,7 @@ struct llama_sampler * common_reasoning_budget_init(
+         const std::vector<llama_token> & end_tokens,
+         const std::vector<llama_token> & forced_tokens,
+         int32_t                          budget,
++        const common_reasoning_pressure & pressure = {},
+         common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE);
+ 
+ common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index d163006..8e9b9e9 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -295,12 +295,34 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
+ 
+     // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
+     if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0)) {
++        common_reasoning_pressure pressure;
++        // steering applies only when an explicit budget was set (not the INT_MAX filler
++        // used for grammar-only suppression) so thresholds stay finite and meaningful
++        if (params.reasoning_pressure_start > 0.0) {
++            if (params.reasoning_budget_tokens >= 0) {
++                pressure.start  = params.reasoning_pressure_start;
++                pressure.grace  = params.reasoning_pressure_grace;
++                pressure.boost  = params.reasoning_pressure_boost;
++                pressure.notice_tokens = params.reasoning_pressure_notice_tokens;
++                if (pressure.notice_tokens.empty()) {
++                    // default notice, tokenized here so CLI and any common_params consumer
++                    // get the steering without going through the server parse (patch 0010)
++                    pressure.notice_tokens = common_tokenize(vocab,
++                        std::string("\n\n") + COMMON_REASONING_PRESSURE_DEFAULT_NOTICE + "\n\n", false, true);
++                }
++            }
++            if (!pressure.enabled()) {
++                // fail loud: this fork has been burned by silent no-ops
++                LOG_WRN("%s: reasoning pressure requested but inert (no explicit reasoning budget or empty notice)\n", __func__);
++            }
++        }
+         rbudget = common_reasoning_budget_init(
+             vocab,
+             params.reasoning_budget_start,
+             params.reasoning_budget_end,
+             params.reasoning_budget_forced,
+-            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
++            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens,
++            pressure);
+ 
+         for (const auto & token : prefill_tokens) {
+             llama_sampler_accept(rbudget, token);
+diff --git a/tests/test-reasoning-budget.cpp b/tests/test-reasoning-budget.cpp
+index f7a6017..1cea38a 100644
+--- a/tests/test-reasoning-budget.cpp
++++ b/tests/test-reasoning-budget.cpp
+@@ -44,6 +44,7 @@ static void test_reasoning_budget(
+         end_tokens,
+         forced_tokens,
+         budget,
++        {},  // pressure - not used in state machine tests (patch 0010)
+         initial_state
+     );
+ 
+@@ -124,10 +125,183 @@ static void test_reasoning_budget(
+     (void)sequence;
+ }
+ 
++// patch 0010: pressure steering helpers
++// Count finite (unmasked) candidates; returns the single unmasked token when count == 1.
++static size_t finite_count_of(const std::vector<llama_token_data> & cur, llama_token & finite_token) {
++    size_t finite_count = 0;
++    finite_token = -1;
++    for (const auto & d : cur) {
++        if (std::isfinite(d.logit)) {
++            finite_count++;
++            finite_token = d.id;
++        }
++    }
++    return finite_count;
++}
++
++static void reset_logits(std::vector<llama_token_data> & cur, float base = 0.0f) {
++    for (auto & d : cur) {
++        d.logit = base;
++    }
++}
++
++// Test 7: pressure notice fires at used >= start*budget, masks all but the current
++// notice token, returns to COUNTING and counting resumes normally afterwards.
++static void test_pressure_notice_and_counting() {
++    common_reasoning_pressure pressure;
++    pressure.start  = 0.5;    // notice at used >= 50
++    pressure.grace  = 200;    // squeeze_from = min(50+200, 99) = 99 -> no squeeze interference
++    pressure.boost  = 5.0;
++    pressure.notice_tokens = {5, 6};
++
++    auto * sampler = common_reasoning_budget_init(nullptr, {1}, {2}, {3}, 100, pressure, REASONING_BUDGET_IDLE);
++
++    std::vector<llama_token_data> cur;
++    for (int i = 0; i < 10; i++) {
++        cur.push_back({(llama_token)i, 0.0f, 0.0f});
++    }
++    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
++    llama_token finite_token = -1;
++
++    llama_sampler_accept(sampler, 1); // activate: COUNTING, remaining = 100
++
++    for (int i = 0; i < 49; i++) {
++        llama_sampler_accept(sampler, 9); // used = 49
++    }
++    reset_logits(cur);
++    llama_sampler_apply(sampler, &cur_p);
++    GGML_ASSERT(finite_count_of(cur, finite_token) == cur.size()); // passthrough below threshold
++
++    llama_sampler_accept(sampler, 9); // used = 50 -> FORCING_NOTA
++    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING_NOTA);
++    reset_logits(cur);
++    llama_sampler_apply(sampler, &cur_p);
++    GGML_ASSERT(finite_count_of(cur, finite_token) == 1 && finite_token == 5);
++
++    llama_sampler_accept(sampler, 5); // notice_pos = 1
++    reset_logits(cur);
++    llama_sampler_apply(sampler, &cur_p);
++    GGML_ASSERT(finite_count_of(cur, finite_token) == 1 && finite_token == 6);
++
++    llama_sampler_accept(sampler, 6); // notice complete -> COUNTING
++    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
++    reset_logits(cur);
++    llama_sampler_apply(sampler, &cur_p);
++    GGML_ASSERT(finite_count_of(cur, finite_token) == cur.size()); // passthrough again
++
++    // counting resumes normally: 49 more tokens -> remaining = 1, then exhaustion forces
++    for (int i = 0; i < 49; i++) {
++        llama_sampler_accept(sampler, 9);
++    }
++    llama_sampler_accept(sampler, 9); // remaining = 0 -> FORCING
++    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
++    reset_logits(cur);
++    llama_sampler_apply(sampler, &cur_p);
++    GGML_ASSERT(finite_count_of(cur, finite_token) == 1 && finite_token == 3); // forced[0]
++
++    llama_sampler_free(sampler);
++    fprintf(stderr, "  Test 'pressure notice fires at start fraction and counting resumes' passed\n");
++}
++
++// Test 8: notice-then-squeeze. After the notice completes and used >= squeeze_from,
++// the matcher's next end-token logit gets exactly x*x*boost added (budget=100, start=0.5,
++// grace=10 -> note_from=50, squeeze_from=60; at used=78: x=(78-60)/(100-60)=0.45 -> +1.0125).
++static void test_pressure_notice_then_squeeze() {
++    common_reasoning_pressure pressure;
++    pressure.start  = 0.5;
++    pressure.grace  = 10;
++    pressure.boost  = 5.0;
++    pressure.notice_tokens = {5, 6};
++
++    auto * sampler = common_reasoning_budget_init(nullptr, {1}, {2}, {3}, 100, pressure, REASONING_BUDGET_IDLE);
++
++    std::vector<llama_token_data> cur;
++    for (int i = 0; i < 10; i++) {
++        cur.push_back({(llama_token)i, 0.0f, 0.0f});
++    }
++    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
++    llama_token finite_token = -1;
++
++    llama_sampler_accept(sampler, 1); // activate
++    for (int i = 0; i < 50; i++) {
++        llama_sampler_accept(sampler, 9); // used = 50 -> notice fires
++    }
++    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING_NOTA);
++    llama_sampler_accept(sampler, 5);
++    llama_sampler_accept(sampler, 6); // back to COUNTING, remaining = 50, used = 50
++
++    // used = 57 and used = 58: below squeeze_from (60), no boost yet
++    for (int i = 0; i < 8; i++) {
++        llama_sampler_accept(sampler, 9); // used = 58
++    }
++    reset_logits(cur);
++    llama_sampler_apply(sampler, &cur_p);
++    GGML_ASSERT(fabsf(cur[2].logit) < 1e-6f); // end token untouched below squeeze_from
++
++    // 20 more: used = 78, x = 18/40 = 0.45, boost = 0.45^2 * 5 = 1.0125
++    for (int i = 0; i < 20; i++) {
++        llama_sampler_accept(sampler, 9);
++    }
++    reset_logits(cur);
++    llama_sampler_apply(sampler, &cur_p);
++    GGML_ASSERT(fabsf(cur[2].logit - 1.0125f) < 1e-4f); // end token boosted exactly x*x*boost
++    for (int i = 0; i < 10; i++) {
++        if (i != 2) {
++            GGML_ASSERT(fabsf(cur[i].logit) < 1e-6f); // only the end token is boosted
++        }
++    }
++    (void)finite_token;
++
++    llama_sampler_free(sampler);
++    fprintf(stderr, "  Test 'pressure squeeze adds exactly x*x*boost to the end token' passed\n");
++}
++
++// Test 9: clone mid-FORCING_NOTA. Advance into the notice, clone, push the ORIGINAL
++// past the notice with divergent tokens, then assert the CLONE still masks the notice
++// token at its preserved position (guards the clone state-passthrough fix of 0010).
++static void test_pressure_clone_mid_notice() {
++    common_reasoning_pressure pressure;
++    pressure.start  = 0.5;
++    pressure.grace  = 200;
++    pressure.boost  = 5.0;
++    pressure.notice_tokens = {5, 6, 7}; // 3 tokens so the preserved position is non-trivial
++
++    auto * sampler = common_reasoning_budget_init(nullptr, {1}, {2}, {3}, 100, pressure, REASONING_BUDGET_IDLE);
++
++    std::vector<llama_token_data> cur;
++    for (int i = 0; i < 10; i++) {
++        cur.push_back({(llama_token)i, 0.0f, 0.0f});
++    }
++    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
++    llama_token finite_token = -1;
++
++    llama_sampler_accept(sampler, 1); // activate
++    for (int i = 0; i < 50; i++) {
++        llama_sampler_accept(sampler, 9); // used = 50 -> FORCING_NOTA, notice_pos = 0
++    }
++    llama_sampler_accept(sampler, 5);    // notice_pos = 1
++
++    auto * clone = llama_sampler_clone(sampler);
++
++    // diverge the ORIGINAL: skip the rest of the notice, back to COUNTING
++    llama_sampler_accept(sampler, 9);    // notice_pos = 2
++    llama_sampler_accept(sampler, 9);    // notice_pos = 3 >= size -> COUNTING
++    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
++
++    // the CLONE is unaffected: still mid-notice at notice_pos = 1 -> masks all but 6
++    GGML_ASSERT(common_reasoning_budget_get_state(clone) == REASONING_BUDGET_FORCING_NOTA);
++    reset_logits(cur);
++    llama_sampler_apply(clone, &cur_p);
++    GGML_ASSERT(finite_count_of(cur, finite_token) == 1 && finite_token == 6);
++
++    llama_sampler_free(sampler);
++    llama_sampler_free(clone);
++    fprintf(stderr, "  Test 'clone mid-notice preserves notice position' passed\n");
++}
++
+ // UTF-8 boundary detection unit test
+ // Tests common_utf8_is_complete() from reasoning-budget.h
+-static void test_utf8_boundary_detection() {
+-    // Complete sequences
++static void test_utf8_boundary_detection() {    // Complete sequences
+     GGML_ASSERT(common_utf8_is_complete("hello"));
+     GGML_ASSERT(common_utf8_is_complete(""));
+     GGML_ASSERT(common_utf8_is_complete("\xC2\xA0"));            // complete 2-byte UTF-8 (U+00A0)
+@@ -250,7 +424,16 @@ int main(void) {
+             7);     // forcing continues through i=7
+     }
+ 
+-    printf("OK (6 tests passed)\n");
++    // Test 7: pressure notice fires at the start fraction, counting resumes
++    test_pressure_notice_and_counting();
++
++    // Test 8: quadratic squeeze on the end token after the notice
++    test_pressure_notice_then_squeeze();
++
++    // Test 9: clone mid-FORCING_NOTA keeps its notice position
++    test_pressure_clone_mid_notice();
++
++    printf("OK (9 tests passed)\n");
+ 
+     printf("Testing UTF-8 boundary detection... ");
+     test_utf8_boundary_detection();
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index e418e65..985ab71 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1194,6 +1194,18 @@ json oaicompat_chat_params_parse(
+             // otherwise, as done for the budget itself)
+             llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
+         }
++
++        // patch 0010: reasoning pressure per-request. NB: il copy-through del body
++        // (~1213) porta già in llama_params le chiavi reasoning_pressure_* se presenti
++        // nel body — questo blocco serve a fornire i DEFAULT da opt per le sotto-chiavi
++        // non specificate, e a non attivare mai la pressure senza budget/end-tag.
++        const double pressure_start = json_value(body, "reasoning_pressure_start", opt.reasoning_pressure_start);
++        if (reasoning_budget >= 0 && !chat_params.thinking_end_tag.empty() && pressure_start > 0.0) {
++            llama_params["reasoning_pressure_start"]  = pressure_start;
++            llama_params["reasoning_pressure_grace"]  = json_value(body, "reasoning_pressure_grace",  opt.reasoning_pressure_grace);
++            llama_params["reasoning_pressure_boost"]  = json_value(body, "reasoning_pressure_boost",  opt.reasoning_pressure_boost);
++            llama_params["reasoning_pressure_notice"] = json_value(body, "reasoning_pressure_notice", opt.reasoning_pressure_notice);
++        }
+     }
+ 
+     // Handle "logprobs" field
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index c28558d..20b317f 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -296,6 +296,10 @@ struct server_chat_params {
+     bool enable_thinking = true;
+     int  reasoning_budget = -1;
+     std::string reasoning_budget_message;
++    double       reasoning_pressure_start  = 0.0;   // server default; 0 = steering off unless per-request
++    int32_t      reasoning_pressure_grace  = 200;
++    double       reasoning_pressure_boost  = 9.0;
++    std::string  reasoning_pressure_notice;          // empty = built-in default text
+     std::string media_path;
+     bool force_pure_content = false;
+ };
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index f77ce55..08c03b5 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1240,6 +1240,10 @@ private:
+                 /* enable_thinking       */ enable_thinking,
+                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
+                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
++                /* reasoning_pressure_start */ params_base.sampling.reasoning_pressure_start,
++                /* reasoning_pressure_grace */ params_base.sampling.reasoning_pressure_grace,
++                /* reasoning_pressure_boost */ params_base.sampling.reasoning_pressure_boost,
++                /* reasoning_pressure_notice */ params_base.sampling.reasoning_pressure_notice,
+                 /* media_path            */ params_base.media_path,
+                 /* force_pure_content    */ params_base.force_pure_content_parser
+             };
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 8dbcd44..a3c6f87 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -6,6 +6,7 @@
+ #include "common.h"
+ #include "json-schema-to-grammar.h"
+ #include "llama.h"
++#include "reasoning-budget.h"
+ #include "sampling.h"
+ #include "speculative.h"
+ #include "server-common.h"
+@@ -521,6 +522,27 @@ task_params server_task::params_from_json_cmpl(
+                 params.sampling.reasoning_budget_end.size(),
+                 params.sampling.reasoning_budget_forced.size());
+         }
++
++        // patch 0010: reasoning pressure (soft steering) — spec 2026-08-17
++        params.sampling.reasoning_pressure_start = json_value(data, "reasoning_pressure_start", 0.0);
++        const int32_t pressure_grace = json_value(data, "reasoning_pressure_grace", 200);
++        if (pressure_grace < 0) {
++            throw std::runtime_error("Error: reasoning_pressure_grace must be >= 0"); // same guard as the CLI flag
++        }
++        params.sampling.reasoning_pressure_grace = pressure_grace;
++        params.sampling.reasoning_pressure_boost = json_value(data, "reasoning_pressure_boost", 9.0);
++        std::string pressure_notice = json_value(data, "reasoning_pressure_notice", std::string());
++        if (pressure_notice.empty()) {
++            pressure_notice = COMMON_REASONING_PRESSURE_DEFAULT_NOTICE;
++        }
++        if (params.sampling.reasoning_pressure_start > 0.0 && !end_tag.empty()) {
++            // deterministic sequence, tokenized once — round-trip cache requires the
++            // resent reasoning to contain exactly these tokens
++            params.sampling.reasoning_pressure_notice =
++                "\n\n" + pressure_notice + "\n\n";
++            params.sampling.reasoning_pressure_notice_tokens =
++                common_tokenize(vocab, params.sampling.reasoning_pressure_notice, false, true);
++        }
+     }
+ 
+     {
+-- 
+2.43.0
+

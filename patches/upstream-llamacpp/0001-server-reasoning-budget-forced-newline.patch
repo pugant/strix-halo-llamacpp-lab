@@ -1,0 +1,46 @@
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 5d7fa6a..f15b47a 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -8,6 +8,22 @@ namespace server_schema {
+ // llama.cpp-specific completion schema
+ //
+ 
++// first non-empty reasoning end tag string in the request data
++static std::string first_reasoning_end_tag(const json & data) {
++    if (data.contains("reasoning_budget_end_tags")) {
++        for (const auto & t : data.at("reasoning_budget_end_tags")) {
++            std::string tag = t.get<std::string>();
++            if (!tag.empty()) {
++                return tag;
++            }
++        }
++    }
++    if (data.contains("reasoning_budget_end_tag")) {
++        return data.at("reasoning_budget_end_tag").get<std::string>();
++    }
++    return "";
++}
++
+ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params & params_base, task_params & params) {
+     std::vector<std::unique_ptr<field>> fields;
+     auto add = [&](field * f) {
+@@ -417,13 +433,11 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+         ->set_handler([&](field_eval_context & ctx, const json & data) {
+             GGML_ASSERT(ctx.vocab != nullptr);
+             if (!ctx.params.sampling.reasoning_budget_end.empty()) {
+-                llama_tokens end_tag = ctx.params.sampling.reasoning_budget_end.front();
+-                std::string message = json_value(data, "reasoning_budget_message", std::string());
+-                if (!message.empty()) {
+-                    llama_tokens message_tokens = common_tokenize(ctx.vocab, message, false, true);
+-                    end_tag.insert(end_tag.begin(), message_tokens.begin(), message_tokens.end());
+-                }
+-                ctx.params.sampling.reasoning_budget_forced = std::move(end_tag);
++                const std::string message = json_value(data, "reasoning_budget_message", std::string());
++                // chat templates re-render resent reasoning trimmed, followed by '\n' + end tag,
++                // so emit that exact string to keep a budget-truncated turn round-trippable
++                const std::string forced_str = "\n" + message + (message.empty() ? "" : "\n") + first_reasoning_end_tag(data);
++                ctx.params.sampling.reasoning_budget_forced = common_tokenize(ctx.vocab, forced_str, false, true);
+             }
+         }));
+ 

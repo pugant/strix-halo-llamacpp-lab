@@ -1,0 +1,69 @@
+From 9fe3841607c082cd7b145ecba5972aa50912a8d3 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Sun, 16 Aug 2026 11:00:24 +0200
+Subject: [PATCH] server,cli: separate newline between wrap-up message and end
+ tag
+
+Chat templates re-render a resent assistant turn as '<think>\n' +
+reasoning_content|trim + '\n</think>\n\n'. The trim strips trailing
+whitespace from the extracted reasoning, so a forced tail of
+'\n' + message + end_tag makes the cache diverge at the message/end-tag
+boundary (the resend re-adds a '\n' the generation never emitted) and the
+resend pays a checkpoint rollback instead of an exact cache hit.
+
+Emit '\n' + message + '\n' + end_tag when a wrap-up message is set; keep
+the bare '\n' + end_tag when empty, which is the exact-hit case already
+verified in production.
+---
+ tools/cli/cli.cpp            |  9 ++++++---
+ tools/server/server-task.cpp | 12 ++++++++----
+ 2 files changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/tools/cli/cli.cpp b/tools/cli/cli.cpp
+index 58a519d..27ee086 100644
+--- a/tools/cli/cli.cpp
++++ b/tools/cli/cli.cpp
+@@ -111,11 +111,14 @@ struct cli_context {
+                 }
+                 task.params.sampling.reasoning_budget_end =
+                     common_tokenize(vocab, chat_params.thinking_end_tag, false, true);
+-                // '\n' before the end tag: chat templates re-render an assistant turn as
+-                // '<think>\n' + reasoning_content + '\n</think>\n\n', so without it a
++                // '\n' before the end tag (and after a non-empty wrap-up message): chat
++                // templates re-render an assistant turn as '<think>\n' +
++                // reasoning_content|trim + '\n</think>\n\n', so without it a
+                 // budget-truncated turn does not round-trip on session resend
+                 task.params.sampling.reasoning_budget_forced =
+-                    common_tokenize(vocab, "\n" + defaults.sampling.reasoning_budget_message + chat_params.thinking_end_tag, false, true);
++                    common_tokenize(vocab, "\n" + defaults.sampling.reasoning_budget_message
++                        + (defaults.sampling.reasoning_budget_message.empty() ? "" : "\n")
++                        + chat_params.thinking_end_tag, false, true);
+             }
+ 
+             rd.post_task({std::move(task)});
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 9208af8..8dbcd44 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -506,10 +506,14 @@ task_params server_task::params_from_json_cmpl(
+         if (!end_tag.empty()) {
+             params.sampling.reasoning_budget_end = common_tokenize(vocab, end_tag, false, true);
+             // il template re-renderizza un turno assistant passato come
+-            // '<think>\n' + reasoning_content + '\n</think>\n\n': il '\n' prima dell'end tag
+-            // deve far parte della sequenza forzata, altrimenti un turno tagliato dal budget
+-            // non round-trippa nel resend del client e la prompt cache diverge alla chiusura
+-            params.sampling.reasoning_budget_forced = common_tokenize(vocab, "\n" + message + end_tag, false, true);
++            // '<think>\n' + reasoning_content|trim + '\n</think>\n\n': la sequenza forzata
++            // deve portare un '\n' PRIMA dell'end tag e, quando c'e' un messaggio di
++            // chiusura, anche un '\n' DOPO il messaggio (il trim dell'estratto rimuove i
++            // whitespace di coda, quindi il resend ricompone esattamente '\n' + messaggio
++            // + '\n' + end_tag); senza di cio' un turno tagliato dal budget non round-trippa
++            // nel resend del client e la prompt cache diverge alla chiusura
++            params.sampling.reasoning_budget_forced = common_tokenize(
++                vocab, "\n" + message + (message.empty() ? "" : "\n") + end_tag, false, true);
+ 
+             SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
+                 budget, params.sampling.generation_prompt.c_str(),
+-- 
+2.43.0
+

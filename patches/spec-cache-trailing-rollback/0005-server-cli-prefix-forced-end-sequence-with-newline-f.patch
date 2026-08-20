@@ -1,0 +1,59 @@
+From b5edff093d4560000e87ba85341447e16a7b9d22 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Sat, 15 Aug 2026 18:53:38 +0200
+Subject: [PATCH] server,cli: prefix forced end sequence with newline for cache
+ round-trip
+
+Chat templates (e.g. Qwen3.8) re-render an assistant turn passed back as
+'<think>\n' + reasoning_content + '\n</think>\n\n'. When the reasoning
+budget is exhausted, the forced sequence was just message + end_tag,
+missing the newline the template inserts before </think>: a truncated
+turn therefore diverged on client resend at exactly the reasoning
+boundary, cascading into a cold fallback (spec-boundary-mismatch).
+
+Include the leading '\n' in the forced sequence in both the server and
+CLI call sites so the emitted text matches the re-rendered template.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ tools/cli/cli.cpp            | 5 ++++-
+ tools/server/server-task.cpp | 6 +++++-
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/tools/cli/cli.cpp b/tools/cli/cli.cpp
+index 369c242..58a519d 100644
+--- a/tools/cli/cli.cpp
++++ b/tools/cli/cli.cpp
+@@ -111,8 +111,11 @@ struct cli_context {
+                 }
+                 task.params.sampling.reasoning_budget_end =
+                     common_tokenize(vocab, chat_params.thinking_end_tag, false, true);
++                // '\n' before the end tag: chat templates re-render an assistant turn as
++                // '<think>\n' + reasoning_content + '\n</think>\n\n', so without it a
++                // budget-truncated turn does not round-trip on session resend
+                 task.params.sampling.reasoning_budget_forced =
+-                    common_tokenize(vocab, defaults.sampling.reasoning_budget_message + chat_params.thinking_end_tag, false, true);
++                    common_tokenize(vocab, "\n" + defaults.sampling.reasoning_budget_message + chat_params.thinking_end_tag, false, true);
+             }
+ 
+             rd.post_task({std::move(task)});
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 5b75c44..9208af8 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -505,7 +505,11 @@ task_params server_task::params_from_json_cmpl(
+         }
+         if (!end_tag.empty()) {
+             params.sampling.reasoning_budget_end = common_tokenize(vocab, end_tag, false, true);
+-            params.sampling.reasoning_budget_forced = common_tokenize(vocab, message + end_tag, false, true);
++            // il template re-renderizza un turno assistant passato come
++            // '<think>\n' + reasoning_content + '\n</think>\n\n': il '\n' prima dell'end tag
++            // deve far parte della sequenza forzata, altrimenti un turno tagliato dal budget
++            // non round-trippa nel resend del client e la prompt cache diverge alla chiusura
++            params.sampling.reasoning_budget_forced = common_tokenize(vocab, "\n" + message + end_tag, false, true);
+ 
+             SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
+                 budget, params.sampling.generation_prompt.c_str(),
+-- 
+2.43.0
+

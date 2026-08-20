@@ -1,0 +1,33 @@
+From 41990e5b5da2c4191585ac9d127c3d06f9c96cc4 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Sun, 16 Aug 2026 10:43:01 +0200
+Subject: [PATCH] server: accept reasoning_budget_message per-request on the
+ OAI chat path
+
+The generic copy-through of remaining body keys skips keys already present
+in llama_params, so the message set from the CLI option silently shadowed
+any per-request value. Read the body field explicitly with the CLI value
+as default, mirroring what the budget alias patch does for the token count.
+---
+ tools/server/server-common.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 2fb47f5..e418e65 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1189,7 +1189,10 @@ json oaicompat_chat_params_parse(
+             llama_params["reasoning_budget_tokens"] = reasoning_budget;
+             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
+             llama_params["reasoning_budget_end_tag"] = chat_params.thinking_end_tag;
+-            llama_params["reasoning_budget_message"] = opt.reasoning_budget_message;
++            // the copy-through of remaining body keys below skips keys already set
++            // here, so the per-request message must be read explicitly (CLI default
++            // otherwise, as done for the budget itself)
++            llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
+         }
+     }
+ 
+-- 
+2.43.0
+

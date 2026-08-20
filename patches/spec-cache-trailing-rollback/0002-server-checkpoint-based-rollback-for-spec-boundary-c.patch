@@ -1,0 +1,316 @@
+From a393c3a88a96d2a5abecdeb4b19dedb1b6edf05e Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Sat, 15 Aug 2026 16:41:12 +0200
+Subject: [PATCH 2/4] server: checkpoint-based rollback for spec-boundary cache
+ salvage
+
+v2: direct llama_memory_seq_rm on the draft context corrupts the MTP
+pairing state (pending_h rows live outside the context memory), which
+crashes common_speculative_process with 'missing MTP boundary'.
+
+Capture the speculative-impl state together with each context checkpoint
+(create_checkpoint runs before the pending batch is decoded, so the MTP
+boundary rows sit exactly at pos_max and stay coherent with the restored
+target/draft state). On a diverging cache boundary, restore the newest
+checkpoint that stays within the common prefix and carries a coherent
+speculative state, then reprocess only the tokens after it.
+
+load() accepts entries with a shorter common prefix when such a
+checkpoint exists (slot and RAM states; disk states keep the exact rule
+because they restore without live checkpoints).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ common/common.cpp               |  7 +++
+ common/common.h                 |  4 ++
+ tools/server/server-context.cpp | 81 ++++++++++++++++++++-------------
+ tools/server/server-task.cpp    | 35 +++++++-------
+ tools/server/server-task.h      |  1 -
+ 5 files changed, 76 insertions(+), 52 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index 5b92940..17adcce 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2068,6 +2068,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoin
+     pos_max(other.pos_max),
+     data_tgt(other.data_tgt),
+     data_dft(other.data_dft),
++    data_spec(other.data_spec),
+     storage_tgt(llama_state_seq_storage_clone(other.storage_tgt)),
+     storage_dft(llama_state_seq_storage_clone(other.storage_dft)) {
+ }
+@@ -2083,6 +2084,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prom
+ 
+     data_tgt = other.data_tgt;
+     data_dft = other.data_dft;
++    data_spec = other.data_spec;
+ 
+     llama_state_seq_storage_free(storage_tgt);
+     llama_state_seq_storage_free(storage_dft);
+@@ -2098,6 +2100,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && o
+     pos_max(other.pos_max),
+     data_tgt(std::move(other.data_tgt)),
+     data_dft(std::move(other.data_dft)),
++    data_spec(std::move(other.data_spec)),
+     storage_tgt(other.storage_tgt),
+     storage_dft(other.storage_dft) {
+     other.storage_tgt = nullptr;
+@@ -2118,6 +2121,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
+ 
+     data_tgt = std::move(other.data_tgt);
+     data_dft = std::move(other.data_dft);
++    data_spec = std::move(other.data_spec);
+ 
+     storage_tgt = other.storage_tgt;
+     storage_dft = other.storage_dft;
+@@ -2131,6 +2135,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
+ size_t common_prompt_checkpoint::size() const {
+     return data_tgt.size() +
+            data_dft.size() +
++           data_spec.size() +
+            llama_state_seq_storage_size(storage_tgt) +
+            llama_state_seq_storage_size(storage_dft);
+ }
+@@ -2147,6 +2152,8 @@ void common_prompt_checkpoint::clear() {
+ 
+     data_tgt.clear();
+     data_dft.clear();
++    data_spec.clear();
++    data_spec.shrink_to_fit();
+ 
+     llama_state_seq_storage_free(storage_tgt);
+     llama_state_seq_storage_free(storage_dft);
+diff --git a/common/common.h b/common/common.h
+index 4084470..a24a985 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1074,6 +1074,10 @@ struct common_prompt_checkpoint {
+ 
+     std::vector<uint8_t> data_tgt;
+     std::vector<uint8_t> data_dft;
++    // speculative-impl state (e.g. MTP boundary rows) coherent with the
++    // checkpoint position: captured right after the batch decoded so far,
++    // so the pending boundary sits at pos_max
++    std::vector<uint8_t> data_spec;
+ 
+     llama_state_seq_storage * storage_tgt = nullptr;
+     llama_state_seq_storage * storage_dft = nullptr;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 0a50de6..741a977 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -153,11 +153,11 @@ struct server_slot {
+         return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id, state_spec);
+     }
+ 
+-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, bool spec_trailing_rm) {
++    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+         const bool spec_state_required = common_speculative_state_required(spec);
+         bool cache_hit = false;
+         uint64_t disk_entry_id = 0;
+-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec_state_required, spec_trailing_rm, &cache_hit, &disk_entry_id);
++        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec_state_required, &cache_hit, &disk_entry_id);
+         if (res && cache_hit) {
+             if (spec_state_required && prompt.data.spec.empty()) {
+                 SLT_WRN(*this, "%s", "failed to load required speculative state from prompt cache\n");
+@@ -1344,16 +1344,7 @@ private:
+ 
+                 ret->prompt_save(*prompt_cache);
+ 
+-                // dense KV or bounded RS recurrent state on both contexts allows salvaging
+-                // cache entries whose tail diverges from the new prompt (spec-boundary)
+-                const bool spec_trailing_rm =
+-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+-                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) &&
+-                    (!ctx_dft ||
+-                     ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+-                     ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS);
+-
+-                if (!ret->prompt_load(*prompt_cache, task.tokens, spec_trailing_rm)) {
++                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                     ret->prompt_clear(false);
+                     SRV_INF("prompt cache cold fallback: slot=%d reason=target-draft-restore-rejected target_and_draft_cleared=true\n",
+                             ret->id);
+@@ -2038,6 +2029,16 @@ private:
+         cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+         cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+ 
++        // snapshot the speculative-impl state together with the contexts: the
++        // checkpoint is taken before the pending batch is decoded, so the MTP
++        // boundary rows (pending_h) sit exactly at pos_max and stay coherent
++        // with the restored target/draft state. May remain empty when the
++        // implementation has no state available (then the checkpoint cannot be
++        // used for a spec-boundary rollback, only for the non-spec paths).
++        if (spec && common_speculative_state_required(spec.get())) {
++            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
++        }
++
+         SLT_INF(slot,
+                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+@@ -2801,37 +2802,53 @@ private:
+                             // boundaries, so the speculative state is only valid at an exact cache
+                             // boundary. When the new prompt shares a strictly shorter prefix
+                             // (lcp < cached_tokens, e.g. a client re-sending a normalized
+-                            // conversation), try to salvage the cache with a bounded trailing
+-                            // rollback of the target and draft memory (dense KV or bounded RS
+-                            // recurrent state, same primitive used by the context-shift path):
+-                            // drop everything past the common prefix, discard the stale
+-                            // speculative state and reprocess only the remaining tokens.
+-                            // Full-prefix extension and the exact-hit one-token replay below
+-                            // remain supported. If either memory cannot roll back, keep the
+-                            // previous behavior and reprocess cold.
++                            // conversation), try to salvage the cache by restoring the newest
++                            // context checkpoint that stays within the common prefix AND carries
++                            // a speculative boundary row coherent with its position: target and
++                            // draft state come back together, and only the tokens after the
++                            // checkpoint are reprocessed. If no usable checkpoint exists, keep
++                            // the previous behavior and reprocess cold. Full-prefix extension
++                            // and the exact-hit one-token replay below remain supported.
+                             if (common_speculative_state_required(spec.get()) &&
+                                 n_past > 0 && n_past < slot.prompt.n_tokens()) {
+-                                const llama_pos p0_rm = slot.prompt.tokens.pos_next(n_past);
++                                bool rolled_back = false;
++
++                                // newest checkpoint with a coherent speculative state that does
++                                // not extend beyond the common prefix
++                                const auto it_ckpt_ok = std::find_if(
++                                    slot.prompt.checkpoints.rbegin(),
++                                    slot.prompt.checkpoints.rend(),
++                                    [&](const common_prompt_checkpoint & cur) {
++                                        return cur.n_tokens <= (int64_t) n_past && !cur.data_spec.empty();
++                                    });
++
++                                if (it_ckpt_ok != slot.prompt.checkpoints.rend()) {
++                                    const bool restored_tgt = it_ckpt_ok->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++                                    const bool restored_dft = it_ckpt_ok->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++
++                                    if (restored_tgt && restored_dft && common_speculative_set_state(spec.get(), slot.id, it_ckpt_ok->data_spec)) {
++                                        n_past = (int) it_ckpt_ok->n_tokens;
+ 
+-                                bool rolled_back = llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0_rm, -1);
++                                        SLT_INF(slot,
++                                                "prompt cache checkpoint rollback: lcp=%d cached_tokens=%d ckpt_n_tokens=%" PRId64 " ckpt_pos_max=%d request_tokens=%d\n",
++                                                n_past, slot.prompt.n_tokens(), it_ckpt_ok->n_tokens, it_ckpt_ok->pos_max, slot.task->n_tokens());
+ 
+-                                if (rolled_back && ctx_dft) {
+-                                    rolled_back = llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, p0_rm, -1);
++                                        rolled_back = true;
++                                    } else {
++                                        SLT_WRN(slot,
++                                                "failed to restore context checkpoint for spec-boundary rollback (target=%d draft=%d, pos_min = %d, pos_max = %d, n_tokens = %" PRId64 "); forcing full prompt re-processing\n",
++                                                (int) restored_tgt, (int) restored_dft,
++                                                it_ckpt_ok->pos_min, it_ckpt_ok->pos_max, it_ckpt_ok->n_tokens);
++                                    }
+                                 }
+ 
+-                                if (rolled_back) {
+-                                    SLT_INF(slot,
+-                                            "prompt cache trailing rollback: lcp=%d cached_tokens=%d request_tokens=%d p0=%d\n",
+-                                            n_past, slot.prompt.n_tokens(), slot.task->n_tokens(), p0_rm);
+-                                } else {
++                                if (!rolled_back) {
+                                     SLT_INF(slot,
+                                             "prompt cache cold fallback: reason=spec-boundary-mismatch lcp=%d cached_tokens=%d request_tokens=%d\n",
+                                             n_past, slot.prompt.n_tokens(), slot.task->n_tokens());
+                                     n_past = 0;
++                                    common_speculative_set_state(spec.get(), slot.id, {});
+                                 }
+-
+-                                // the speculative state is tied to the exact cache boundary: discard it
+-                                common_speculative_set_state(spec.get(), slot.id, {});
+                             }
+ 
+                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 5b75c44..c1353a4 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -2993,7 +2993,6 @@ bool server_prompt_cache::load(
+               llama_context * ctx_dft,
+                     int32_t   id_slot,
+                        bool   spec_state_required,
+-                       bool   spec_trailing_rm,
+                        bool * cache_hit,
+                    uint64_t * disk_entry_id) {
+     if (cache_hit != nullptr) {
+@@ -3007,31 +3006,26 @@ bool server_prompt_cache::load(
+ 
+     // With speculative decoding, an entry whose token sequence extends past the
+     // common prefix (lcp < cached_tokens, e.g. a client re-sending a normalized
+-    // conversation) can still be salvaged when the target and draft memories
+-    // support removing the diverging tail: the slot code then performs a bounded
+-    // trailing rollback and reprocesses only the new tokens.
+-    const auto spec_boundary_valid = [&](size_t cached_tokens, int lcp) {
++    // conversation) can still be salvaged when a context checkpoint within the
++    // common prefix carries a speculative boundary row coherent with its
++    // position: the slot code then restores that checkpoint and reprocesses
++    // only the tokens after it.
++    const auto spec_boundary_valid = [&](const std::list<common_prompt_checkpoint> & checkpoints, size_t cached_tokens, int lcp) {
+         if (!spec_state_required || lcp == (int) cached_tokens) {
+             return true;
+         }
+-        if (!spec_trailing_rm || lcp < 0 || cached_tokens <= (size_t) lcp) {
++        if (lcp < 0 || cached_tokens <= (size_t) lcp) {
+             return false;
+         }
+-        const size_t delta = cached_tokens - (size_t) lcp;
+-        // dense KV (n_rs_seq == 0) supports removing any tail; bounded RS state only up to the snapshot bound
+-        uint32_t n_rs_min = UINT32_MAX;
+-        if (const uint32_t n_rs = llama_n_rs_seq(ctx_tgt); n_rs > 0) {
+-            n_rs_min = std::min(n_rs_min, n_rs);
+-        }
+-        if (ctx_dft) {
+-            if (const uint32_t n_rs = llama_n_rs_seq(ctx_dft); n_rs > 0) {
+-                n_rs_min = std::min(n_rs_min, n_rs);
++        for (const auto & cur : checkpoints) {
++            if (cur.n_tokens <= (int64_t) lcp && !cur.data_spec.empty()) {
++                return true;
+             }
+         }
+-        return n_rs_min == UINT32_MAX || delta <= (size_t) n_rs_min;
++        return false;
+     };
+ 
+-    const bool base_boundary_valid = spec_boundary_valid(prompt.tokens.size(), lcp_best);
++    const bool base_boundary_valid = spec_boundary_valid(prompt.checkpoints, prompt.tokens.size(), lcp_best);
+     float f_keep_best = base_boundary_valid && prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+     float sim_best    = base_boundary_valid ? float(lcp_best) / std::max<size_t>(1, tokens_new.size()) : -1.0f;
+ 
+@@ -3053,7 +3047,7 @@ bool server_prompt_cache::load(
+     for (auto it = states.begin(); it != states.end(); ++it) {
+         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+ 
+-        if (!spec_boundary_valid(it->tokens.size(), lcp_cur)) {
++        if (!spec_boundary_valid(it->checkpoints, it->tokens.size(), lcp_cur)) {
+             SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=ram lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
+                     lcp_cur, it->tokens.size(), tokens_new.size(), it->data.spec.size());
+             continue;
+@@ -3093,7 +3087,10 @@ bool server_prompt_cache::load(
+ 
+         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+ 
+-        if (!spec_boundary_valid(it->tokens.size(), lcp_cur)) {
++        // disk states restore without live checkpoints, so the exact-prefix
++        // rule still applies there
++        if (spec_state_required &&
++            lcp_cur != (int) it->tokens.size()) {
+             SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=disk entry=%" PRIu64 " lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
+                     it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->spec.size());
+             continue;
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index efbfcbd..a3ebc1e 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -712,7 +712,6 @@ struct server_prompt_cache {
+               llama_context * ctx_drft,
+                     int32_t   id_slot,
+                        bool   spec_state_required,
+-                       bool   spec_trailing_rm,
+                        bool * cache_hit,
+                    uint64_t * disk_entry_id);
+ 
+-- 
+2.43.0
+

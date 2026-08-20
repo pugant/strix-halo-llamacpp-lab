@@ -1,0 +1,38 @@
+From b5562f8c475a9e694f2f07b78c2ed68b407aef02 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Sat, 15 Aug 2026 21:58:40 +0200
+Subject: [PATCH] server: accept thinking_token_budget (vLLM name) as
+ per-request budget alias
+
+pi-ai sends the per-request reasoning budget as 'thinking_token_budget'
+(vLLM field name) via its openai-completions streamFn; the fork only
+read 'thinking_budget_tokens', so the client-side thinking level had no
+matching hard cap and the server default always applied.
+
+Fall back to the vLLM name before the server default. Exact name and
+default behavior unchanged.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ tools/server/server-common.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index adc452a..2fb47f5 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1176,6 +1176,11 @@ json oaicompat_chat_params_parse(
+     // Reasoning budget: pass parameters through to sampling layer
+     {
+         int reasoning_budget = json_value(body, "thinking_budget_tokens", -1);
++        if (reasoning_budget == -1) {
++            // vLLM name, used by pi-ai (openai-completions streamFn): per-request
++            // reasoning budget under the alternative field name
++            reasoning_budget = json_value(body, "thinking_token_budget", -1);
++        }
+         if (reasoning_budget == -1) {
+             reasoning_budget = opt.reasoning_budget;
+         }
+-- 
+2.43.0
+

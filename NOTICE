@@ -1,0 +1,23 @@
+# NOTICE — Credits & Attribution
+
+This project is an independent community experiment and is NOT affiliated with,
+endorsed by, or sponsored by AMD, ggml-org, or any hardware vendor.
+
+It stands on the shoulders of:
+
+- **ggml-org / llama.cpp** (Georgi Gerganov and contributors, MIT) — the main
+  branch of llama.cpp is the foundation of everything here and is invaluable
+  to the whole local-inference community. Thank you for keeping it open.
+  https://github.com/ggml-org/llama.cpp
+- **charlie12345** — maintainer of the ROCmFPX fork of llama.cpp, where the
+  ROCmFP4 / Q4_0_ROCMFP4_STRIX_LEAN preset, HIP kernels and GGUF extensions
+  live. Most of the code this lab builds upon (and merges PR #67–#82, incl.
+  our own #69) is their work. https://github.com/charlie12345/ROCmFPX
+- **kyuz0** — the `amd-strix-halo-toolboxes` / `docker-llm-service` containers
+  this lab builds and runs on. https://github.com/kyuz0
+- **The Strix Halo community** — where the ROCmFP4-STRIX_LEAN preset was born
+  and tuned collectively; the benchmarks, feedback and hardware knowledge that
+  shaped every decision in this repo.
+
+If we forgot anyone: it is an omission, not an intent — open an issue and we
+will credit you.
