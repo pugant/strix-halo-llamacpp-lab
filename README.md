@@ -14,6 +14,7 @@
 | [`pugant/Qwen3.8-27B-imatrix`](https://huggingface.co/pugant/Qwen3.8-27B-imatrix) | The importance matrix used by the preset above |
 | [`pugant/grug-35b-v2-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/grug-35b-v2-ROCmFP4-STRIX_LEAN) | MoE 35B-A3B, reasoning/tool-call finetune |
 | [`pugant/Ornith-1.0-35B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/Ornith-1.0-35B-ROCmFP4-STRIX_LEAN) | MoE 35B-A3B, multimodal |
+| [`pugant/Ornith-1.5-35B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/Ornith-1.5-35B-ROCmFP4-STRIX_LEAN) | MoE 35B-A3B, multimodal — MTP head measured, NOT recommended (degraded by the finetune) |
 | [`pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN) | Mamba-hybrid MoE |
 | [`pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX`](https://huggingface.co/pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX) | MoE 35B-A3B at Q6_0 |
 
@@ -339,6 +340,7 @@ The same pipeline produced the other published quants. Their quantize scripts ar
 |---|---|---|
 | grug-35b-v2 | MoE 35B-A3B, reasoning/tool-call finetune | [`pugant/grug-35b-v2-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/grug-35b-v2-ROCmFP4-STRIX_LEAN) |
 | Ornith-1.0-35B | MoE 35B-A3B, **multimodal** | [`pugant/Ornith-1.0-35B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/Ornith-1.0-35B-ROCmFP4-STRIX_LEAN) |
+| Ornith-1.5-35B | MoE 35B-A3B, **multimodal**; ships an MTP head whose pos-2 acceptance collapsed to ~0.07 (0.99 pos-1) — speculative decoding loses to plain at every n-max | [`pugant/Ornith-1.5-35B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/Ornith-1.5-35B-ROCmFP4-STRIX_LEAN) |
 | Nemotron-3.5-Lightning-30B-A3B | **Mamba-hybrid** MoE | [`pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN) |
 | Qwen3.6-35B-A3B | MoE 35B-A3B, Q6_0 | [`pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX`](https://huggingface.co/pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX) |
 
