@@ -1,0 +1,10 @@
+*
+!*.*
+!fixtures/
+!fixtures/**/
+!fixtures/**/*.*
+!snapshots/
+*.o
+ggml-common.h
+**/*.swp
+!peg-parser

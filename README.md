@@ -5,7 +5,7 @@
 - **What** — llama.cpp server experiments focused on one machine class: per-request speculative-decoding **routing** (built-in MTP ⇄ external DFlash2 block-diffusion drafter), a **reasoning ("thinking") budget** with cache-friendly truncation, **spec-boundary cache salvage**, and a complete **ROCmFP4-STRIX_LEAN quantization pipeline** (imatrix → quantize → sanitize → publish).
 - **Where it runs** — AMD Strix Halo: Ryzen AI MAX+ 395, Radeon 8060S iGPU (gfx1151, RDNA 3.5), 128 GB unified LPDDR5X, inside ROCm 7.2.4 containers built from [kyuz0](https://github.com/kyuz0)'s [amd-strix-halo-toolboxes](https://github.com/kyuz0/amd-strix-halo-toolboxes).
 - **Status** — the dual-drafter routing server is live in daily production since the morning of **2026-08-20** (published the same day), on the author's machine. Every performance claim in this README was measured on our hardware; nothing is projected or taken from vendor material.
-- **Code** — lives on the companion branch [`pugant/ROCmFPX:drafter-routing`](https://github.com/pugant/ROCmFPX/tree/drafter-routing) (a fork of [charlie12345/ROCmFPX](https://github.com/charlie12345/ROCmFPX), itself a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)). This repo carries the same work as `git am`-clean patches, plus the scripts and the raw benchmark notes.
+- **Code** — the **full buildable source of the runtime fork is included in this repo under [`rocmfpx/`](rocmfpx/)** (snapshot of our `drafter-routing` branch, a fork of [charlie12345/ROCmFPX](https://github.com/charlie12345/ROCmFPX), itself a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)). The same work is also carried as `git am`-clean patches, plus the scripts and the raw benchmark notes.
 - **Models** (Hugging Face, weights under their own licenses):
 
 | Repo | What it is |
@@ -17,7 +17,7 @@
 | [`pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN) | Mamba-hybrid MoE |
 | [`pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX`](https://huggingface.co/pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX) | MoE 35B-A3B at Q6_0 |
 
-**Repository layout** — `patches/` (all features, `git am`-able) · `scripts/` (download / imatrix / quantize / sanitize / test / bench) · `docker/` (convert container) · `docs/` (raw experiment notes) · [LICENSE](LICENSE) · [NOTICE](NOTICE).
+**Repository layout** — `rocmfpx/` (**full runtime fork source, buildable — clone this repo and compile**) · `patches/` (all features, `git am`-able) · `scripts/` (download / imatrix / quantize / sanitize / test / bench) · `docker/` (convert container) · `docs/` (raw experiment notes) · [LICENSE](LICENSE) · [NOTICE](NOTICE).
 
 ---
 
@@ -64,13 +64,13 @@ If we forgot anyone: it is an omission, not an intent — open an issue and we w
 - Boot fallback: if the draft-model file is missing, the server degrades to mono MTP-nextn with a warning; an explicit `"spec_drafter"` override then returns a clear 400.
 - Metrics: Prometheus counter `spec_route_cache_rebuild_total` (per kind), plus `spec-route:` log lines.
 
-**Patch.** [`patches/drafter-routing/0001-drafter-routing-mtp-dflash-per-request.patch`](patches/drafter-routing/0001-drafter-routing-mtp-dflash-per-request.patch) — this single file contains the full 14-commit series, `git am`-clean.
+**Patch.** [`patches/drafter-routing/0001-drafter-routing-mtp-dflash-per-request.patch`](patches/drafter-routing/0001-drafter-routing-mtp-dflash-per-request.patch) — this single file contains the full 14-commit series, `git am`-clean (the resulting code is already included in [`rocmfpx/`](rocmfpx/)).
 
 **Status.** In daily production since 2026-08-20; validated by gates T1–T5 (see [Validation gates](#validation-gates-t1t5)).
 
 ### DFlash2 block-diffusion drafter porting
 
-**What.** Port of upstream llama.cpp PR #27342 ("spec: add DFlash2 support") adapted to the fork's internals — commits [`ba2485545`](https://github.com/pugant/ROCmFPX/commit/ba2485545), [`ebf1cc855`](https://github.com/pugant/ROCmFPX/commit/ebf1cc855), [`fdd53c521`](https://github.com/pugant/ROCmFPX/commit/fdd53c521) on the [`drafter-routing`](https://github.com/pugant/ROCmFPX/tree/drafter-routing) branch. Usage notes in [`docs/dflash2.md`](https://github.com/pugant/ROCmFPX/blob/drafter-routing/docs/dflash2.md) on that branch.
+**What.** Port of upstream llama.cpp PR #27342 ("spec: add DFlash2 support") adapted to the fork's internals — commits `ba2485545`, `ebf1cc855`, `fdd53c521` (all included in [`rocmfpx/`](rocmfpx/)). Usage notes in [`rocmfpx/docs/dflash2.md`](rocmfpx/docs/dflash2.md).
 
 **Outcome.** NO-GO as a full replacement — free prose pays −26% tg — but it set the deterministic record on our hardware: **57.4 tok/s**. This asymmetry is exactly what motivated the routing work above.
 
@@ -256,12 +256,11 @@ The host-side `gguf-py` does **not** know the fork's custom tensor types — run
 
 ### Step 6 — Build the fork's llama-server (Vulkan RADV)
 
-The server binary is **not** distributed: build it from the branch. We build inside Docker with the Vulkan Dockerfile from kyuz0's toolboxes, feeding it our staged sources instead of its default clone (`$TB` = your checkout of [kyuz0/amd-strix-halo-toolboxes](https://github.com/kyuz0/amd-strix-halo-toolboxes)):
+The server binary is **not** distributed: build it from the sources, **already included in this repo under `rocmfpx/`** (no extra clone needed). We build inside Docker with the Vulkan Dockerfile from kyuz0's toolboxes, feeding it our sources instead of its default clone (`$TB` = your checkout of [kyuz0/amd-strix-halo-toolboxes](https://github.com/kyuz0/amd-strix-halo-toolboxes)):
 
 ```bash
-git clone -b drafter-routing https://github.com/pugant/ROCmFPX.git
 mkdir -p image-build/src
-git -C ROCmFPX archive --format=tar HEAD | tar -x -C image-build/src
+cp -r rocmfpx/. image-build/src/          # the full fork source, included in this repo
 sed -e 's|^RUN git clone -b ${BRANCH} --single-branch ${REPO} \.$|COPY src/ .|' \
     -e 's|^RUN git clean -xdf \\$|RUN patch -p1 < /tmp/llama-grammar.patch \\|' \
     -e 's|^  \&\& patch -p1 < /tmp/llama-grammar.patch \\$|  \&\& true \\|' \
@@ -342,9 +341,9 @@ The same pipeline produced the other published quants. Their quantize scripts ar
 | Patch | Series | Purpose | Upstream status |
 |---|---|---|---|
 | [`patches/spec-cache-trailing-rollback/`](patches/spec-cache-trailing-rollback/) | 9-patch series — breakdown below | Spec-boundary cache salvage + reasoning-budget request surface | partially merged — PR #69 |
-| [`patches/drafter-routing/0001-drafter-routing-mtp-dflash-per-request.patch`](patches/drafter-routing/0001-drafter-routing-mtp-dflash-per-request.patch) | full 14-commit series in one file | Dual draft contexts, per-request routing, drafter-tagged cache, boot fallback, metrics | lives on `drafter-routing` only |
+| [`patches/drafter-routing/0001-drafter-routing-mtp-dflash-per-request.patch`](patches/drafter-routing/0001-drafter-routing-mtp-dflash-per-request.patch) | full 14-commit series in one file | Dual draft contexts, per-request routing, drafter-tagged cache, boot fallback, metrics | included in [`rocmfpx/`](rocmfpx/) |
 | [`patches/reasoning-pressure/0010-reasoning-pressure.patch`](patches/reasoning-pressure/0010-reasoning-pressure.patch) | single | Reasoning-pressure steering (notice + squeeze) — **NO-GO experiment**, documented, not for production | archived |
-| [`patches/spec-verify-log/0001-spec-verify-log.patch`](patches/spec-verify-log/0001-spec-verify-log.patch) | single | Per-position acceptance instrumentation of the verify batch | lives on `drafter-routing` only |
+| [`patches/spec-verify-log/0001-spec-verify-log.patch`](patches/spec-verify-log/0001-spec-verify-log.patch) | single | Per-position acceptance instrumentation of the verify batch | instrumentation only, not in the runtime build |
 | [`patches/upstream-llamacpp/0001-server-reasoning-budget-forced-newline.patch`](patches/upstream-llamacpp/0001-server-reasoning-budget-forced-newline.patch) + [`README.md`](patches/upstream-llamacpp/README.md) | single | The reasoning-budget forced-newline fix as prepared against ggml-org master | **PR archived, never sent** — see the patch dir README for the story |
 
 Breakdown of [`patches/spec-cache-trailing-rollback/`](patches/spec-cache-trailing-rollback/):
@@ -367,15 +366,15 @@ All patches apply with `git am` on the appropriate branch of the fork.
 ```text
 ggml-org/llama.cpp (main)
   └── charlie12345/ROCmFPX          (ROCmFP4 preset, HIP kernels, GGUF types)
-        ├── pugant/ROCmFPX:main                  (mirror, stale at upstream PR #66)
-        ├── pugant/ROCmFPX:spec-cache-soft-wrap  (pre-existing, from the upstream-PR flow)
-        └── pugant/ROCmFPX:drafter-routing  ← THIS LAB'S CODE
-              (52 commits ahead of our mirror: our work + upstream merges
-               of charlie12345 PRs #67–#82; other inherited branches omitted)
-
-  pugant/strix-halo-llamacpp-lab  ← THIS REPO — no fork code: the branch's
-                                    work mirrored as git am-able patches,
-                                    plus docs and replication scripts
+        └── pugant fork (GitHub, since removed): branch drafter-routing
+              = charlie main + upstream merges PR #67–#82 + our work
+              (routing, DFlash2 port, reasoning budget, cache salvage)
+                    │  snapshot of its final state (34a127168)
+                    ▼
+  pugant/strix-halo-llamacpp-lab  ← THIS REPO — the full fork source
+                                    included in rocmfpx/ (buildable),
+                                    plus the same work as git am-able
+                                    patches, docs and replication scripts
 ```
 
 What is merged where:
@@ -384,7 +383,11 @@ What is merged where:
 |---|---|
 | Spec-boundary cache trailing rollback (+ reasoning-budget resend alignment) | Merged in [charlie12345/ROCmFPX#69](https://github.com/charlie12345/ROCmFPX/pull/69) |
 | Reasoning-budget forced-newline, prepared for ggml-org | Upstream PR **archived, not sent** — story in [`patches/upstream-llamacpp/README.md`](patches/upstream-llamacpp/README.md) |
-| Everything else (drafter routing, DFlash2 port, verify-log, remaining cache patches) | Only on [`pugant/ROCmFPX:drafter-routing`](https://github.com/pugant/ROCmFPX/tree/drafter-routing), mirrored here as patches |
+| Everything else (drafter routing, DFlash2 port, verify-log, remaining cache patches) | **Included in this repo**: full source in [`rocmfpx/`](rocmfpx/), plus the `git am`-able series in `patches/` |
+
+> History note: our pull requests to the fork (incl. #69, merged; #80, open at
+> the time) went through the now-removed GitHub fork; the patches and this
+> snapshot preserve everything.
 
 ---
 
