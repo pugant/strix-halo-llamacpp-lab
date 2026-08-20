@@ -72,6 +72,61 @@ the full list):
 5. Logits are requested on every noise-block position: the selector lattice
    reads the full-block logits.
 
+## Drafter routing (dual MTP + DFlash2, per request)
+
+One server, one target model, **both drafters loaded**: MTP (nextn, n_max=6)
+for prose/chat, DFlash2 (n_max=7) for agentic/deterministic workloads, picked
+per request. Branch `drafter-routing`.
+
+```bash
+llama-server -m Qwen3.8-27B-Q4_0_ROCMFP4_STRIX_LEAN.gguf \
+  -ngl 999 -fa on --jinja -c 16384 \
+  --spec-type draft-mtp,draft-dflash \
+  --spec-draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
+  --spec-draft-ngl all --spec-draft-n-max 7 \
+  --spec-draft-p-min 0.75 --spec-draft-p-split 0.10
+```
+
+`--spec-draft-n-max` is the global sizing (7); per-impl clamps apply
+(MTP→6 in dual mode, DFlash2→7 via `block_size`).
+
+**Policy (client-agnostic):** requests whose body carries a non-empty `tools`
+array or a `tool_choice` != "none" are routed to DFlash2; everything else
+defaults to MTP (conservative: misrouting prose to DFlash2 costs ~-26%, the
+reverse costs nothing). **Override:** optional body field
+`"spec_drafter": "mtp" | "dflash" | "auto"` (`auto` = absent = policy);
+any other value (or non-string) is a 400. Requesting a drafter that is not
+loaded (e.g. after boot fallback) is an explicit 400, never a silent
+fallback.
+
+**Boot fallback:** if the DFlash2 model file is missing/corrupt the server
+drops `draft-dflash` with a WARNING and continues mono MTP-nextn. A single
+`--spec-type` keeps the exact mono behavior (identity policy).
+
+**Observability** (`--metrics`, level 3 logs): `spec-route:` markers at boot
+(`dual mode active: ...`), per task (`signal=<tools|none|override:X> ->
+drafter=<mtp|dflash>`) and on cache tag mismatch; counters
+`spec_route_requests_total{drafter}`, `spec_route_override_total`,
+`spec_route_cache_rebuild_total{kind}`.
+
+**Cache semantics:** the target KV is drafter-independent and always reused
+(prompt-cache entries carry the saving drafter as a tag; on mismatch the
+target is restored and the draft side rebuilds — `mtp-resync` or
+`dflash-prefix-miss (<P> tok)`, one degraded first draft, correct output).
+Checkpoints are tagged the same way.
+
+**Rollback note:** recurrent-state (RS) partial rollback stays enabled with
+`draft-dflash` (the blanket "any non-MTP disables RS" condition only applies
+to ngram-style methods; without RS the hybrid target falls back to full
+checkpoint replay, which taxes every partially-rejected round ~-7..-15% tg).
+Trailing rollback works in dual mode.
+
+**Known limits:** adding `tools` to a conversation re-renders the chat
+template system block (prefix reuse drops to ~40 tokens — template property,
+identical on mono); after a drafter switch with cache hit the newly routed
+drafter starts from a missing draft prefix (degraded first drafts, target KV
+fully reused).
+
 ## Related
 
 - Target model (this fork's quant): [pugant/Qwen3.8-27B-MTP-Q4_0_ROCMFP4_STRIX_LEAN](https://huggingface.co/pugant/Qwen3.8-27B-MTP-Q4_0_ROCMFP4_STRIX_LEAN)
