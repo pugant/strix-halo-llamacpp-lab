@@ -1929,7 +1929,6 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    GGML_UNUSED(flags);
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -1974,6 +1973,14 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         // skip empty streams
         if (cell_count == 0) {
             continue;
+        }
+
+        // ckpt split-restore: a multi-range save is stored as split device blocks
+        // and is restored through the serial split-buffer copy path
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && cr.data.size() > 1) {
+            LLAMA_LOG_WARN("%s: saving %d non-contiguous cell ranges for stream %d (seq %d) "
+                    "to device storage; split-buffer restore will be used\n",
+                    __func__, (int) cr.data.size(), s, seq_id);
         }
 
         state_write_meta(io, cr, seq_id);
