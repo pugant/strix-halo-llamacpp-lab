@@ -1815,11 +1815,31 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
                 // and let the capture at the end of this call record a valid pending_h so
                 // speculation resumes normally on the next step. Costs one rejected draft
                 // per image, not a crash.
-                LOG_WRN("%s: MTP boundary missing for seq_id=%d pos=%d (current=%d/%d previous=%d/%d); "
-                        "resyncing after a non-token batch (e.g. vision chunk)\n",
-                        __func__, (int) seq_id, (int) pos_needed,
-                        (int) pending_h_pos[seq_id], (int) pending_h_valid[seq_id],
-                        (int) pending_h_prev_pos[seq_id], (int) pending_h_prev_valid[seq_id]);
+                //
+                // Dual-mode note: for a sequence routed to another drafter this is the
+                // EXPECTED outcome of every partially-rejected verify round. process() runs
+                // ungated on all sequences (prompt-cache invariant), captures pending_h at
+                // the end of the drafted block, and the rollback of the rejected tail then
+                // rewinds the sequence behind that capture. The neutral resync below costs
+                // nothing here - this impl never drafts that sequence - so demote to debug
+                // and only warn where a real gap (e.g. vision chunk) costs a rejected draft.
+                const bool drafts_this_seq =
+                    dparams_routing == nullptr ||
+                    (*dparams_routing)[seq_id].drafter == COMMON_SPECULATIVE_TYPE_NONE ||
+                    (*dparams_routing)[seq_id].drafter == type;
+
+                if (drafts_this_seq) {
+                    LOG_WRN("%s: MTP boundary missing for seq_id=%d pos=%d (current=%d/%d previous=%d/%d); "
+                            "resyncing after a non-token batch (e.g. vision chunk)\n",
+                            __func__, (int) seq_id, (int) pos_needed,
+                            (int) pending_h_pos[seq_id], (int) pending_h_valid[seq_id],
+                            (int) pending_h_prev_pos[seq_id], (int) pending_h_prev_valid[seq_id]);
+                } else {
+                    LOG_DBG("%s: MTP boundary ahead of the rolled-back position for seq_id=%d pos=%d "
+                            "(current=%d/%d) - sequence routed to another drafter, neutral resync\n",
+                            __func__, (int) seq_id, (int) pos_needed,
+                            (int) pending_h_pos[seq_id], (int) pending_h_valid[seq_id]);
+                }
                 std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
                 std::fill(pending_h_prev[seq_id].begin(), pending_h_prev[seq_id].end(), 0.0f);
                 pending_h_valid[seq_id]      = 0;
