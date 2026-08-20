@@ -22,7 +22,7 @@ after the checkpoint are reprocessed. Boundary bookkeeping is reset and
 recaptured from the replayed batches. Cold reprocessing remains the
 fallback when no usable checkpoint exists or the restore fails.
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  common/common.cpp               |  6 +++
  common/common.h                 |  4 ++

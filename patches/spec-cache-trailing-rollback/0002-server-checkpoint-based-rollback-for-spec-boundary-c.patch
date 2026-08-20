@@ -19,7 +19,7 @@ load() accepts entries with a shorter common prefix when such a
 checkpoint exists (slot and RAM states; disk states keep the exact rule
 because they restore without live checkpoints).
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  common/common.cpp               |  7 +++
  common/common.h                 |  4 ++

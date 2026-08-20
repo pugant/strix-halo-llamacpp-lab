@@ -9,7 +9,7 @@ acceptance rounds, so rollback_state could not find the row at the
 common prefix even within the RS bound. Push every row at its contiguous
 position instead.
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  common/speculative.cpp          | 15 ++++++++++++---
  tools/server/server-context.cpp |  4 ++--

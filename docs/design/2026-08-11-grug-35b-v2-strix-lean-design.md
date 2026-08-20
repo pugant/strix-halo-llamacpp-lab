@@ -3,7 +3,7 @@
 **Date:** 2026-08-11
 **Status:** Draft (awaiting adversarial review)
 **Target hardware:** AMD Ryzen AI MAX+ 395 (Strix Halo, gfx1151, 124 GB unified LPDDR5X-8000 ~270 GB/s)
-**Author:** Claude Code session with pugant
+**Author:** GLM by z.ai session with pugant
 
 ---
 
