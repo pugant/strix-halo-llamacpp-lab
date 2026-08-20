@@ -1266,6 +1266,14 @@ common_init_result::common_init_result(common_params & params) :
     // [TAG_RS_STATE_ROLLBACK_SUPPORT]
     // TODO: ngram speculative methods require checkpointing in addition to partial RS rollback
     //       currently this is not supported. so we disable the partial rollback
+    //       [RS-DFLASH-EXPERIMENT 2026-08-20, piano 2026-08-20-rs-rollback-dflash-experiment]
+    //       ESTENSIONE: il limite e' motivato dai soli metodi ngram (drafting senza
+    //       proprio contesto). draft-dflash NON e' ngram: drafter esterno attention-based
+    //       con proprio ctx e KV standard — il rollback RS parziale del target resta
+    //       valido (T4 aveva quantificato la tassa: seq_rm-FULL -> snapshot+restore
+    //       checkpoint a ogni reject parziale, prosa duale -7..-15%). RS mantenuto
+    //       anche per draft-dflash; tutti gli altri non-MTP (ngram*, eagle3, dspark,
+    //       draft-simple) restano disabilitanti (conservativo).
     if (cparams.n_rs_seq > 0 && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model))) {
         auto & types = params.speculative.types;
 
@@ -1274,6 +1282,10 @@ common_init_result::common_init_result(common_params & params) :
                 continue;
             }
             if (types[i] == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                continue;
+            }
+            if (types[i] == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+                // ngram-only limitation does not apply (see the block comment)
                 continue;
             }
 
