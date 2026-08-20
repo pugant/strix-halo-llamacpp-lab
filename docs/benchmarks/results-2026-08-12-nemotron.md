@@ -1,47 +1,47 @@
-# Nemotron 3.5 Lightning 30B-A3B → ROCmFP4-STRIX_LEAN — Risultati Bench
+# Nemotron 3.5 Lightning 30B-A3B → ROCmFP4-STRIX_LEAN — Bench Results
 
-**Data:** 2026-08-12
-**Modello:** NVIDIA-Nemotron-3.5-Lightning-30B-A3B (`nemotron_h_moe`, 31.58B params, 3.5B attivi/token)
-**Architettura:** Hybrid Mamba-2 + MoE (128 esperti, 6 per token) + Attention (52 layer)
+**Date:** 2026-08-12
+**Model:** NVIDIA-Nemotron-3.5-Lightning-30B-A3B (`nemotron_h_moe`, 31.58B params, 3.5B active/token)
+**Architecture:** Hybrid Mamba-2 + MoE (128 experts, 6 per token) + Attention (52 layers)
 **Toolchain:** fork charlie12345/ROCmFPX commit a7ddbe7, ROCm 7.2.4, gfx1151
 
-## Config sistema
+## System config
 
-| Componente | Valore |
+| Component | Value |
 |---|---|
 | APU | AMD RYZEN AI MAX+ 395 w/ Radeon 8060S (Strix Halo) |
 | GPU | Radeon 8060S Graphics, gfx1151, 126976 MiB (unified memory) |
 | Kernel | 7.0.0-28-generic |
 | Power profile | balanced |
-| VRAM partition | 512 MB (UMA obbligatoria: `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`) |
+| VRAM partition | 512 MB (UMA mandatory: `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`) |
 
-## Confronto ROCmFP4-STRIX_LEAN vs Q4_K_M
+## ROCmFP4-STRIX_LEAN vs Q4_K_M comparison
 
-Entrambi quantizzati dallo stesso BF16 fork (401 tensori, convertito da safetensors nvidia col converter del fork). Bench via `llama-bench -ngl 999 -fa on -p 512 -n 128`.
+Both quantized from the same fork BF16 (401 tensors, converted from nvidia safetensors with the fork's converter). Bench via `llama-bench -ngl 999 -fa on -p 512 -n 128`.
 
-| Metrico | ROCmFP4-STRIX_LEAN | Q4_K_M | Δ ROCmFP4 |
+| Metric | ROCmFP4-STRIX_LEAN | Q4_K_M | Δ ROCmFP4 |
 |---|---|---|---|
 | **tg128 (tok/s)** | **84.28 ± 0.66** | 63.64 ± 0.93 | **+32%** |
 | **pp512 (tok/s)** | **1051 ± 5.88** | 813 ± 55.46 | **+29%** |
 | Size | 15.72 GiB | 22.82 GiB | **−31%** |
 | BPW | 4.28 | 6.21 | |
-| Tensori fallback | 1/401 | 134/401 | |
+| Fallback tensors | 1/401 | 134/401 | |
 
-**Verdetto:** ROCmFP4-STRIX_LEAN è il formato ottimale per Nemotron su Strix Halo: +32% tg128, +29% pp512, e 31% più piccolo del Q4_K_M.
+**Verdict:** ROCmFP4-STRIX_LEAN is the optimal format for Nemotron on Strix Halo: +32% tg128, +29% pp512, and 31% smaller than Q4_K_M.
 
-### Note tecniche
+### Technical notes
 
-1. **Fallback tensori:** Q4_K_M ha 134/401 tensori in fallback (tensori Mamba/SSM non quantizzabili a Q4_K_M per shape incompatibili → cadono su tipo superiore). ROCmFP4 ha solo 1 tensore in fallback. Questo contribuisce al vantaggio di ROCmFP4: quantizza nativamente i tensori SSM (`ssm_in.weight`, `ssm_out.weight`) a `q4_0_rocmfp4_fast`.
+1. **Tensor fallback:** Q4_K_M has 134/401 tensors in fallback (Mamba/SSM tensors not quantizable to Q4_K_M due to incompatible shapes → they fall back to a larger type). ROCmFP4 has only 1 tensor in fallback. This contributes to ROCmFP4's advantage: it natively quantizes the SSM tensors (`ssm_in.weight`, `ssm_out.weight`) to `q4_0_rocmfp4_fast`.
 
-2. **`-fit off` obbligatorio per nemotron_h_moe:** `llama-server` col fit di default (`-fit on`) si blocca su "fitting params to device memory" (loop infinito per MoE 128 esperti). Usare sempre `-fit off`. `llama-bench` non ha questo problema.
+2. **`-fit off` mandatory for nemotron_h_moe:** `llama-server` with the default fit (`-fit on`) hangs on "fitting params to device memory" (infinite loop for the 128-expert MoE). Always use `-fit off`. `llama-bench` does not have this problem.
 
-3. **Caricamento BF16 lento (~8 min):** il graph_reserve per 52 layer misti Mamba/MoE/Attention è lento. Il ROCmFP4 (16 GB) carica in ~14s. Il BF16 (60 GB) richiede ~8 min.
+3. **Slow BF16 loading (~8 min):** graph_reserve for 52 mixed Mamba/MoE/Attention layers is slow. ROCmFP4 (16 GB) loads in ~14s. BF16 (60 GB) takes ~8 min.
 
-4. **Mamba-on-HIP validato:** i kernel `fused Gated Delta Net` (Mamba-2) girano su gfx1151 senza assert. Inference produce testo coerente.
+4. **Mamba-on-HIP validated:** the `fused Gated Delta Net` (Mamba-2) kernels run on gfx1151 without asserts. Inference produces coherent text.
 
-5. **MTP non embedded:** il converter del fork non converte i tensori nextn (MTP layer). Il modello funziona come base senza speculative decoding embedded. Per MTP, serve drafter separato (non testato in questa session).
+5. **MTP not embedded:** the fork's converter does not convert the nextn tensors (MTP layer). The model works as a base without embedded speculative decoding. For MTP, a separate drafter is needed (not tested in this session).
 
-## Comando serving (ROCmFP4)
+## Serving command (ROCmFP4)
 
 ```bash
 docker run --rm -d --name nemotron \
@@ -53,13 +53,13 @@ docker run --rm -d --name nemotron \
     -ngl 999 -c 32768 -fa on --jinja --host 0.0.0.0 --port 1234 -fit off
 ```
 
-## Confronto con altri modelli su Strix Halo
+## Comparison with other models on Strix Halo
 
-| Modello | Format | tg128 | Size |
+| Model | Format | tg128 | Size |
 |---|---|---|---|
 | **Nemotron 30B-A3B** | **ROCmFP4-STRIX_LEAN** | **84.28** ⭐ | 15.72 GiB |
 | grug-35b-v2 | ROCmFP4-STRIX_LEAN | 70.92 | 17.32 GiB |
 | Ornith-1.0-35B | ROCmFP4-STRIX_LEAN | 66.68 | 17.32 GiB |
-| Qwen3.6-27B | ROCmFP4-STRIX_LEAN | 13.68 (32.7 con MTP) | 13.82 GiB |
+| Qwen3.6-27B | ROCmFP4-STRIX_LEAN | 13.68 (32.7 with MTP) | 13.82 GiB |
 
-Nemotron ROCmFP4 è il **più veloce mai testato** su Strix Halo (+19% vs grug, il precedente record).
+Nemotron ROCmFP4 is the **fastest ever tested** on Strix Halo (+19% vs grug, the previous record).

@@ -2,11 +2,11 @@
 # Part of strix-halo-llamacpp-lab — see README.md.
 # Replication scripts for the Qwen3.8-27B ROCmFP4-STRIX_LEAN pipeline.
 # Env: LLMODELS_DIR (default $HOME/llmodels), HF_TOKEN (downloads/uploads).
-# bench-dflash-vs-mtp.sh — T7 A/B: drafter DFlash2 vs MTP su Qwen3.8-27B STRIX_LEAN
-# Piano: docs/superpowers/plans/2026-08-19-dflash2-vs-mtp-ab.md (internal plan, not included in this repo)
-# Protocollo standard bench-full-vs-lean.sh: GPU DEDICATA (llm-service FERMO,
-# gestito esternamente), -c 16384, p_min 0.75, temp 0, warm-up scartato,
-# marker TREATMENT nei log (lezione 17/08).
+# bench-dflash-vs-mtp.sh — T7 A/B: DFlash2 vs MTP drafter on Qwen3.8-27B STRIX_LEAN
+# Plan: docs/superpowers/plans/2026-08-19-dflash2-vs-mtp-ab.md (internal plan, not included in this repo)
+# Standard protocol from bench-full-vs-lean.sh: DEDICATED GPU (llm-service STOPPED,
+# managed externally), -c 16384, p_min 0.75, temp 0, warm-up discarded,
+# TREATMENT marker in the logs (lesson 17/08).
 set -u
 LAB_DIR="${LAB_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 LLMODELS_DIR="${LLMODELS_DIR:-$HOME/llmodels}"
@@ -16,7 +16,7 @@ PORT=1235
 MODEL=/llmodels/QWEN3.8/Qwen3.8-27B-Q4_0_ROCMFP4_STRIX_LEAN.gguf
 DRAFTER=/llmodels/QWEN3.8/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 
-start_server() { # $1=img $2=tag $3=tipo $4=nmax $5=drafter(o vuoto)
+start_server() { # $1=img $2=tag $3=type $4=nmax $5=drafter(or empty)
   local img="$1" tag="$2" tipo="$3" nmax="$4" dft="${5:-}"
   local name="bench-${tag}-q38"
   local extra=()
@@ -44,25 +44,25 @@ bench_tok() { # $1 prompt
     python3 -c "import json,sys; t=json.load(sys.stdin).get('timings',{}); print(round(t.get('predicted_per_second',0),1))" 2>/dev/null || echo "ERR"
 }
 
-run_arm() { # $1 img $2 tag $3 tipo $4 nmax $5 drafter
+run_arm() { # $1 img $2 tag $3 type $4 nmax $5 drafter
   echo "== TREATMENT=${2} tipo=${3} n-max=${4} model=LEAN p_min=0.75 c=16384 vulkan =="
   if start_server "$1" "$2" "$3" "$4" "${5:-}"; then
-    bench_tok 'Rispondi solo OK.' >/dev/null   # warm-up scartato
+    bench_tok 'Rispondi solo OK.' >/dev/null   # warm-up discarded
     P1a=$(bench_tok 'Scrivi un paragrafo dettagliato sulla storia di Roma.')
     P1b=$(bench_tok 'Scrivi un saggio breve sulla stampa e il Rinascimento italiano.')
     P2a=$(bench_tok 'Conta da 1 a 200, un numero per riga, solo i numeri.')
     P2b=$(bench_tok 'Elenco l alfabeto inglese una lettera per riga, poi ripetilo al contrario.')
-    echo "RISULTATO TREATMENT=${2}: prosa ${P1a}/${P1b} | det ${P2a}/${P2b} tok/s"
+    echo "RESULT TREATMENT=${2}: prose ${P1a}/${P1b} | det ${P2a}/${P2b} tok/s"
     docker logs "bench-${2}-q38" > "$OUT/bench-${2}.log" 2>&1
     grep -E 'statistics draft|mean acceptance' "$OUT/bench-${2}.log" | tail -3
   else
-    echo "RISULTATO TREATMENT=${2}: SERVER FAIL"
+    echo "RESULT TREATMENT=${2}: SERVER FAIL"
   fi
   docker rm -f "bench-${2}-q38" >/dev/null 2>&1
 }
 
-# bracci (ordine: controllo prima)
+# arms (order: control first)
 run_arm docker-llm-service:vulkan-fork-ckpt7    MTP6 draft-mtp    6 ""
 run_arm docker-llm-service:vulkan-fork-dflash2  DF7   draft-dflash 7 "$DRAFTER"
 run_arm docker-llm-service:vulkan-fork-dflash2  DF5   draft-dflash 5 "$DRAFTER"
-echo "=== FINE (marker TREATMENT in ogni riga RISULTATO) ==="
+echo "=== END (TREATMENT marker on every RESULT line) ==="

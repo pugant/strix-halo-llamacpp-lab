@@ -1,200 +1,200 @@
-# Spec: Pubblicazione HF grug + Ornith ROCmFP4-STRIX_LEAN
+# Spec: HF publication of grug + Ornith ROCmFP4-STRIX_LEAN
 
-**Data**: 2026-08-11
-**Autore**: user pugant
-**Stato**: DRAFT → da validare adversarial review
-**Prerequisiti**: FASE 1 grug + FASE 2 Ornith completate (T4-T9 ✓). Vedere `docs/design/2026-08-11-grug-35b-v2-strix-lean-design.md`.
+**Date**: 2026-08-11
+**Author**: user pugant
+**Status**: DRAFT → to be validated by adversarial review
+**Prerequisites**: grug PHASE 1 + Ornith PHASE 2 completed (T4-T9 ✓). See `docs/design/2026-08-11-grug-35b-v2-strix-lean-design.md`.
 
-## 1. Obiettivo e scope
+## 1. Goal and scope
 
-Pubblicare su Hugging Face due repository pubblici con i GGUF quantizzati `Q4_0_ROCMFP4_STRIX_LEAN` di **grug-35b-v2** e **Ornith-1.0-35B**, prodotti dalla pipeline ROCmFPX su Strix Halo, per condivisione con la community (in particolare altri utenti Strix Halo / gfx1151).
+Publish two public Hugging Face repositories with the `Q4_0_ROCMFP4_STRIX_LEAN` quantized GGUFs of **grug-35b-v2** and **Ornith-1.0-35B**, produced by the ROCmFPX pipeline on Strix Halo, for sharing with the community (in particular other Strix Halo / gfx1151 users).
 
 ### In scope
-- 2 repo HF pubblici sotto `pugant/`
-- GGUF quantizzato + mmproj + imatrix (grug) per ciascun modello
-- Model card EN con benchmark, metodologia, usage, attribution
-- File LICENSE + NOTICE per ciascun repo
+- 2 public HF repos under `pugant/`
+- Quantized GGUF + mmproj + imatrix (grug) for each model
+- EN model card with benchmarks, methodology, usage, attribution
+- LICENSE + NOTICE files for each repo
 - Upload via `huggingface_hub` (token in `~/.cache/huggingface/token`, user `pugant`)
 
 ### Out of scope
-- Pubblicazione degli script di pipeline (scelta utente: "Core, modello pronto")
-- Pubblicazione del calibration text integro (contiene codice OS di terzi)
-- Eval di qualità (perplexity/MMLU) — dichiarata come limitazione, invito al feedback community
-- Modifiche ai pesi o ai metadata del GGUF (pubblichiamo così come generati)
-- Riavvio del llm-service produzione (separato)
+- Publishing the pipeline scripts (user choice: "Core, ready model")
+- Publishing the full calibration text (contains third-party OS code)
+- Quality eval (perplexity/MMLU) — declared as a limitation, invitation for community feedback
+- Modifications to the GGUF weights or metadata (we publish as generated)
+- Restart of the production llm-service (separate)
 
-## 2. Verifica legale (licenze)
+## 2. Legal verification (licenses)
 
-### Catena di derivazione (model tree)
+### Derivation chain (model tree)
 ```
-Qwen3.5-VL-MoE (arch base)
+Qwen3.5-VL-MoE (base arch)
     └── ornith-ai/Ornith-1.0-35B (alias `deepreinforce-ai/Ornith-1.0-35B`, MIT)  [base]
             └── ProCreations/grug-35b-v2 (Apache-2.0) [fine-tune]
 ```
-Model tree verificato via HF API: `ProCreations/grug-35b-v2` cardData.base_model dichiara `deepreinforce-ai/Ornith-1.0-35B` (namespace legacy). Quel repo fa redirect 307 → `ornith-ai/Ornith-1.0-35B` (canonical). Nel YAML frontmatter dei nostri repo useremo `ornith-ai/Ornith-1.0-35B` (canonical) per allineamento col model tree HF.
+Model tree verified via HF API: `ProCreations/grug-35b-v2` cardData.base_model declares `deepreinforce-ai/Ornith-1.0-35B` (legacy namespace). That repo 307-redirects → `ornith-ai/Ornith-1.0-35B` (canonical). In our repos' YAML frontmatter we will use `ornith-ai/Ornith-1.0-35B` (canonical) for alignment with the HF model tree.
 
-### Licenze componenti
-| Componente | Licenza | Fonte verifica | Permette ridistribuzione GGUF derivato? |
+### Component licenses
+| Component | License | Verification source | Permits redistributing the derivative GGUF? |
 |---|---|---|---|
-| `ProCreations/grug-35b-v2` (modello base grug) | **Apache-2.0** | HF metadata `license: apache-2.0` | Sì, con attribution + license inclusion + NOTICE |
-| `ornith-ai/Ornith-1.0-35B` (modello base Ornith) | **MIT** | HF metadata `license: mit` + unsloth card | Sì, con attribution + license inclusion |
-| `charlie12345/ROCmFPX` (fork quantizzazione) | **MIT** | README repo GitHub | Sì (MIT sul codice; non impone termini sui GGUF output) |
-| `kyuz0/amd-strix-halo-toolboxes` (container) | **Nessuna LICENSE** (GitHub API 404 verificato 2026-08-11) | GitHub repo | N/A (non ridistribuiamo il container; usiamo solo attribution come riferimento link) |
-| `ProCreations/grug-think-v3-10k` (dataset calibration) | Apache-2.0, **pubblico non gated** | HF API verificata | Non ridistribuiamo il dataset, solo riferimento + attribution. Community può scaricarlo liberamente. |
-| Qwen3.5-VL-MoE (arch base) | non direttamente nel model tree HF di grug (base dichiarata = Ornith) | — | Licenza efectiva = quella del model tree HF |
+| `ProCreations/grug-35b-v2` (grug base model) | **Apache-2.0** | HF metadata `license: apache-2.0` | Yes, with attribution + license inclusion + NOTICE |
+| `ornith-ai/Ornith-1.0-35B` (Ornith base model) | **MIT** | HF metadata `license: mit` + unsloth card | Yes, with attribution + license inclusion |
+| `charlie12345/ROCmFPX` (quantization fork) | **MIT** | GitHub repo README | Yes (MIT on the code; imposes no terms on the output GGUFs) |
+| `kyuz0/amd-strix-halo-toolboxes` (container) | **No LICENSE** (GitHub API 404 verified 2026-08-11) | GitHub repo | N/A (we do not redistribute the container; we only use attribution as a reference link) |
+| `ProCreations/grug-think-v3-10k` (calibration dataset) | Apache-2.0, **public, not gated** | HF API verified | We do not redistribute the dataset, only reference + attribution. The community can download it freely. |
+| Qwen3.5-VL-MoE (base arch) | not directly in grug's HF model tree (declared base = Ornith) | — | Effective license = the one in the HF model tree |
 
-### Obblighi di attribuzione
-- **Apache-2.0** (grug): includere license text + NOTICE file + dichiarazione "derivative work". Apache-2.0 sezione 4 impone di mantenere tutte le attribution/NOTICE.
-- **MIT** (Ornith): includere license text + copyright notice.
-- Entrambi i repo avranno `LICENSE` (full text) + `NOTICE` (attribution chain).
+### Attribution obligations
+- **Apache-2.0** (grug): include the license text + NOTICE file + "derivative work" statement. Apache-2.0 section 4 requires keeping all attribution/NOTICE.
+- **MIT** (Ornith): include the license text + copyright notice.
+- Both repos will have `LICENSE` (full text) + `NOTICE` (attribution chain).
 
-### Caveat legale (da dichiarare nel model card)
+### Legal caveats (to state in the model card)
 - "No affiliation with AMD, Qwen, ProCreations, DeepReinforce, unsloth, kyuz0, or charlie12345."
 - "Provided as-is, without warranty."
 - "Users must comply with the base model license (Apache-2.0 / MIT)."
 
-## 3. Verifica sicurezza (dati sensibili)
+## 3. Security verification (sensitive data)
 
-### Verifiche eseguite empiricamente (2026-08-11, adversarial review)
+### Checks performed empirically (2026-08-11, adversarial review)
 
-| Check | Risultato |
+| Check | Result |
 |---|---|
-| Token HF negli script pubblicati | N/A (scope = "Core, modello pronto" → nessuno script pubblicato) |
-| **Path locali embedded come metadata GGUF** | **CONFERMATI via `grep -aoE` su file intero** (NON tramite `strings` che ha soglia minima e li ha mancati):<br>• grug: `quantize.imatrix.file = '/llmodels/GRUG/imatrix-grug-35b-v2.gguf'`, `quantize.imatrix.dataset = '/calibration/grug-calibration.txt'`<br>• Ornith: `quantize.imatrix.file = '/llmodels/ORNITH/imatrix_unsloth.gguf_file'`, `quantize.imatrix.dataset = 'unsloth_calibration_Ornith-1.0-35B.txt'`<br><br>Nessun path nella home utente o token HF. I path `/llmodels/` non sono credenziali ma rivelano convenzioni interne → **sanificazione richiesta** (vedi §3.1). |
-| **Metadata GGUF errati o generici** | **CONFERMATI via parser GGUF Python**:<br>• grug: `general.name = '35B BF16'` (generico, nessuna menzione "grug")<br>• Ornith: `general.name = 'Ornith-1.0-9B'` (**ERRATO: dice 9B invece di 35B**, errore ereditato da unsloth)<br><br>→ **sanificazione richiesta** (vedi §3.1). |
-| Calibration text (non pubblicato) | 140 match keyword "sensibili" = **tutti falsi positivi**: codice Python OS (paramiko, marshmallow) con nomi attributi `password`/`api_key` + email pubbliche autori OS in copyright notice. Nessun dato sensibile reale. |
-| Token HF negli script interni | Presenti negli script (`scripts/*.sh`) ma NON pubblicati (scope = Core, no script). |
+| HF tokens in published scripts | N/A (scope = "Core, ready model" → no scripts published) |
+| **Local paths embedded as GGUF metadata** | **CONFIRMED via `grep -aoE` on the whole file** (NOT via `strings` which has a minimum length threshold and missed them):<br>• grug: `quantize.imatrix.file = '/llmodels/GRUG/imatrix-grug-35b-v2.gguf'`, `quantize.imatrix.dataset = '/calibration/grug-calibration.txt'`<br>• Ornith: `quantize.imatrix.file = '/llmodels/ORNITH/imatrix_unsloth.gguf_file'`, `quantize.imatrix.dataset = 'unsloth_calibration_Ornith-1.0-35B.txt'`<br><br>No paths in the user home or HF tokens. The `/llmodels/` paths are not credentials but reveal internal conventions → **sanitization required** (see §3.1). |
+| **Wrong or generic GGUF metadata** | **CONFIRMED via Python GGUF parser**:<br>• grug: `general.name = '35B BF16'` (generic, no "grug" mention)<br>• Ornith: `general.name = 'Ornith-1.0-9B'` (**WRONG: says 9B instead of 35B**, error inherited from unsloth)<br><br>→ **sanitization required** (see §3.1). |
+| Calibration text (not published) | 140 "sensitive" keyword matches = **all false positives**: OS Python code (paramiko, marshmallow) with `password`/`api_key` attribute names + public OS authors' emails in copyright notices. No real sensitive data. |
+| HF tokens in internal scripts | Present in the scripts (`scripts/*.sh`) but NOT published (scope = Core, no scripts). |
 
-### 3.1 Sanificazione metadata GGUF (pre-upload, **OBBLIGATORIA**)
+### 3.1 GGUF metadata sanitization (pre-upload, **MANDATORY**)
 
-Prima dell'upload HF, entrambi i GGUF vengono sanificati via script Python con libreria `gguf` (path riutilizza `/usr/local/bin/convert_hf_to_gguf.py` deps installati nel container `docker-llm-service-convert`).
+Before the HF upload, both GGUFs are sanitized via a Python script with the `gguf` library (path reuses the `/usr/local/bin/convert_hf_to_gguf.py` deps installed in the `docker-llm-service-convert` container).
 
-**Operazioni** (per entrambi i GGUF):
-1. Leggere tutti i KV metadata esistenti
-2. Modificare / aggiungere:
+**Operations** (for both GGUFs):
+1. Read all the existing KV metadata
+2. Modify / add:
    - `general.name`: `'grug-35b-v2'` (grug) / `'Ornith-1.0-35B'` (Ornith) — fix C1/C2
    - `general.basename`: `'grug'` / `'Ornith-1.0-35B'`
    - `general.size_label`: `'35B'`
    - `general.finetune`: `'grug-v2'` (grug) / `'1.0'` (Ornith)
    - `general.organization`: `'ProCreations'` / `'DeepReinforce'`
    - `general.repo_url`: `'https://huggingface.co/ProCreations/grug-35b-v2'` / `'https://huggingface.co/ornith-ai/Ornith-1.0-35B'`
-   - `general.base_model.0.name`: `'Ornith 1.0 35B'` (entrambi, Ornith come base)
+   - `general.base_model.0.name`: `'Ornith 1.0 35B'` (both, Ornith as base)
    - `general.base_model.0.repo_url`: `'https://huggingface.co/ornith-ai/Ornith-1.0-35B'`
    - `general.license`: `'apache-2.0'` (grug) / `'mit'` (Ornith)
    - `general.quantized_by`: `'pugant'`
-   - `general.tags`: aggiungere `[gfx1151, rocmfpx, strix-halo, rocm, amdgpu]`
-3. Rimuovere o sostituire con placeholder neutri:
-   - `quantize.imatrix.file`: `'grug-calibration.gguf'` (grug) / `'unsloth-imatrix.gguf'` (Ornith) — solo basename, no path — fix C3
+   - `general.tags`: add `[gfx1151, rocmfpx, strix-halo, rocm, amdgpu]`
+3. Remove or replace with neutral placeholders:
+   - `quantize.imatrix.file`: `'grug-calibration.gguf'` (grug) / `'unsloth-imatrix.gguf'` (Ornith) — basename only, no path — fix C3
    - `quantize.imatrix.dataset`: `'grug-think-v3-10k'` (grug) / `'unsloth-calibration'` (Ornith)
-4. Copiare tensori 1:1 invariati
-5. Scrivere nuovo file GGUF su path temporaneo (es. `*.sanitized.gguf`)
-6. Verifica post-sanificazione: ricalcolo SHA256, `llama-bench` smoke (caricamento + 1 token), `llama-gguf ... r` per dump KV e verifica valori nuovi
-7. Sostituire il file originale col sanificato (rinomina)
+4. Copy the tensors 1:1 unchanged
+5. Write the new GGUF file to a temporary path (e.g. `*.sanitized.gguf`)
+6. Post-sanitization verification: recompute SHA256, `llama-bench` smoke (load + 1 token), `llama-gguf ... r` to dump the KVs and verify the new values
+7. Replace the original file with the sanitized one (rename)
 
-**Costo**: ~10 min per GGUF (copia 17 GB con metadata nuovi, su NVMe interno ~1 GB/s).
-**SHA256**: cambia post-sanificazione → ricalcolare per il report.
+**Cost**: ~10 min per GGUF (17 GB copy with new metadata, on internal NVMe ~1 GB/s).
+**SHA256**: changes post-sanitization → recompute for the report.
 
-### Conclusione sicurezza (post-sanificazione)
-Post-sanificazione, i GGUF pubblicati avranno:
-- ✓ Nome modello corretto e identificabile
-- ✓ Attribution completa (organizzazione, repo URL, base model)
-- ✓ License embedded nel metadata
-- ✓ Nessun path locale embedded (solo basename neutri)
-- ✓ Tags per discoverability HF
+### Security conclusion (post-sanitization)
+Post-sanitization, the published GGUFs will have:
+- ✓ Correct and identifiable model name
+- ✓ Complete attribution (organization, repo URL, base model)
+- ✓ License embedded in the metadata
+- ✓ No local paths embedded (only neutral basenames)
+- ✓ Tags for HF discoverability
 
-## 4. Struttura repo
+## 4. Repo structure
 
-### 4.1 Repo grug
+### 4.1 grug repo
 **Path**: `pugant/grug-35b-v2-ROCmFP4-STRIX_LEAN`
 **Visibility**: public
 **Files**:
 ```
-README.md                                  # model card EN
+README.md                                  # EN model card
 LICENSE                                    # Apache-2.0 full text
 NOTICE                                     # attribution chain + ROCmFPX commit
 .gitattributes                             # LFS config (*.gguf, *.png)
 grug-35b-v2-ROCmFP4-STRIX_LEAN.gguf        # 17.32 GiB (main, LFS)
-imatrix-grug-35b-v2.gguf                   # 183 MB (nostra, LFS)
+imatrix-grug-35b-v2.gguf                   # 183 MB (ours, LFS)
 mmproj-grug-35b-v2-f16.gguf                # 857 MB (vision projector, LFS)
 ```
 
-### 4.2 Repo Ornith
+### 4.2 Ornith repo
 **Path**: `pugant/Ornith-1.0-35B-ROCmFP4-STRIX_LEAN`
 **Visibility**: public
 **Files**:
 ```
-README.md                                  # model card EN
+README.md                                  # EN model card
 LICENSE                                    # MIT full text
 NOTICE                                     # attribution chain (ornith-ai + unsloth + ROCmFPX)
 .gitattributes                             # LFS config
 Ornith-1.0-35B-ROCmFP4-STRIX_LEAN.gguf     # 17.32 GiB (main, LFS)
-imatrix.dat                                # 183 MB (copia imatrix unsloth, LFS) — attribution nel NOTICE
+imatrix.dat                                # 183 MB (copy of the unsloth imatrix, LFS) — attribution in the NOTICE
 mmproj-F16.gguf                            # 857 MB (LFS)
 ```
 
-**Nota imatrix Ornith**: l'imatrix deriva da `unsloth/Ornith-1.0-35B-GGUF/imatrix_unsloth.gguf_file`. La ridistribuiamo come `imatrix.dat` con attribution esplicita a unsloth nel NOTICE (licenza MIT di unsloth lo permette).
+**Ornith imatrix note**: the imatrix derives from `unsloth/Ornith-1.0-35B-GGUF/imatrix_unsloth.gguf_file`. We redistribute it as `imatrix.dat` with explicit attribution to unsloth in the NOTICE (unsloth's MIT license permits this).
 
 ## 5. Model card (README.md, EN)
 
-Struttura sezioni (ispirata a unsloth, adattata Strix-specific):
+Section structure (inspired by unsloth, adapted Strix-specific):
 
 1. **HF metadata YAML** (frontmatter)
    - `library_name: llama.cpp`
    - `license: apache-2.0` (grug) / `mit` (Ornith)
    - `base_model: ProCreations/grug-35b-v2` / `ornith-ai/Ornith-1.0-35B`
    - `tags: [rocmfpx, gfx1151, strix-halo, qwen35moe, moe, rocm, amdgpu, ROCmFP4]`
-   - `pipeline_tag: image-text-to-text` (modello vision + text)
+   - `pipeline_tag: image-text-to-text` (vision + text model)
    - `language: [en, multilingual]`
    - `version: 1.0` + `date: 2026-08-11`
 
 2. **Version header**: `> Version 1.0 — 2026-08-11`
 
-3. **TL;DR** (2 righe): modello + quant + target hardware
+3. **TL;DR** (2 lines): model + quant + target hardware
 
-4. **⚠️ Critical warnings** (top, callout visibile):
-   - Richiede **kyuz0 Strix Halo toolbox** (che builda `charlie12345/ROCmFPX`). Type 106 (Q4_0_ROCMFP4_STRIX_LEAN) = **INVALID in stock llama.cpp**.
-   - Profilato per **gfx1151** (Strix Halo / RDNA 3.5). Altrove non testato.
-   - FP4 è **software** su RDNA 3.5 (nessuna unità FP4 in silicio) — beneficio è bandwidth memory, non compute.
+4. **⚠️ Critical warnings** (top, visible callout):
+   - Requires the **kyuz0 Strix Halo toolbox** (which builds `charlie12345/ROCmFPX`). Type 106 (Q4_0_ROCMFP4_STRIX_LEAN) = **INVALID in stock llama.cpp**.
+   - Profiled for **gfx1151** (Strix Halo / RDNA 3.5). Not tested elsewhere.
+   - FP4 is **software** on RDNA 3.5 (no FP4 silicon units) — the benefit is memory bandwidth, not compute.
 
-5. **Benchmarks** — tabella tg128/pp512 (grug ROCmFP4: 70.92 vs grug Q4_K_M 61.18, +16%; Ornith ROCmFP4: 66.68; grug size 17.31 GiB vs Q4_K_M 19.70 GiB, -12%). Su Strix Halo Ryzen AI Max+ 395, 128 GB LPDDR5X. Metodologia: `llama-bench -ngl 999 -fa on -p 512 -n 128 -mmap 0`. Riferimento produzione: Qwen3.6-35B-A3B ROCmFP4-STRIX_LEAN 63 tok/s. Fonti: `docs/benchmarks/bench-grug-{rocmfp4,q4_k_m}.txt`, `logs/bench-ornith-vs-grug.log`.
+5. **Benchmarks** — tg128/pp512 table (grug ROCmFP4: 70.92 vs grug Q4_K_M 61.18, +16%; Ornith ROCmFP4: 66.68; grug size 17.31 GiB vs Q4_K_M 19.70 GiB, -12%). On Strix Halo Ryzen AI Max+ 395, 128 GB LPDDR5X. Methodology: `llama-bench -ngl 999 -fa on -p 512 -n 128 -mmap 0`. Production reference: Qwen3.6-35B-A3B ROCmFP4-STRIX_LEAN 63 tok/s. Sources: `docs/benchmarks/bench-grug-{rocmfp4,q4_k_m}.txt`, `logs/bench-ornith-vs-grug.log`.
 
-   **Configurazione sistema al momento del bench** (dichiarata per riproducibilità):
+   **System configuration at bench time** (declared for reproducibility):
    - **Bare metal host**: Bosgame BeyondMax Series (`bosgame-m5`), Ubuntu 24.04.4 LTS, kernel 7.0.0-28-generic
-   - **CPU power profile**: `balanced` (`powerprofilesctl get`) — configurazione di default, **NON forzata a `performance`**. Rappresentativa di un setup out-of-the-box.
-   - **CPU scaling driver**: `amd-pstate-epp`, scaling_governor `performance` (default amd-pstate-epp), EPP `performance`
-   - **IOMMU/iGPU power**: auto (nessun tuning manuale)
+   - **CPU power profile**: `balanced` (`powerprofilesctl get`) — default configuration, **NOT forced to `performance`**. Representative of an out-of-the-box setup.
+   - **CPU scaling driver**: `amd-pstate-epp`, scaling_governor `performance` (amd-pstate-epp default), EPP `performance`
+   - **IOMMU/iGPU power**: auto (no manual tuning)
 
-   Nota: i tok/s sono misurati su sistema NON ottimizzato (power profile balanced). Utenti che impostano `powerprofilesctl set performance` possono ottenere valori leggermente superiori.
+   Note: the tok/s are measured on a NON-optimized system (balanced power profile). Users who set `powerprofilesctl set performance` may get slightly higher values.
 
-6. **Quantization details** — preset `Q4_0_ROCMFP4_STRIX_LEAN` (type 106, 4.29 BPW). Cosa protegge: K/V attention (`attn_qkv`/`attn_v` → q4_0_rocmfp4) + Q5_K token embeddings. Expert (`ffn_*_exps`) in `q4_0_rocmfp4_fast` (max speed). Riferimento fork: `charlie12345/ROCmFPX` commit `00d5452`.
+6. **Quantization details** — preset `Q4_0_ROCMFP4_STRIX_LEAN` (type 106, 4.29 BPW). What it protects: attention K/V (`attn_qkv`/`attn_v` → q4_0_rocmfp4) + Q5_K token embeddings. Experts (`ffn_*_exps`) in `q4_0_rocmfp4_fast` (max speed). Fork reference: `charlie12345/ROCmFPX` commit `00d5452`.
 
 7. **imatrix methodology**
-   - **grug**: generata con `llama-imatrix` 256 chunks, 16 thread, CPU-only. Calibration da `ProCreations/grug-think-v3-10k` (**dataset pubblico Apache-2.0, non gated** — chiunque può scaricarlo per replicare). Ringraziamento esplicito al grug team. 510 entries su 733 tensori. Warning `partial data 99.61%` = 1/256 expert non attivato nel calibration (normale per MoE, vedi codice llama.cpp `tools/imatrix/imatrix.cpp`).
-   - **Ornith**: imatrix precomputata da unsloth (46 chunks). Inclusa come `imatrix.dat`.
+   - **grug**: generated with `llama-imatrix` 256 chunks, 16 threads, CPU-only. Calibration from `ProCreations/grug-think-v3-10k` (**public Apache-2.0 dataset, not gated** — anyone can download it to replicate). Explicit thanks to the grug team. 510 entries out of 733 tensors. Warning `partial data 99.61%` = 1/256 experts not activated during calibration (normal for MoE, see the llama.cpp code `tools/imatrix/imatrix.cpp`).
+   - **Ornith**: imatrix precomputed by unsloth (46 chunks). Included as `imatrix.dat`.
 
-8. **Usage** — comandi Strix Halo:
+8. **Usage** — Strix Halo commands:
    ```bash
-   # Richiede container kyuz0/charlie12345 ROCmFPX
+   # Requires the kyuz0/charlie12345 ROCmFPX container
    llama-server -m <model>.gguf --mmproj <mmproj>.gguf \
      -ngl 999 -fa on --jinja -c 32768 --host 0.0.0.0 --port 1234
    ```
-   (Nota: MTP non attivato per grug — assente nel modello. Per Ornith — presente `mtp_num_hidden_layers=1` ma non attivato a runtime per allineamento MoE plain.)
+   (Note: MTP not enabled for grug — absent from the model. For Ornith — `mtp_num_hidden_layers=1` present but not enabled at runtime for plain MoE alignment.)
 
-9. **How to replicate** (testo, no script pubblicati) — pipeline a parole: builda container ROCmFPX → download BF16 → `convert_hf_to_gguf.py` (grug) / usa BF16 GGUF unsloth (Ornith) → `llama-imatrix` (grug, dataset grug-think-v3-10k) → `llama-quantize ... Q4_0_ROCMFP4_STRIX_LEAN 16`.
+9. **How to replicate** (text, no published scripts) — pipeline in words: build the ROCmFPX container → download BF16 → `convert_hf_to_gguf.py` (grug) / use the unsloth BF16 GGUF (Ornith) → `llama-imatrix` (grug, grug-think-v3-10k dataset) → `llama-quantize ... Q4_0_ROCMFP4_STRIX_LEAN 16`.
 
-10. **Attribution & model tree** — base model link, chain (Qwen3.5-VL-MoE → Ornith → grug), commit ROCmFPX, tag kyuz0 toolbox, unsloth credit.
+10. **Attribution & model tree** — base model link, chain (Qwen3.5-VL-MoE → Ornith → grug), ROCmFPX commit, kyuz0 toolbox tag, unsloth credit.
 
 11. **License** — Apache-2.0 (grug) / MIT (Ornith). "Derivative work: original model and its license are preserved. See LICENSE and NOTICE."
 
-12. **Acknowledgements** — sezione dedicata (vedi §5.1).
+12. **Acknowledgements** — dedicated section (see §5.1).
 
-13. **Limitations & community feedback** — speed benchmark only, no quality eval. Invito esplicito: "We invite the community — especially fellow Strix Halo owners — to test and share quality results. Open a Discussion."
+13. **Limitations & community feedback** — speed benchmark only, no quality eval. Explicit invitation: "We invite the community — especially fellow Strix Halo owners — to test and share quality results. Open a Discussion."
 
 14. **Citation** — bibtex placeholder (grug: ProCreations; Ornith: DeepReinforce Team, URL `deep-reinforce.com/ornith_1_0.html`).
 
 15. **Disclaimer** — no affiliation, as-is.
 
-### 5.1 Sezione Acknowledgements
+### 5.1 Acknowledgements section
 ```markdown
 ## Acknowledgements
 Built on the shoulders of giants:
@@ -210,64 +210,64 @@ Built on the shoulders of giants:
 ## 6. Upload mechanism
 
 ### Tool
-`huggingface_hub` Python lib v1.22.0 (verificata su host). Token: `~/.cache/huggingface/token`. User confermato: `pugant`, nessuna org.
+`huggingface_hub` Python lib v1.22.0 (verified on host). Token: `~/.cache/huggingface/token`. User confirmed: `pugant`, no org.
 
-### Verifica preventiva storage HF (2026-08-11)
-- `pugant` è account **free** (`isPro=False, plan=None, canPay=False` via `hf whoami-v2`)
-- Limiti HF free: 500 GB total storage, 50 GB per singolo file LFS ([docs](https://huggingface.co/docs/hub/en/storage-limits))
-- Pubblicazione totale: ~36 GB (grug ~18 GB + Ornith ~18 GB) → **OK entro soglia**
-- Per-file: GGUF 17 GB < 50 GB limit ✓
+### Preventive HF storage check (2026-08-11)
+- `pugant` is a **free** account (`isPro=False, plan=None, canPay=False` via `hf whoami-v2`)
+- HF free limits: 500 GB total storage, 50 GB per single LFS file ([docs](https://huggingface.co/docs/hub/en/storage-limits))
+- Total publication: ~36 GB (grug ~18 GB + Ornith ~18 GB) → **OK within the threshold**
+- Per file: 17 GB GGUF < 50 GB limit ✓
 
-### Procedura (per repo)
+### Procedure (per repo)
 1. `HfApi().create_repo(repo_id="pugant/<name>", repo_type="model", private=False, exist_ok=False)`
-2. Upload `.gitattributes` + `LICENSE` + `NOTICE` (file piccoli)
-3. `upload_large_folder()` o `upload_file()` per GGUF (17 GB), mmproj (857 MB), imatrix (183 MB) — LFS automatico, resume on failure
-4. `upload_file()` per `README.md` (per ultimo, così il repo è "completo" quando la card va live)
-5. sha256 check post-upload (opzionale, `huggingface_hub` non lo fa nativamente; confronto `hf_hub_url` size vs locale)
+2. Upload `.gitattributes` + `LICENSE` + `NOTICE` (small files)
+3. `upload_large_folder()` or `upload_file()` for the GGUF (17 GB), mmproj (857 MB), imatrix (183 MB) — automatic LFS, resume on failure
+4. `upload_file()` for `README.md` (last, so the repo is "complete" when the card goes live)
+5. sha256 check post-upload (optional, `huggingface_hub` does not do it natively; compare `hf_hub_url` size vs local)
 
-### Ordine upload
+### Upload order
 1. LICENSE, NOTICE, .gitattributes (setup)
-2. File grandi (GGUF, mmproj, imatrix)
+2. Large files (GGUF, mmproj, imatrix)
 3. README.md (live card)
 
 ### Resume
-`huggingface_hub` handle resume automatico per LFS. Se upload interrompe, re-run stesso comando riprende.
+`huggingface_hub` handles automatic resume for LFS. If an upload interrupts, re-running the same command resumes it.
 
-## 7. Criteri di successo
+## 7. Success criteria
 
-1. Entrambi i repo creati `public` sotto `pugant/`
-2. Tutti i file presenti con size corretta (verifica via HF API `repo_info`)
-3. README.md si renderizza correttamente (preview HF)
-4. License visibile nel sidebar HF (metadata `license` nel frontmatter)
-5. Model tree HF popolato (`base_model` link funzionante)
-6. Nessun dato sensibile pubblicato (re-check post-upload: grep path locali nel README/NOTICE)
-7. Repo trovabile via tag `rocmfpx`, `gfx1151`, `strix-halo`
+1. Both repos created `public` under `pugant/`
+2. All files present with the correct size (verification via HF API `repo_info`)
+3. README.md renders correctly (HF preview)
+4. License visible in the HF sidebar (`license` metadata in the frontmatter)
+5. HF model tree populated (`base_model` link working)
+6. No sensitive data published (post-upload re-check: grep for local paths in the README/NOTICE)
+7. Repos findable via the tags `rocmfpx`, `gfx1151`, `strix-halo`
 
-## 8. Limitazioni dichiarate (nel model card)
+## 8. Declared limitations (in the model card)
 
 - Speed benchmark only (no quality eval)
-- Profilato per gfx1151 solo (non testato su altre GPU)
-- MTP non attivato (plain inference). Eventuale attivazione MTP = lavoro futuro
-- imatrix grug: 1/256 expert non coperto (normale MoE, impatto trascurabile)
+- Profiled for gfx1151 only (not tested on other GPUs)
+- MTP not enabled (plain inference). Possible MTP activation = future work
+- grug imatrix: 1/256 experts not covered (normal for MoE, negligible impact)
 
-## 9. Rischi e mitigation
+## 9. Risks and mitigations
 
-| Rischio | Mitigazione |
+| Risk | Mitigation |
 |---|---|
-| Upload fallisce per size | LFS resume; re-run |
-| License metadata errata nel frontmatter | Verifica pre-upload: `license: apache-2.0` (grug), `license: mit` (Ornith) |
-| Community confonde con stock-llama.cpp quant | Warning critico top + tag espliciti |
-| Violazione attribution Apache-2.0 NOTICE | File NOTICE completo + dichiarazione derivative work |
-| grug-think-v3-10k gated: utente non può replicare imatrix | **Non applicabile**: dataset pubblico Apache-2.0 non gated (verificato HF API). Community può scaricarlo liberamente per replicare la imatrix. Punto positivo per la replicabilità, dichiarato nel card. |
+| Upload fails due to size | LFS resume; re-run |
+| Wrong license metadata in the frontmatter | Pre-upload check: `license: apache-2.0` (grug), `license: mit` (Ornith) |
+| Community confuses it with a stock-llama.cpp quant | Top critical warning + explicit tags |
+| Apache-2.0 NOTICE attribution violation | Complete NOTICE file + derivative work statement |
+| grug-think-v3-10k gated: a user cannot replicate the imatrix | **Not applicable**: public Apache-2.0 dataset, not gated (verified via HF API). The community can download it freely to replicate the imatrix. A positive point for replicability, stated in the card. |
 
-## 10. Artefatti sorgente (post-completamento, riferimento)
+## 10. Source artifacts (post-completion, reference)
 
 - grug: `~/llmodels/models/GRUG/grug-35b-v2-ROCmFP4-STRIX_LEAN.gguf` (17.32 GiB), `imatrix-grug-35b-v2.gguf` (183 MB), `mmproj-grug-35b-v2-f16.gguf` (857 MB)
 - Ornith: `~/llmodels/models/ORNITH/Ornith-1.0-35B-ROCmFP4-STRIX_LEAN.gguf` (17.32 GiB), `imatrix_unsloth.gguf_file` (183 MB, → `imatrix.dat`), `mmproj-F16.gguf` (857 MB)
 - Bench logs: `<lab-repo>/logs/bench-grug-t9.log`, `bench-ornith-vs-grug.log`
 
-## 11. Apertura / decisioni differite
+## 11. Open items / deferred decisions
 
-- **License kyuz0 toolbox**: **verificato 2026-08-11** — il repo `kyuz0/amd-strix-halo-toolboxes` NON ha file LICENSE (HTTP 404 su GitHub API sia su `/license` che su `LICENSE` raw). Default copyright "All rights reserved" si applica. **Decisione**: nel model card usiamo solo attribution come riferimento link GitHub (fair use), senza clausole che implicano ridistribuzione del container. Se kyuz0 aggiunge LICENSE in futuro, allineare NOTICE.
-- **eval quality**: lavoro futuro, su input community
-- **Riavvio llm-service produzione**: separato, decisione utente post-pubblicazione
+- **kyuz0 toolbox license**: **verified 2026-08-11** — the `kyuz0/amd-strix-halo-toolboxes` repo has NO LICENSE file (HTTP 404 on the GitHub API for both `/license` and the raw `LICENSE`). The default "All rights reserved" copyright applies. **Decision**: in the model card we use only attribution as a GitHub reference link (fair use), without clauses implying redistribution of the container. If kyuz0 adds a LICENSE in the future, align the NOTICE.
+- **quality eval**: future work, on community input
+- **Production llm-service restart**: separate, user decision post-publication

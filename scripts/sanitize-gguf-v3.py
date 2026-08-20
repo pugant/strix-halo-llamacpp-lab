@@ -2,9 +2,9 @@
 # Part of strix-halo-llamacpp-lab — see README.md.
 # Replication scripts for the Qwen3.8-27B ROCmFP4-STRIX_LEAN pipeline.
 # Env: LLMODELS_DIR (default $HOME/llmodels), HF_TOKEN (downloads/uploads).
-# sanitize-gguf-v3.py — KV-only sanitizer con parser validato (2026-08-15).
-# Copia RAW tensor_info + tensor_data; riscrive solo header+KV; ricalcola padding alignment.
-# Uso: python3 sanitize-gguf-v3.py <input.gguf> <output.gguf> <config.json>
+# sanitize-gguf-v3.py — KV-only sanitizer with a validated parser (2026-08-15).
+# Copies tensor_info + tensor_data RAW; rewrites only header+KV; recomputes alignment padding.
+# Usage: python3 sanitize-gguf-v3.py <input.gguf> <output.gguf> <config.json>
 import json
 import mmap
 import os
@@ -112,7 +112,7 @@ def main(inp, outp, cfg_path):
                 chunk = fi.read(min(1 << 24, remaining))
                 fo.write(chunk)
                 remaining -= len(chunk)
-    print(f"[✓] scritto {outp} ({os.path.getsize(outp)} B, orig {total} B)")
+    print(f"[✓] written {outp} ({os.path.getsize(outp)} B, orig {total} B)")
 
 
 if __name__ == '__main__':

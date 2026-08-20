@@ -2,50 +2,51 @@
 # Part of strix-halo-llamacpp-lab — see README.md.
 # Replication scripts for the Qwen3.8-27B ROCmFP4-STRIX_LEAN pipeline.
 # Env: LLMODELS_DIR (default $HOME/llmodels), HF_TOKEN (downloads/uploads).
-# test-drafter-routing-t3.sh — T3 regressione percorsi sacri (0005-0009) in duale (spec §7 T3)
-# Uso: bash scripts/test-drafter-routing-t3.sh simple|prod
+# test-drafter-routing-t3.sh — T3 regression of the sacred paths (0005-0009) in dual mode (spec §7 T3)
+# Usage: bash scripts/test-drafter-routing-t3.sh simple|prod
 #
-# EMENDAMENTI 2026-08-19 (stessa natura di T1/T2; NON indebolimenti — motivazione in header):
-#  1. Misura riuso via cached=/delta (usage.prompt_tokens_details + riga prompt-eval del
-#     log), MAI usage.prompt_tokens totale (T1: e' il totale, non il delta).
-#  2. Le varianti "resend CON tools" del piano diventano echo INFO non-gate (la divergenza
-#     template del blocco tools, lcp~40, renderebbe l'exact-hit impossibile: certificherebbe
-#     il template, non il routing). La versione GATE usa override spec_drafter.
-#  3. SIMILARITA' DEFAULT (0.10, NIENTE tecnica T2): i percorsi sacri (trailing rollback,
-#     checkpoint salvage 0007) vivono nel path slot-local di update_slots; con similarity 0
-#     + flush i resend divergenti prendono la via load()-RAM che SCARTA le entry divergenti
-#     (spec_trailing_rm=false) e pagano cold — non e' il percorso da certificare qui.
-#  4. Vincolo tag-checkpoint (by design, spec §4.4 + server-context.cpp): il salvage usa il
-#     checkpoint piu' recente <=p0_rm e restaura i byte draft solo a tag drafter compatibile
-#     con la classe del task; => S2/S4 allineano la classe dei resend divergenti alla classe
-#     del turno creatore del checkpoint utile. Il caso divergente CROSS-CLASS e' echo INFO
-#     in coda (cold by design, limite dichiarato). S1 usa turni che chiudono con stop
-#     (max_tokens 400) per aver round-trip esatti deterministici (delta 0) con switch.
-#  5. Prompt-turno-1 lunghi (~470 tok): evitano che un nuovo scenario catturi per similarita'
-#     lo slot di una conversazione precedente (sim<0.10) — i cold delle conversazioni NUOVE
-#     resterebbero altrimenti loggati come 'cold fallback' inquinando i gate zero-cold.
-#  6. Fix pre-esistente scoperto da T3 (commit reasoning-budget-clone): il budget non
-#     si esauriva MAI su config con dflash (clone del sampler riempiva il contatore a ogni
-#     rollback speculativo). S1 dipende da quel fix (marker 'budget exhausted').
+# AMENDMENTS 2026-08-19 (same nature as T1/T2; NOT weakenings — rationale in the header):
+#  1. Measure reuse via cached=/delta (usage.prompt_tokens_details + the log
+#     prompt-eval line), NEVER total usage.prompt_tokens (T1: it is the total, not the delta).
+#  2. The plan's "resend WITH tools" variants become not-a-gate INFO echoes (the template
+#     divergence of the tools block, lcp~40, would make the exact-hit impossible: it would
+#     certify the template, not the routing). The GATE version uses the spec_drafter override.
+#  3. DEFAULT SIMILARITY (0.10, NO T2 technique): the sacred paths (trailing rollback,
+#     checkpoint salvage 0007) live in the slot-local path of update_slots; with similarity 0
+#     + flush the divergent resends take the load()-RAM route which DISCARDS divergent
+#     entries (spec_trailing_rm=false) and pays cold — that is not the path to certify here.
+#  4. Tag-checkpoint constraint (by design, spec §4.4 + server-context.cpp): the salvage uses
+#     the most recent checkpoint <=p0_rm and restores the draft bytes only at a drafter tag
+#     compatible with the task class; => S2/S4 align the class of the divergent resends to
+#     the class of the turn that created the useful checkpoint. The divergent CROSS-CLASS
+#     case is an INFO echo at the end (cold by design, declared limitation). S1 uses turns
+#     that end with stop (max_tokens 400) to get deterministic exact round-trips (delta 0)
+#     with a switch.
+#  5. Long turn-1 prompts (~470 tok): prevent a new scenario from capturing by similarity
+#     the slot of a previous conversation (sim<0.10) — otherwise the colds of NEW
+#     conversations would be logged as 'cold fallback', polluting the zero-cold gates.
+#  6. Pre-existing fix discovered by T3 (commit reasoning-budget-clone): the budget
+#     never exhausted on configs with dflash (the sampler clone refilled the counter
+#     on every speculative rollback). S1 depends on that fix (marker 'budget exhausted').
 #
-# Scenario (fonti: piani 15/08 forced-end, 16/08 checkpoint-rollback + t3-cold-fallback):
-#  S1 budget-forced end + resend verbatim, 2 varianti (mtp->dflash, dflash->mtp):
+# Scenario (sources: 15/08 forced-end plan, 16/08 checkpoint-rollback plan + t3-cold-fallback):
+#  S1 budget-forced end + verbatim resend, 2 variants (mtp->dflash, dflash->mtp):
 #     gate: marker 'budget exhausted, forcing end sequence' + exact-hit (cached>=90% conv,
-#     delta<pt/2) + zero cold non-spec-route.
-#  S2 resend alterato (reasoning turn-1 mozzato presto => delta oltre ring => salvage):
+#     delta<pt/2) + zero cold outside spec-route.
+#  S2 altered resend (turn-1 reasoning truncated early => delta beyond ring => salvage):
 #     conv mtp,dflash; resend mtp. gate: 200, zero abort, zero cold, marker
-#     'prompt cache checkpoint rollback' (rigenera SOLO dal checkpoint).
-#  S3 trailing truncation + resend (ultima parola mutata, delta piccolo), 2 varianti
+#     'prompt cache checkpoint rollback' (regenerates ONLY from the checkpoint).
+#  S3 trailing truncation + resend (last word changed, small delta), 2 variants
 #     (mtp->dflash, dflash->mtp): gate: marker 'trailing rollback: lcp=' + zero abort + zero cold.
-#  S4 checkpoint salvage 0007: conv mtp/dflash/mtp-tronco(max_tokens 60, length) + resume
-#     prefisso puro (re-ask turno 3) classe mtp: gate: marker 'prompt cache checkpoint
-#     rollback' + zero abort + prefill risparmiato >50% (processed < pt/2 dal log) + 200.
-#  INFO non-gate: resend CON tools dopo S1 e S3 (documenta divergenza template).
+#  S4 checkpoint salvage 0007: conv mtp/dflash/mtp-truncated(max_tokens 60, length) +
+#     pure-prefix resume (re-ask turn 3) class mtp: gate: marker 'prompt cache checkpoint
+#     rollback' + zero abort + prefill saved >50% (processed < pt/2 from the log) + 200.
+#  INFO not a gate: resend WITH tools after S1 and S3 (documents template divergence).
 set -u
 CONFIG=${1:-simple}
 case "$CONFIG" in
   simple|prod) ;;
-  *) echo "uso: $0 simple|prod"; exit 2 ;;
+  *) echo "usage: $0 simple|prod"; exit 2 ;;
 esac
 LAB_DIR="${LAB_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 LLMODELS_DIR="${LLMODELS_DIR:-$HOME/llmodels}"
@@ -73,9 +74,9 @@ docker run -d --name $NAME --network host --device /dev/dri --group-add render \
 for i in $(seq 1 120); do curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health 2>/dev/null | grep -q 200 && break; sleep 1; done
 
 NLOG=0
-seg() { docker logs $NAME 2>&1 | tail -n +$((NLOG+1)); } # log dalla fine dello scenario precedente
+seg() { docker logs $NAME 2>&1 | tail -n +$((NLOG+1)); } # log from the end of the previous scenario
 cursor() { NLOG=$(docker logs $NAME 2>&1 | wc -l); }
-longmsg() { # $1 topic -> prompt lungo ~470 token (nuova conversazione: sim<0.10 con slot vecchi)
+longmsg() { # $1 topic -> long ~470-token prompt (new conversation: sim<0.10 vs old slots)
   local M="Contesto lungo per la domanda finale. "
   for i in $(seq 1 30); do M="$M Nota numero $i su $1: il punto e' rilevante per la risposta finale. "; done
   M="$M Alla fine, dopo aver riflettuto, rispondi in una frase breve."
@@ -106,15 +107,15 @@ hist.append(a); hist.append({'role':'user','content':'''$3'''})
 json.dump(hist,open('$2','w'))
 "
 }
-proc_tokens() { # $1 seg-file -> token processati dall'ultima riga prompt-eval
+proc_tokens() { # $1 seg-file -> tokens processed, from the last prompt-eval line
   grep -oE 'prompt eval time *= *[0-9.]+ ms */ *[0-9]+ tokens' "$1" | tail -1 | grep -oE '[0-9]+ tokens' | grep -oE '[0-9]+' || echo 0
 }
-zero_cold() { # $1 seg-file -> 0 se zero cold fallback non-spec-route
+zero_cold() { # $1 seg-file -> 0 if zero cold fallback outside spec-route
   if grep -iE 'cold fallback' "$1" | grep -v 'spec-route' | grep -q .; then echo 1; else echo 0; fi
 }
 
-# ============ S1: budget-forced end + resend verbatim (2 varianti) ============
-s1() { # $1 variante(a|mtp->dflash | b|dflash->mtp) $2 classe-turno1 $3 classe-resend $4 topic
+# ============ S1: budget-forced end + verbatim resend (2 variants) ============
+s1() { # $1 variant(a|mtp->dflash | b|dflash->mtp) $2 turn1-class $3 resend-class $4 topic
   local V=$1 C1=$2 CR=$3 H="$OUT/s1-$1-$CONFIG.hist.json" R
   echo "[{\"role\":\"user\",\"content\":\"$(longmsg "$4")\"}]" > "$H"
   cursor
@@ -136,18 +137,18 @@ s1() { # $1 variante(a|mtp->dflash | b|dflash->mtp) $2 classe-turno1 $3 classe-r
 s1 a mtp    dflash "Giulio Cesare e la Roma antica"
 s1 b dflash mtp    "la fotosintesi delle piante"
 
-# ============ S2: resend alterato (reasoning turn-1 mozzato) ============
-# NB tag-checkpoint (by design §4.4): il resend divergente recupera SOLO via
-# checkpoint-salvage, che restaura i byte draft solo a tag compatibile => i turni
-# del flusso GATE restano classe mtp (stessa del turno-1, creatore del checkpoint
-# utile). Il caso cross-class divergente e' echo INFO in coda (cold by design).
+# ============ S2: altered resend (turn-1 reasoning truncated) ============
+# NB tag-checkpoint (by design §4.4): the divergent resend recovers ONLY via
+# checkpoint-salvage, which restores the draft bytes only at a compatible tag => the
+# turns of the GATE flow stay class mtp (same as turn-1, creator of the useful
+# checkpoint). The divergent cross-class case is an INFO echo at the end (cold by design).
 H2="$OUT/s2-$CONFIG.hist.json"
 echo "[{\"role\":\"user\",\"content\":\"$(longmsg "le termiche dell atmosfera")\"}]" > "$H2"
 cursor
 R=$(reqturn "$OUT/s2-t1-$CONFIG.json" "$H2" mtp)
 hist_append "$OUT/s2-t1-$CONFIG.json" "$H2" "Ok. Ora dammi un esempio pratico breve."
 R2=$(reqturn "$OUT/s2-t2-$CONFIG.json" "$H2" mtp)
-# resend ALTERATO: reasoning del turno-1 mozzato presto (delta oltre ring) + nuovo turno, classe mtp
+# ALTERED resend: turn-1 reasoning truncated early (delta beyond ring) + new turn, class mtp
 python3 - "$H2" <<'EOF'
 import json,sys
 h=json.load(open(sys.argv[1]))
@@ -166,22 +167,22 @@ G=0; [ "$R" = 200 ] && [ "$R2" = 200 ] && [ "$R3" = 200 ] || G=1
 grep -q 'prompt cache checkpoint rollback' "$OUT/s2-$CONFIG.seg.log" || G=1
 [ "$(zero_cold "$OUT/s2-$CONFIG.seg.log")" = 0 ] || G=1
 grep -q 'GGML_ABORT' "$OUT/s2-$CONFIG.seg.log" && G=1
-ck "S2 resend-alterato (no abort, no cold, rigenera dal checkpoint: processed=$PROC3/$PT3)" $G
+ck "S2 altered-resend (no abort, no cold, regenerates from checkpoint: processed=$PROC3/$PT3)" $G
 
-# ============ S3: trailing truncation + resend (gate ORIGINALE ripristinato, ciclo RS 20/08) ============
-# [CICLO RS 2026-08-20, piano 2026-08-20-rs-rollback-dflash-experiment] il commit
-# 'spec: keep recurrent state rollback with draft-dflash' mantiene n_rs_seq>0 anche
-# col duale => il seq_rm del blocco trailing ora riesce e il marker originale
-# 'trailing rollback: lcp=' torna raggiungibile. L'emendamento S3' del 19/08
-# (gate degradato a esito-documentato) e' OBSOLETO e rimosso: gate originale.
-s3() { # $1 variante $2 classe-turno1 $3 classe-resend $4 topic
+# ============ S3: trailing truncation + resend (ORIGINAL gate restored, RS cycle 20/08) ============
+# [RS CYCLE 2026-08-20, plan 2026-08-20-rs-rollback-dflash-experiment] the commit
+# 'spec: keep recurrent state rollback with draft-dflash' keeps n_rs_seq>0 even in
+# dual mode => the seq_rm of the trailing block now succeeds and the original
+# marker 'trailing rollback: lcp=' is reachable again. The 19/08 S3' amendment
+# (gate degraded to documented outcome) is OBSOLETE and removed: original gate.
+s3() { # $1 variant $2 turn1-class $3 resend-class $4 topic
   local V=$1 C1=$2 CR=$3 H="$OUT/s3-$1-$CONFIG.hist.json"
   echo "[{\"role\":\"user\",\"content\":\"$(longmsg "$4")\"}]" > "$H"
   cursor
   R=$(reqturn "$OUT/s3-$V-t1-$CONFIG.json" "$H" "$C1")
-  # append PRIMA della mutazione (h[1] deve esistere): h = [u1,a1,u2]
+  # append BEFORE the mutation (h[1] must exist): h = [u1,a1,u2]
   hist_append "$OUT/s3-$V-t1-$CONFIG.json" "$H" "Confermi? Una parola."
-  # resend con ULTIMA PAROLA del content mutata (delta piccolo, dentro ring)
+  # resend with the LAST WORD of the content changed (small delta, within ring)
   python3 - "$H" <<'EOF'
 import json,sys
 h=json.load(open(sys.argv[1]))
@@ -204,21 +205,21 @@ EOF
 s3 a mtp    dflash "le piramidi d Egitto"
 s3 b dflash mtp    "il ciclo dell acqua"
 
-# ============ S4: checkpoint salvage (conv con switch + turno troncato + resume prefisso puro) ============
-# Classi: t1=mtp, t2=mtp, t3=dflash TRONCATO, resume=dflash. Lo switch resta (t2->t3) e
-# ogni resend con delta<=2 (trim whitespace, topic-luck) cade su checkpoint a tag
-# COMPATIBILE (t2 su ckpt t1 mtp; resume su ckpt prefill t3 dflash). Il resume
-# certifica il salvage su un checkpoint DFLASH-tagged (complementare a S2/mtp-tag).
+# ============ S4: checkpoint salvage (conv with switch + truncated turn + pure-prefix resume) ============
+# Classes: t1=mtp, t2=mtp, t3=dflash TRUNCATED, resume=dflash. The switch stays (t2->t3)
+# and every resend with delta<=2 (whitespace trim, topic luck) lands on a checkpoint with
+# a COMPATIBLE tag (t2 on the t1 mtp ckpt; resume on the t3 dflash prefill ckpt). The
+# resume certifies the salvage on a DFLASH-tagged checkpoint (complementary to S2/mtp-tag).
 H4="$OUT/s4-$CONFIG.hist.json"
 echo "[{\"role\":\"user\",\"content\":\"$(longmsg "le rotte commerciali medievali")\"}]" > "$H4"
 cursor
-R=$(reqturn "$OUT/s4-t1-$CONFIG.json" "$H4" mtp)                                # turno 1 mtp
+R=$(reqturn "$OUT/s4-t1-$CONFIG.json" "$H4" mtp)                                # turn 1 mtp
 hist_append "$OUT/s4-t1-$CONFIG.json" "$H4" "Dammi un secondo esempio."
-R2=$(reqturn "$OUT/s4-t2-$CONFIG.json" "$H4" mtp)                               # turno 2 mtp
+R2=$(reqturn "$OUT/s4-t2-$CONFIG.json" "$H4" mtp)                               # turn 2 mtp
 hist_append "$OUT/s4-t2-$CONFIG.json" "$H4" "Un terzo esempio, breve."
-R3=$(reqturn "$OUT/s4-t3-$CONFIG.json" "$H4" dflash 60)                         # turno 3 dflash TRONCATO (switch + length)
-# resume: il client scarta l'output parziale e re-invia la request del turno 3 VERBATIM
-# (H4 e' ancora [u1,a1,u2,a2,u3]: l'assistant troncato non e' mai stato appeso) — classe dflash (= ckpt t3)
+R3=$(reqturn "$OUT/s4-t3-$CONFIG.json" "$H4" dflash 60)                         # turn 3 dflash TRUNCATED (switch + length)
+# resume: the client discards the partial output and resends the turn-3 request VERBATIM
+# (H4 is still [u1,a1,u2,a2,u3]: the truncated assistant was never appended) — class dflash (= ckpt t3)
 R4=$(reqturn "$OUT/s4-t4-$CONFIG.json" "$H4" dflash)
 seg > "$OUT/s4-$CONFIG.seg.log"; cursor
 read -r PT4 CACHED4 _ < <(usage3 "$OUT/s4-t4-$CONFIG.json")
@@ -232,15 +233,15 @@ grep -q 'GGML_ABORT' "$OUT/s4-$CONFIG.seg.log" && G=1
 grep 'prompt cache checkpoint rollback' "$OUT/s4-$CONFIG.seg.log" | tail -1
 ck "S4 checkpoint-salvage (marker, no abort, no cold, saved>50%: $PROC4/$PT4)" $G
 
-# ============ INFO non-gate: resend CON tools (divergenza template) ============
+# ============ INFO not a gate: resend WITH tools (template divergence) ============
 cursor
 HI="$OUT/s1-a-$CONFIG.hist.json"
 RI=$(reqturn "$OUT/info-tools1-$CONFIG.json" "$HI" none tools)
 read -r PTI CI _ < <(usage3 "$OUT/info-tools1-$CONFIG.json")
 seg > "$OUT/info-$CONFIG.seg.log"
-echo "INFO (non-gate) S1-conv resend CON tools: code=$RI pt=$PTI cached=$CI $(grep -oE 'lcp=[0-9]+' "$OUT/info-$CONFIG.seg.log" | tail -1) — atteso riuso nullo/parziale per divergenza template (lcp atteso ~40)"
+echo "INFO (not a gate) S1-conv resend WITH tools: code=$RI pt=$PTI cached=$CI $(grep -oE 'lcp=[0-9]+' "$OUT/info-$CONFIG.seg.log" | tail -1) — null/partial reuse expected due to template divergence (expected lcp ~40)"
 
-# ============ INFO non-gate: resend alterato CROSS-CLASS (limite by-design §4.4) ============
+# ============ INFO not a gate: altered resend CROSS-CLASS (by-design limit §4.4) ============
 H2X="$OUT/info-xclass-$CONFIG.hist.json"
 echo "[{\"role\":\"user\",\"content\":\"$(longmsg "i vulcani islandesi")\"}]" > "$H2X"
 R=$(reqturn "$OUT/info-x1-$CONFIG.json" "$H2X" mtp)
@@ -255,15 +256,15 @@ EOF
 hist_append "$OUT/info-x1-$CONFIG.json" "$H2X" "Prosegui."
 RX=$(reqturn "$OUT/info-x2-$CONFIG.json" "$H2X" dflash)
 seg > "$OUT/info-xclass-$CONFIG.seg.log"
-echo "INFO (non-gate) resend alterato CROSS-CLASS (mtp->dflash): code=$RX — atteso cold by design (§4.4: checkpoint salvage a tag incompatibile non restaura i byte draft)"
+echo "INFO (not a gate) altered resend CROSS-CLASS (mtp->dflash): code=$RX — cold expected by design (§4.4: checkpoint salvage at an incompatible tag does not restore the draft bytes)"
 
-# liveness finale + abort globali
+# final liveness + global aborts
 docker logs $NAME > "$OUT/t3-$CONFIG-full.log" 2>&1
 LIVE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health)
 NABORT=$(grep -c 'GGML_ABORT' "$OUT/t3-$CONFIG-full.log")
 NCOLD=$(grep -iE 'cold fallback' "$OUT/t3-$CONFIG-full.log" | grep -cv 'spec-route')
-echo "INFO finale: health=$LIVE GGML_ABORT(totali)=$NABORT cold-fallback(non-spec-route,totali)=$NCOLD"
-[ "$LIVE" = 200 ] && [ "$NABORT" -eq 0 ]; ck "G-final server vivo + zero abort" $?
+echo "INFO final: health=$LIVE GGML_ABORT(total)=$NABORT cold-fallback(outside-spec-route,total)=$NCOLD"
+[ "$LIVE" = 200 ] && [ "$NABORT" -eq 0 ]; ck "G-final server alive + zero aborts" $?
 
 docker rm -f $NAME >/dev/null 2>&1
 echo "=== T3[$CONFIG]: PASS=$PASS FAIL=$FAIL ==="

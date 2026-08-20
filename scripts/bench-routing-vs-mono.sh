@@ -2,18 +2,18 @@
 # Part of strix-halo-llamacpp-lab — see README.md.
 # Replication scripts for the Qwen3.8-27B ROCmFP4-STRIX_LEAN pipeline.
 # Env: LLMODELS_DIR (default $HOME/llmodels), HF_TOKEN (downloads/uploads).
-# bench-routing-vs-mono.sh — T4 A/B: routing duale (policy) vs MONO-MTP6 su Qwen3.8-27B STRIX_LEAN
-# Piano T7-f2 Task 9. Derivato da bench-dflash-vs-mtp.sh + bench-dflash-df3-agentic.sh (prompt VERBATIM).
-# Protocollo standard T7/T0: GPU DEDICATA (llm-service FERMO, gestito esternamente),
-# -c 16384, p_min 0.75 ESPLICITO, temp 0, warm-up scartato, marker TREATMENT, -lv 3.
-# FAIRNESS: immagine UNICA (vulkan-fork-dflash2-route) per entrambi i bracci — cambia SOLO la config.
+# bench-routing-vs-mono.sh — T4 A/B: dual routing (policy) vs MONO-MTP6 on Qwen3.8-27B STRIX_LEAN
+# Plan T7-f2 Task 9. Derived from bench-dflash-vs-mtp.sh + bench-dflash-df3-agentic.sh (VERBATIM prompts).
+# Standard protocol T7/T0: DEDICATED GPU (llm-service STOPPED, managed externally),
+# -c 16384, EXPLICIT p_min 0.75, temp 0, warm-up discarded, TREATMENT marker, -lv 3.
+# FAIRNESS: single image (vulkan-fork-dflash2-route) for both arms — ONLY the config changes.
 #   MONO-MTP6: --spec-type draft-mtp --spec-draft-n-max 6
 #   DUALE:     --spec-type draft-mtp,draft-dflash --spec-draft-n-max 7 (+ draft model)
-# Prompt: 4 standard T7 (prosa×2 SENZA tools; det×2 CON tools minimal per il routing) +
-#         3 agentic VERBATIM da bench-dflash-df3-agentic.sh (CON tools).
-# Gate (media per-prompt sulla classe): R3.1 prosa DUALE >= MONO-3%; R3.2 agentic DUALE >= MONO+10%
-# (media dei 3, non 2/3). Det = informazionale. Acceptance per impl = DELTA dei contatori
-# cumulativi nelle righe 'statistics' tra prompt consecutivi.
+# Prompts: 4 standard T7 (prose×2 WITHOUT tools; det×2 WITH minimal tools for routing) +
+#         3 agentic VERBATIM from bench-dflash-df3-agentic.sh (WITH tools).
+# Gates (class mean across prompts): R3.1 prose DUAL >= MONO-3%; R3.2 agentic DUAL >= MONO+10%
+# (mean of the 3, not 2/3). Det = informational. Acceptance by impl = DELTA of the
+# cumulative counters in the 'statistics' lines between consecutive prompts.
 set -u
 LAB_DIR="${LAB_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 LLMODELS_DIR="${LLMODELS_DIR:-$HOME/llmodels}"
@@ -24,21 +24,21 @@ MODEL=/llmodels/QWEN3.8/Qwen3.8-27B-Q4_0_ROCMFP4_STRIX_LEAN.gguf
 DRAFTER=/llmodels/QWEN3.8/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 IMG=docker-llm-service:vulkan-fork-dflash2-route
 
-# tools payload minimal (T1): attiva il signal 'tools' -> policy -> dflash in DUALE;
-# presente in ENTRAMBI i bracci (stesso body: fairness, il mono lo ignora come routing)
+# minimal tools payload (T1): activates the 'tools' signal -> policy -> dflash in DUAL;
+# present in BOTH arms (same body: fairness, mono ignores it for routing)
 TOOLS='[{"type":"function","function":{"name":"get_time","description":"Ora corrente","parameters":{"type":"object","properties":{}}}}]'
 
-# prompt standard T7 (VERBATIM da bench-dflash-vs-mtp.sh)
+# standard T7 prompts (VERBATIM from bench-dflash-vs-mtp.sh)
 STD_P1='Scrivi un paragrafo dettagliato sulla storia di Roma.'
 STD_P2='Scrivi un saggio breve sulla stampa e il Rinascimento italiano.'
 STD_D1='Conta da 1 a 200, un numero per riga, solo i numeri.'
 STD_D2='Elenco l alfabeto inglese una lettera per riga, poi ripetilo al contrario.'
-# prompt agentic (VERBATIM da bench-dflash-df3-agentic.sh)
+# agentic prompts (VERBATIM from bench-dflash-df3-agentic.sh)
 AG1='Scrivi dieci funzioni Python molto brevi, una per riga: somma, sottrazione, moltiplicazione, divisione, modulo, potenza, minimo, massimo, valore assoluto, arrotondamento. Ogni funzione su una riga con def e return.'
 AG2='Genera un array JSON di trenta oggetti utente: id progressivo da 1, nome user_N, email user_N at example.com, attivo true, punteggio N virgola 5. Solo JSON valido, senza commenti.'
 AG3='Scrivi venti righe di log in formato standard: data 2026-08-19, ora progressiva, livello INFO, servizio api, messaggio richiesta N elaborata con stato 200.'
 
-start_server() { # $1=tag $2=tipo $3=nmax $4=drafter(o vuoto)
+start_server() { # $1=tag $2=type $3=nmax $4=drafter(or empty)
   local tag="$1" tipo="$2" nmax="$3" dft="${4:-}"
   local name="bench-${tag}-q38"
   local extra=()
@@ -70,26 +70,26 @@ bench_tok() {
   python3 -c "import json; t=json.load(open('$out')).get('timings',{}); print(round(t.get('predicted_per_second',0),1))" 2>/dev/null || echo "ERR"
 }
 
-stat_after() { # $1=container $2=impl -> ultimo valore cumulativo '#gen drafts' e '#acc tokens'
+stat_after() { # $1=container $2=impl -> latest cumulative '#gen drafts' and '#acc tokens' values
   docker logs "$1" 2>&1 | grep -E "statistics +$2:" | tail -1 | sed -E 's/.*#gen drafts = +([0-9]+).*#acc tokens = +([0-9]+).*/\1 \2/'
 }
-route_after() { # $1=container -> ultimo marker routing (NB: '.*' assorbe il glifo unicode della freccia)
+route_after() { # $1=container -> latest routing marker (NB: '.*' absorbs the arrow unicode glyph)
   docker logs "$1" 2>&1 | grep 'spec-route: task' | tail -1 | sed -E 's/.*signal=([^ ]+).*drafter=([a-z]+).*/\1 \2/'
 }
 
-run_arm() { # $1=tag $2=tipo $3=nmax $4=drafter
+run_arm() { # $1=tag $2=type $3=nmax $4=drafter
   local tag="$1" name="bench-$1-q38" tsv="$OUT/arm-$1.tsv"
   echo "== TREATMENT=${tag} tipo=${2} n-max=${3} model=LEAN p_min=0.75 c=16384 vulkan img=route =="
   rm -f "$tsv"
   if ! start_server "$tag" "$2" "$3" "${4:-}"; then
-    echo "RISULTATO TREATMENT=${tag}: SERVER FAIL"
+    echo "RESULT TREATMENT=${tag}: SERVER FAIL"
     return 1
   fi
-  bench_tok 'Rispondi solo OK.' 50 0 >/dev/null   # warm-up scartato (baseline contatori)
+  bench_tok 'Rispondi solo OK.' 50 0 >/dev/null   # warm-up discarded (counter baseline)
   { local bm bd; read -r bm _ <<< "$(stat_after "$name" draft-mtp)"; read -r bd _ <<< "$(stat_after "$name" draft-dflash)"
     [ -z "$bm" ] && bm=-; [ -z "$bd" ] && bd=-
     echo -e "W\twarm\t0\t${bm}\t${bd}\t-\t-" >> "$tsv"; }
-  # id classe tools max_tokens prompt  (NB: campi separati da SINGOLO spazio)
+  # id class tools max_tokens prompt  (NB: fields separated by a SINGLE space)
   local rows=(
     "P1|prosa|0|600|$STD_P1"
     "P2|prosa|0|600|$STD_P2"
@@ -118,7 +118,7 @@ run_arm() { # $1=tag $2=tipo $3=nmax $4=drafter
   docker rm -f "$name" >/dev/null 2>&1
 }
 
-# bracci (controllo prima)
+# arms (control first)
 run_arm MONO-MTP6 draft-mtp 6 ""
 run_arm DUALE     draft-mtp,draft-dflash 7 "$DRAFTER"
 
@@ -139,8 +139,8 @@ def load(tag):
         prev_m,prev_d=m,df
     return rows
 mono=load('MONO-MTP6'); dual=load('DUALE')
-print('== TABELLA tok/s (prompt x braccio) ==')
-print(f"{'prompt':4} {'classe':8} {'MONO-MTP6':>10} {'DUALE':>8} {'delta%':>8}  route(DUALE)")
+print('== TABLE tok/s (prompt x arm) ==')
+print(f"{'prompt':4} {'class':8} {'MONO-MTP6':>10} {'DUALE':>8} {'delta%':>8}  route(DUALE)")
 for p in ['P1','P2','D1','D2','A1','A2','A3']:
     m,d=mono[p]['tok'],dual[p]['tok']
     dp=(d-m)/m*100 if m>0 else 0
@@ -149,18 +149,18 @@ def amean(d,pids):
     v=[d[p]['tok'] for p in pids]; return sum(v)/len(v)
 mp,dp_=amean(mono,['P1','P2']),amean(dual,['P1','P2'])
 ma,da=amean(mono,['A1','A2','A3']),amean(dual,['A1','A2','A3'])
-print(f"\nmedie classe: prosa MONO={mp:.1f} DUALE={dp_:.1f} ({(dp_-mp)/mp*100:+.1f}%) | agentic MONO={ma:.1f} DUALE={da:.1f} ({(da-ma)/ma*100:+.1f}%)")
-print('== acceptance per impl DUALE (delta contatori cumulativi per prompt; gen drafts) ==')
-print(f"{'prompt':4} {'cls':8} {'mtp gen-dr':>10} {'df gen-dr':>10} {'df attivo?':>12}")
+print(f"\nclass means: prose MONO={mp:.1f} DUALE={dp_:.1f} ({(dp_-mp)/mp*100:+.1f}%) | agentic MONO={ma:.1f} DUALE={da:.1f} ({(da-ma)/ma*100:+.1f}%)")
+print('== acceptance by impl DUAL (delta of cumulative counters for each prompt; gen drafts) ==')
+print(f"{'prompt':4} {'cls':8} {'mtp gen-dr':>10} {'df gen-dr':>10} {'df active?':>12}")
 for p in ['P1','P2','D1','D2','A1','A2','A3']:
-    print(f"{p:4} {dual[p]['cls']:8} {dual[p]['dm']:10d} {dual[p]['dd']:10d} {'NO(ok prose)' if dual[p]['dd']==0 else 'SI'}")
+    print(f"{p:4} {dual[p]['cls']:8} {dual[p]['dm']:10d} {dual[p]['dd']:10d} {'NO(ok for prose)' if dual[p]['dd']==0 else 'YES'}")
 g1 = dp_ >= mp*0.97
 g2 = da >= ma*1.10
 prosa_routed_ok = all(dual[p]['dr']=='mtp' for p in ['P1','P2'])
 agentic_routed_ok = all(dual[p]['dr']=='dflash' for p in ['A1','A2','A3'])
-print(f"\nGATE R3.1 prosa DUALE>=MONO-3%: {'PASS' if g1 else 'FAIL'} ({dp_:.1f} vs {mp:.1f}, soglia {mp*0.97:.1f}) | prose routate a mtp: {'OK' if prosa_routed_ok else 'NO'}")
-print(f"GATE R3.2 agentic DUALE>=MONO+10% (media 3): {'PASS' if g2 else 'FAIL'} ({da:.1f} vs {ma:.1f}, soglia {ma*1.10:.1f}) | agentic routati a dflash: {'OK' if agentic_routed_ok else 'NO'}")
-print(f"DET (informazionale): D1 {mono['D1']['tok']:.1f}->{dual['D1']['tok']:.1f} D2 {mono['D2']['tok']:.1f}->{dual['D2']['tok']:.1f}")
+print(f"\nGATE R3.1 prose DUAL>=MONO-3%: {'PASS' if g1 else 'FAIL'} ({dp_:.1f} vs {mp:.1f}, threshold {mp*0.97:.1f}) | prose routed to mtp: {'OK' if prosa_routed_ok else 'NO'}")
+print(f"GATE R3.2 agentic DUAL>=MONO+10% (mean of 3): {'PASS' if g2 else 'FAIL'} ({da:.1f} vs {ma:.1f}, threshold {ma*1.10:.1f}) | agentic routed to dflash: {'OK' if agentic_routed_ok else 'NO'}")
+print(f"DET (informational): D1 {mono['D1']['tok']:.1f}->{dual['D1']['tok']:.1f} D2 {mono['D2']['tok']:.1f}->{dual['D2']['tok']:.1f}")
 print(f"=== T4: R3.1={'PASS' if g1 else 'FAIL'} R3.2={'PASS' if g2 else 'FAIL'} ===")
 EOF
-echo "=== FINE (marker TREATMENT in ogni riga) ==="
+echo "=== END (TREATMENT marker on every line) ==="

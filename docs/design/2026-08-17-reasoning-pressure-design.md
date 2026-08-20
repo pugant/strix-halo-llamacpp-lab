@@ -1,200 +1,208 @@
-# Reasoning Pressure (steering soft del budget reasoning) — Design Spec
+# Reasoning Pressure (soft steering of the reasoning budget) — Design Spec
 
-**Data:** 2026-08-17 · **Filone:** ThinkingCap alla radice (redirect utente: anti-overthinking, NON budget floor)
-**Contesto produzione:** fork ROCmFPX ckpt6 (patch 0001-0009), Qwen3.8-27B STRIX_LEAN, MTP n6, llm-service
-**Report letteratura di riferimento:** `docs/research/2026-08-17-thinkingcap-root-literature.md` (non incluso nel repo)
+**Date:** 2026-08-17 · **Thread:** ThinkingCap at the root (user redirect: anti-overthinking, NOT a budget floor)
+**Production context:** ROCmFPX fork ckpt6 (patches 0001-0009), Qwen3.8-27B STRIX_LEAN, MTP n6, llm-service
+**Reference literature report:** `docs/research/2026-08-17-thinkingcap-root-literature.md` (not included in this repo)
 
-## 1. Problema e obiettivo
+## 1. Problem and goal
 
-Qwen3.8-27B non ha un segnale di stop forte nei pesi: sui task densi il reasoning
-esplode e finisce TRONCATO dall'hard cap (dato A/B/B': 70-90% exhausted a level low).
-La riga dichiarativa (L0) è NO-GO (àncora all'uso pieno: 70→80→90%).
+Qwen3.8-27B has no strong stop signal in its weights: on dense tasks the reasoning
+explodes and ends up TRUNCATED by the hard cap (A/B/B' data: 70-90% exhausted at level low).
+The declarative line (L0) is NO-GO (anchors to full usage: 70→80→90%).
 
-**Obiettivo:** far sì che il modello chiuda il reasoning *da solo e bene* entro il
-budget, tramite steering inference-time soft nel sampler — la famiglia L3 (guided
-decoding) semplificata e training-free, senza predictor.
+**Goal:** make the model close the reasoning *on its own and well* within the
+budget, via soft inference-time steering in the sampler — the L3 family (guided
+decoding) simplified and training-free, without a predictor.
 
-**Metrica di successo:** % exhausted (tagli) da 70-90% → **<30-40%** a parità di
-qualità percepita (gate A/B). Il budget per-level (1024/2048/4096/8192 da pi) resta
-la reference.
+**Success metric:** % exhausted (cuts) from 70-90% → **<30-40%** at parity of
+perceived quality (A/B gate). The per-level budget (1024/2048/4096/8192 from pi) stays
+the reference.
 
-**NON obiettivi (espliciti):** budget floor / force-continue "Wait" (il modello non
-under-thinka — decisione utente 17/08); interventi sui pesi (L4); predictor hidden-states
-(Fase C paper-grade); ridurre i token dei task brevi (che oggi chiudono bene).
+**Explicit NON-goals:** budget floor / force-continue "Wait" (the model does not
+under-think — user decision 17/08); interventions on the weights (L4); hidden-states
+predictor (Phase C paper-grade); reducing tokens on short tasks (which today close well).
 
-## 2. Design scelto — Approccio 1: estensione del sampler `reasoning-budget`
+## 2. Chosen design — Approach 1: extension of the `reasoning-budget` sampler
 
-Tutta la logica vive nel sampler esistente (`common/reasoning-budget.cpp`, patch 0010
-su branch `spec-cache-soft-wrap` = codice ckpt6). Nessun engine work: il sampler è già
-nella chain del target → interazione MTP/cache ereditata dal forced-end in produzione.
+All the logic lives in the existing sampler (`common/reasoning-budget.cpp`, patch 0010
+on branch `spec-cache-soft-wrap` = ckpt6 code). No engine work: the sampler is already
+in the target's chain → MTP/cache interaction inherited from the forced-end in production.
 
-### 2.1 State machine estesa
+### 2.1 Extended state machine
 
 ```
-IDLE → (start_tag) → COUNTING → (end_tag naturale) → DONE   [invariato]
-                         │ used ≥ pressure_start×budget (e UTF-8 complete):
-                         │   FORCING_NOTA (nota deterministica token-per-token,
-                         │                stessa logica accept/apply di FORCING,
-                         │                a fine sequenza ↩ COUNTING, non DONE)
-                         │ COUNTING + used ≥ squeeze_from (condizione DERIVATA,
-                         │ NON uno stato: vedi §2.2)
+IDLE → (start_tag) → COUNTING → (natural end_tag) → DONE   [unchanged]
+                         │ used ≥ pressure_start×budget (and UTF-8 complete):
+                         │   FORCING_NOTA (deterministic token-per-token notice,
+                         │                same accept/apply logic as FORCING,
+                         │                at end of sequence ↩ COUNTING, not DONE)
+                         │ COUNTING + used ≥ squeeze_from (DERIVED condition,
+                         │ NOT a state: see §2.2)
                          ▼
-                      [squeeze attivo in apply] → chiusura naturale o argmax → DONE
-                         │ budget=0 (rete finale INVARIATA):
+                      [squeeze active in apply] → natural close or argmax → DONE
+                         │ budget=0 (final net UNCHANGED):
                          ▼
-                      FORCING (forced-end 0005 + soft-wrap 0008/0009 di oggi)
+                      FORCING (today's forced-end 0005 + soft-wrap 0008/0009)
 ```
 
-- **SQUEEZE non è uno stato**: è una condizione derivata valutata in `apply()` quando
-  `state == COUNTING` e `used ≥ squeeze_from`. Tutte le transizioni di COUNTING
-  (end_matcher → DONE, remaining--, WAITING_UTF8/FORCING a 0, re-arm) restano le
-  stesse — nessuna duplicazione.
-- `FORCING_NOTA` è un nuovo stato che riusa la logica accept/apply di FORCING
-  (sequenza = nota_tokens, masking -inf) ma a fine sequenza torna a COUNTING.
-- La nota si inietta UNA volta per blocco think: flag `note_injected` azzerato dal
-  re-arm su nuovo start_tag (insieme al ricalcolo delle soglie).
-- **Guard UTF-8 al trigger della nota**: WAITING_UTF8 esistente copre SOLO
-  l'exhaustion; il trigger della nota (75%) ha lo stesso bisogno → se l'ultimo token
-  accettato è un pezzo UTF-8 incompleto, l'iniezione è differita al primo token
-  completo (flag `note_pending`, stesso pattern del WAITING_UTF8 esistente).
-- **Contabilità token della nota**: i token forzati della nota NON decrementano
-  `remaining` (come i token del forced-end oggi) → `used = budget - remaining` misura
-  solo i token pensati dal modello.
+- **SQUEEZE is not a state**: it is a derived condition evaluated in `apply()` when
+  `state == COUNTING` and `used ≥ squeeze_from`. All the COUNTING transitions
+  (end_matcher → DONE, remaining--, WAITING_UTF8/FORCING at 0, re-arm) stay the
+  same — no duplication.
+- `FORCING_NOTA` is a new state that reuses FORCING's accept/apply logic
+  (sequence = note_tokens, -inf masking) but returns to COUNTING at the end of the
+  sequence.
+- The note is injected ONCE per think block: a `note_injected` flag cleared by the
+  re-arm on a new start_tag (together with recomputing the thresholds).
+- **UTF-8 guard on the note trigger**: the existing WAITING_UTF8 covers ONLY
+  exhaustion; the note trigger (75%) has the same need → if the last accepted
+  token is an incomplete UTF-8 piece, the injection is deferred to the first complete
+  token (flag `note_pending`, same pattern as the existing WAITING_UTF8).
+- **Token accounting for the note**: the forced tokens of the note do NOT decrement
+  `remaining` (like the forced-end tokens today) → `used = budget - remaining` measures
+  only the tokens thought by the model.
 
-### 2.2 Formula squeeze (condizione in `apply`, stato COUNTING)
+### 2.2 Squeeze formula (condition in `apply`, COUNTING state)
 
 ```cpp
-// soglie in double, calcolate a init (e al re-arm):
+// thresholds in double, computed at init (and at re-arm):
 squeeze_from = min(pressure_start * budget + grace, budget - 1);
-// in apply, se state==COUNTING && used >= squeeze_from:
+// in apply, if state==COUNTING && used >= squeeze_from:
 double x = (double(used) - squeeze_from) / (budget - squeeze_from);
-x = std::min(std::max(x, 0.0), 1.0);        // clamp [0,1] (finestre degeneri)
-const double boost = x * x * max_boost;     // ramp quadratico
-// boost applicato al token end ATTESO DAL MATCHER:
-const llama_token tok = end_tokens[end_matcher.pos];  // di solito == end_tokens[0]
-// scan di cur_p per l'id `tok` (come fa il masking loop) e:
-cur_p[i].logit += boost;                    // SOLO quel token
+x = std::min(std::max(x, 0.0), 1.0);        // clamp [0,1] (degenerate windows)
+const double boost = x * x * max_boost;     // quadratic ramp
+// boost applied to the end token EXPECTED BY THE MATCHER:
+const llama_token tok = end_tokens[end_matcher.pos];  // usually == end_tokens[0]
+// scan cur_p for the id `tok` (as the masking loop does) and:
+cur_p[i].logit += boost;                    // ONLY that token
 ```
 
-- `end_tokens` è la SEQUENZA tokenizzata dell'end tag (il matcher non assume un
-  token singolo): il boost va al prossimo atteso (`end_tokens[end_matcher.pos]`);
-  per Qwen3.8 `</think>` è tipicamente 1 token speciale, ma il codice non lo assume.
-- Clamp doppio (`squeeze_from` e `x`) copre i budget piccoli: con budget=64 → nota a
-  48, squeeze da 63 (finestra 1 token: di fatto nota → cap; comportamento degraduto
-  accettato e documentato).
-- Quadratico: a metà finestra solo +Δ/4; con `max_boost` ~9 l'end diventa argmax
-  negli ultimi ~5-8% del budget. Se non chiude → FORCING a budget 0 (rete finale).
-- **Attivazione solo con budget esplicito**: `reasoning_budget_tokens >= 0` PRIMA del
-  filler `INT_MAX` (sampling.cpp:305): con budget illimitato + grammar_lazy lo
-  steering è inerte (niente soglie a 1.6e9 né overflow int32 — soglie in double).
+- `end_tokens` is the tokenized SEQUENCE of the end tag (the matcher does not assume a
+  single token): the boost goes to the next expected one
+  (`end_tokens[end_matcher.pos]`);
+  for Qwen3.8 `</think>` is typically 1 special token, but the code does not assume that.
+- Double clamp (`squeeze_from` and `x`) covers small budgets: with budget=64 → note at
+  48, squeeze from 63 (1-token window: effectively note → cap; degraded behavior
+  accepted and documented).
+- Quadratic: at half the window only +Δ/4; with `max_boost` ~9 the end becomes argmax
+  in the last ~5-8% of the budget. If it does not close → FORCING at budget 0 (final
+  net).
+- **Activation only with an explicit budget**: `reasoning_budget_tokens >= 0` BEFORE
+  the `INT_MAX` filler (sampling.cpp:305): with unlimited budget + grammar_lazy the
+  steering is inert (no threshold at 1.6e9 nor int32 overflow — thresholds in double).
 
-### 2.3 Nota contestuale
+### 2.3 Contextual note
 
-Sequenza forzata, tokenizzata UNA volta a init, deterministica:
+Forced sequence, tokenized ONCE at init, deterministic:
 
 ```
 \n\n[Budget notice: wrap up the reasoning and give the final answer]\n\n
 ```
 
-- Visibile nel `reasoning_content` estratto (trasparenza; breve, inglese, parentesi
-  quadre stile sistema). NON filtrata: il resend del client deve ricomporla identica
-  per l'exact cache match (il filtro romperebbe il round-trip).
-- Personalizzabile per-request (`reasoning_pressure_notice`).
+- Visible in the extracted `reasoning_content` (transparency; short, English,
+  square brackets, system style). NOT filtered: the client resend must recompose it
+  identically for the exact cache match (filtering would break the round-trip).
+- Customizable per-request (`reasoning_pressure_notice`).
 
-## 3. Parametri e cablaggio
+## 3. Parameters and wiring
 
-Per-request (pattern 0006/0008), fallback sui default server:
+Per-request (0006/0008 pattern), falling back to server defaults:
 
-| Chiave body OAI | Default | Significato |
+| OAI body key | Default | Meaning |
 |---|---|---|
-| `reasoning_pressure_start` | `0.75` | frazione del budget a cui scatta la nota |
-| `reasoning_pressure_grace` | `200` | token di grazia post-nota prima dello squeeze |
-| `reasoning_pressure_boost` | `9.0` | max_boost del ramp quadratico |
-| `reasoning_pressure_notice` | testo §2.3 | nota iniettata |
+| `reasoning_pressure_start` | `0.75` | fraction of the budget at which the note fires |
+| `reasoning_pressure_grace` | `200` | tokens of grace post-note before the squeeze |
+| `reasoning_pressure_boost` | `9.0` | max_boost of the quadratic ramp |
+| `reasoning_pressure_notice` | text §2.3 | injected note |
 
-- Attivazione: `reasoning_pressure_start > 0` E budget ESPLICITO
-  (`reasoning_budget_tokens >= 0` prima del filler INT_MAX di sampling.cpp:305 — il
-  check vive dove il sampler rbudget viene costruito, in modo che INT_MAX non attivi
-  mai soglie). Con `start=0` → bit-per-bit il comportamento di oggi.
-- **Rollout esplicito**: col default 0.75, lo steering è ATTIVO per ogni richiesta
-  con budget esplicito una volta applicata 0010. Per l'A/B è il braccio ON; il
-  default di produzione si decide col GO (switch immagine).
-- CLI/env default server: `--reasoning-pressure-start/-grace/-boost/-notice` +
-  `LLM_REASONING_PRESSURE_START/GRACE/BOOST/NOTICE` (pattern `LLM_REASONING_BUDGET`).
-- Touch point: `common/reasoning-budget.{cpp,h}` (state machine, init estesa con i
-  nuovi parametri, clone/reset completi), `common/common.h` (campi params sampling),
-  `tools/server/server-common.cpp` (body OAI per-request, righe ~1178-1195),
-  `tools/server/server-task.cpp` (tokenize nota + passaggio, zona ~496-525),
-  `tools/server/server-context.cpp` (chat_params se necessario per il path slot),
-  `common/common.cpp`/`common/arg.cpp` (CLI/env default).
-- Patch duratura: `patches/reasoning-pressure/0010-reasoning-pressure.patch` —
-  **0010 CONTINUA la numerazione della serie del branch `spec-cache-soft-wrap`**
-  (0001-0009 in `patches/spec-cache-trailing-rollback/`), dir separata per la regola
-  una-patch-per-feature; ricostruire ckpt6+0010 = serie 0001-0010.
-- La patch 0010 NON modifica il comportamento di 0005-0009 (forced-end, soft-wrap,
-  alias): con steering disattivato l'output è identico (T3 lo dimostra).
+- Activation: `reasoning_pressure_start > 0` AND an EXPLICIT budget
+  (`reasoning_budget_tokens >= 0` before the INT_MAX filler of sampling.cpp:305 — the
+  check lives where the rbudget sampler is built, so that INT_MAX never activates
+  thresholds). With `start=0` → bit-for-bit today's behavior.
+- **Explicit rollout**: with the 0.75 default, steering is ACTIVE for every request
+  with an explicit budget once 0010 is applied. For the A/B it is the ON arm; the
+  production default is decided at GO (image switch).
+- Server CLI/env defaults: `--reasoning-pressure-start/-grace/-boost/-notice` +
+  `LLM_REASONING_PRESSURE_START/GRACE/BOOST/NOTICE` (`LLM_REASONING_BUDGET` pattern).
+- Touch points: `common/reasoning-budget.{cpp,h}` (state machine, extended init with
+  the new parameters, complete clone/reset), `common/common.h` (sampling params
+  fields), `tools/server/server-common.cpp` (per-request OAI body, lines ~1178-1195),
+  `tools/server/server-task.cpp` (tokenize note + pass-through, zone ~496-525),
+  `tools/server/server-context.cpp` (chat_params if needed for the slot path),
+  `common/common.cpp`/`common/arg.cpp` (CLI/env defaults).
+- Durable patch: `patches/reasoning-pressure/0010-reasoning-pressure.patch` —
+  **0010 CONTINUES the numbering of the `spec-cache-soft-wrap` branch series**
+  (0001-0009 in `patches/spec-cache-trailing-rollback/`), separate dir for the
+  one-patch-per-feature rule; rebuilding ckpt6+0010 = series 0001-0010.
+- Patch 0010 does NOT modify the behavior of 0005-0009 (forced-end, soft-wrap,
+  alias): with steering disabled the output is identical (T3 demonstrates this).
 
-## 4. Interazioni da preservare (e verificare nei test)
+## 4. Interactions to preserve (and verify in tests)
 
-- **MTP + clone/rollback (punto critico)**: nota e boost agiscono in `apply` a valle
-  del verify exact; il path MTP clona il sampler e lo RIPRISTINA al reject parziale
-  (server-context.cpp:3570 save / :3631 restore). Il `clone()` esistente NON copia
-  nemmeno `force_pos` (gap latente, innocuo col forced-end a budget 0 dove i rollback
-  sono rari, ma ESPOSTO dalla nota che vive a 75% del budget): 0010 DEVE estendere
-  `clone()` a TUTTI i campi di stato (force_pos esistente + note_injected/note_pending/
-  note_pos + soglie + `remaining` (base di `used`, oggi resettato a `budget` dal clone)
-  + `start/end_matcher.pos` (il secondo è il TARGET del boost; oggi entrambi azzerati
-  dalla clone)) e `reset()` ad azzerarli. L'enumerazione è normativa, non esaustiva:
-  vale "tutti i campi" anche per campi futuri. Senza questo, un rollback mid-nota
-  re-inietta/corrompe la sequenza e rompe il round-trip.
-- **Ordine chain**: l'apply di rbudget gira PRIMA di grammar e sampler chain
-  (sampling.cpp:631): masking e boost vedono il candidate set completo — è questo che
-  rende il meccanismo funzionante; da affermare con commento inline nel codice.
-- **Round-trip cache**: la nota è una sequenza deterministica nel reasoning → il
-  resend del client la contiene → exact match. Verifica T1 obbligatoria (pattern t1
-  del piano 2026-08-15, `scripts/diff-prompt-cache.py` — script non incluso nel repo).
-- **Soft-wrap**: se il modello chiude dopo nota/squeeze → DONE naturale, zero
-  exhausted; il messaggio wrap 0008 resta solo per il caso forced-end.
-- **Re-arm multi-blocco**: nuovo `<think>` azzera nota/squeeze per quel blocco.
-- **UTF-8**: guard dedicata al trigger nota (§2.1, `note_pending`) — NON ereditata
-  da WAITING_UTF8 che copre solo l'exhaustion.
+- **MTP + clone/rollback (critical point)**: note and boost act in `apply`
+  downstream of the exact verify; the MTP path clones the sampler and RESTORES it on
+  partial reject (server-context.cpp:3570 save / :3631 restore). The existing
+  `clone()` does not even copy `force_pos` (latent gap, harmless with the forced-end at
+  budget 0 where rollbacks are rare, but EXPOSED by the note that lives at 75% of the
+  budget): 0010 MUST extend `clone()` to ALL state fields (existing force_pos +
+  note_injected/note_pending/
+  note_pos + thresholds + `remaining` (the base of `used`, today reset to `budget` by
+  clone) + `start/end_matcher.pos` (the second is the TARGET of the boost; today both
+  zeroed by clone)) and `reset()` to clear them. The enumeration is normative, not
+  exhaustive: "all fields" applies to future fields too. Without this, a mid-note
+  rollback re-injects/corrupts the sequence and breaks the round-trip.
+- **Chain order**: the rbudget apply runs BEFORE the grammar and sampler chain
+  (sampling.cpp:631): masking and boost see the complete candidate set — this is what
+  makes the mechanism work; to be asserted with an inline code comment.
+- **Cache round-trip**: the note is a deterministic sequence in the reasoning → the
+  client resend contains it → exact match. T1 verification mandatory (t1 pattern of
+  the 2026-08-15 plan, `scripts/diff-prompt-cache.py` — script not included in this
+  repo).
+- **Soft-wrap**: if the model closes after note/squeeze → natural DONE, zero
+  exhausted; the 0008 wrap message remains only for the forced-end case.
+- **Multi-block re-arm**: a new `<think>` clears note/squeeze for that block.
+- **UTF-8**: dedicated guard on the note trigger (§2.1, `note_pending`) — NOT
+  inherited from WAITING_UTF8 which covers only exhaustion.
 
-## 5. Esperimento e gate GO/NO-GO
+## 5. Experiment and GO/NO-GO gate
 
-### 5.1 Sanity tecnici (container test :1235, GPU dedicata pre-autorizzata)
-- **T1 round-trip**: task denso con budget che fa scattare nota+chiusura → resend
-  verbatim content+reasoning → NESSUN cold fallback (exact hit). Include il caso
-  rollback-MTP mid-nota (log -lv 5: cercare restore/checkpoint attorno all'iniezione).
-  Strumento: pattern t1/t3 esistenti.
-- **T2 efficacia locale**: 3-4 task densi con budget 2048 E con budget 1024 (la
-  finestra più stretta di produzione: 56 token di squeeze), -lv 5 → verificare nei
-  log: nota emessa al 75%, chiusura naturale entro grace o in squeeze, zero frasi
-  mozzate, round MTP corti confinati alla finestra squeeze.
-- **T3 non-regressione**: `reasoning_pressure_start=0` → output bit-identico a ckpt6
-  (stesso seed/prompt, confronto contenuti).
+### 5.1 Technical sanity (test container :1235, dedicated GPU pre-authorized)
+- **T1 round-trip**: dense task with a budget that triggers note+close → resend
+  content+reasoning verbatim → NO cold fallback (exact hit). Includes the
+  mid-note MTP-rollback case (log -lv 5: look for restore/checkpoint around the
+  injection). Tool: existing t1/t3 patterns.
+- **T2 local effectiveness**: 3-4 dense tasks with budget 2048 AND with budget 1024
+  (the narrowest production window: 56 squeeze tokens), -lv 5 → verify in the
+  logs: note emitted at 75%, natural close within grace or in squeeze, zero
+  chopped sentences, short MTP rounds confined to the squeeze window.
+- **T3 non-regression**: `reasoning_pressure_start=0` → output bit-identical to
+  ckpt6 (same seed/prompt, content comparison).
 
-### 5.2 A/B su task reali (gate qualità)
-- Bracci: OFF (ckpt6) vs ON (ckpt6+0010), stessi task/level del manifest A/B/B'
-  (27 task riusabili), estrazione con `scripts/ab-bprime-extract.py` adattato (script non incluso nel repo).
-- Metriche primarie: % exhausted per level, token reasoning medi/sd, wall per turno.
-- Gate qualità: confronto blind su campione 10-15 task a level low (massima pressione
-  sui tagli): ON ≥ OFF; zero artefatti da chiusura (frasi mozzate, loop noti).
-- **GO produzione**: exhausted <30-40% + gate qualità + T1-T3 verdi → switch immagine
-  llm-service con consenso utente. **NO-GO**: documentare (curva troppo debole o
-  qualità degradata) — restano hard cap + soft-wrap attuali.
+### 5.2 A/B on real tasks (quality gate)
+- Arms: OFF (ckpt6) vs ON (ckpt6+0010), same tasks/levels as the A/B/B' manifest
+  (27 reusable tasks), extraction with `scripts/ab-bprime-extract.py` adapted
+  (script not included in this repo).
+- Primary metrics: % exhausted per level, mean/sd reasoning tokens, wall time per
+  turn.
+- Quality gate: blind comparison on a sample of 10-15 tasks at level low (maximum
+  pressure on the cuts): ON ≥ OFF; zero closing artifacts (chopped sentences, known
+  loops).
+- **Production GO**: exhausted <30-40% + quality gate + T1-T3 green → llm-service
+  image switch with user consensus. **NO-GO**: document (curve too weak or degraded
+  quality) — the current hard cap + soft-wrap stay.
 
-## 6. Rischi e mitigazioni
+## 6. Risks and mitigations
 
-| Rischio | Mitigazione |
+| Risk | Mitigation |
 |---|---|
-| Il modello ignora la nota (chiusura non anticipata) | T2 misura l'efficacia prima dell'A/B; boost/slope parametrizzati |
-| Qualità degradata da chiusura forzata anticipata | gate blind A/B; ramp quadratico tardivo |
-| Cache round-trip rotto dalla nota | T1 obbligatorio pre-A/B; nota deterministica |
-| Interazione MTP inattesa nella finestra squeeze | sanity verify nel T2 (round corti attesi solo lì); eredità forced-end |
-| Plateau/degrado stile "troppi Wait" (ICLR26) | UNA sola nota per blocco, mai ripetuta |
-| Effetto àncora (come L0) | nessun numero dichiarato al modello: la nota menziona il comportamento, non il budget residuo |
+| The model ignores the note (no early closing) | T2 measures effectiveness before the A/B; parameterized boost/slope |
+| Degraded quality from forced early closing | blind A/B gate; late quadratic ramp |
+| Cache round-trip broken by the note | T1 mandatory pre-A/B; deterministic note |
+| Unexpected MTP interaction in the squeeze window | verify sanity in T2 (short rounds expected only there); forced-end inheritance |
+| "Too many Wait" style plateau/degradation (ICLR26) | ONE single note per block, never repeated |
+| Anchoring effect (like L0) | no number declared to the model: the note mentions the behavior, not the remaining budget |
 
 ## 7. Out of scope
 
-Floor/force-continue Wait; predictor hidden-states (Fase C); interventi pesi;
-steering sui task brevi; modifica del forced-end/soft-wrap esistenti.
+Floor/force-continue Wait; hidden-states predictor (Phase C); weight interventions;
+steering on short tasks; modification of the existing forced-end/soft-wrap.

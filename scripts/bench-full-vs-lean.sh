@@ -2,9 +2,9 @@
 # Part of strix-halo-llamacpp-lab — see README.md.
 # Replication scripts for the Qwen3.8-27B ROCmFP4-STRIX_LEAN pipeline.
 # Env: LLMODELS_DIR (default $HOME/llmodels), HF_TOKEN (downloads/uploads).
-# bench-full-vs-lean.sh — Task 4 piano 2026-08-18-rocmfp4-full-vs-strix-lean (internal plan, not included in this repo)
-# Server Vulkan MTP n6 p_min 0.75 c 16384 (produzione-equivalente), warm-up + 3 run,
-# marker TREATMENT nei log (lezione 17/08). SOLO backend vulkan (produzione).
+# bench-full-vs-lean.sh — Task 4 of the 2026-08-18-rocmfp4-full-vs-strix-lean plan (internal plan, not included in this repo)
+# Vulkan server MTP n6 p_min 0.75 c 16384 (production-equivalent), warm-up + 3 runs,
+# TREATMENT marker in the logs (lesson 17/08). Vulkan backend ONLY (production).
 set -u
 LAB_DIR="${LAB_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 LLMODELS_DIR="${LLMODELS_DIR:-$HOME/llmodels}"
@@ -14,7 +14,7 @@ PORT=1235
 NMAX=6
 IMG=docker-llm-service:vulkan-fork-ckpt7
 
-start_server() { # $1 modello $2 tag
+start_server() { # $1 model $2 tag
   local m="$1"
   local tag="$2"
   local name="bench-${tag}-q38"
@@ -45,21 +45,21 @@ bench_tok() { # $1 prompt
 for arm in "LEAN:/llmodels/QWEN3.8/Qwen3.8-27B-Q4_0_ROCMFP4_STRIX_LEAN.gguf" \
            "FULL:/out/Qwen3.8-27B-Q4_0_ROCMFP4-full.gguf" \
            "EVEN:/out/Qwen3.8-27B-Q4_0_ROCMFP4-even.gguf"; do
-  # se passato un argomento (LEAN|FULL|EVEN), esegui solo quel braccio
+  # if an argument is passed (LEAN|FULL|EVEN), run only that arm
   if [ -n "${1:-}" ] && [ "${1^^}" != "${arm%%:*}" ]; then continue; fi
   TAG="${arm%%:*}"; M="${arm##*:}"
   echo "== TREATMENT=${TAG} model=${M} n-max=${NMAX} p_min=0.75 c=16384 vulkan =="
   if start_server "$M" "$TAG"; then
-    bench_tok 'Rispondi solo OK.' >/dev/null   # warm-up scartato
+    bench_tok 'Rispondi solo OK.' >/dev/null   # warm-up discarded
     P1a=$(bench_tok 'Scrivi un paragrafo dettagliato sulla storia di Roma.')
     P1b=$(bench_tok 'Scrivi un saggio breve sulla stampa e il Rinascimento italiano.')
     P2a=$(bench_tok 'Conta da 1 a 200, un numero per riga, solo i numeri.')
     P2b=$(bench_tok 'Elenco l alfabeto inglese una lettera per riga, poi ripetilo al contrario.')
-    echo "RISULTATO TREATMENT=${TAG}: prosa ${P1a}/${P1b} | det ${P2a}/${P2b} tok/s"
+    echo "RESULT TREATMENT=${TAG}: prose ${P1a}/${P1b} | det ${P2a}/${P2b} tok/s"
     docker logs "bench-${TAG}-q38" > "$OUT/bench-${TAG}.log" 2>&1
     grep -E 'statistics draft' "$OUT/bench-${TAG}.log" | tail -2
   else
-    echo "RISULTATO TREATMENT=${TAG}: SERVER FAIL"
+    echo "RESULT TREATMENT=${TAG}: SERVER FAIL"
   fi
   docker rm -f "bench-${TAG}-q38" >/dev/null 2>&1
 done

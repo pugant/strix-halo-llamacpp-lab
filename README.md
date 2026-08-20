@@ -17,7 +17,7 @@
 | [`pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN) | Mamba-hybrid MoE |
 | [`pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX`](https://huggingface.co/pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX) | MoE 35B-A3B at Q6_0 |
 
-**Repository layout** — `patches/` (all features, `git am`-able) · `scripts/` (download / imatrix / quantize / sanitize / test / bench) · `docker/` (convert container) · `docs/` (raw experiment notes, in Italian) · [LICENSE](LICENSE) · [NOTICE](NOTICE).
+**Repository layout** — `patches/` (all features, `git am`-able) · `scripts/` (download / imatrix / quantize / sanitize / test / bench) · `docker/` (convert container) · `docs/` (raw experiment notes) · [LICENSE](LICENSE) · [NOTICE](NOTICE).
 
 ---
 
@@ -185,7 +185,7 @@ Practical rule we follow: dense → ROCm; MoE FP4 → Vulkan fork. (The speculat
 
 - **One machine** — the author's Strix Halo (Ryzen AI MAX+ 395, 128 GB), dedicated GPU window (production service stopped during runs).
 - temp 0, single stream, warm-up discarded, **2–3 runs per number** — these are not statistical means; treat them as careful point measurements.
-- Full raw data, logs and per-experiment setup live in [`docs/benchmarks/`](docs/benchmarks/) — **in Italian**; they are the raw working notes. This README is the English summary.
+- Full raw data, logs and per-experiment setup live in [`docs/benchmarks/`](docs/benchmarks/) — they are the raw working notes. This README is the summary and entry point.
 
 ---
 
@@ -334,8 +334,6 @@ The same pipeline produced the other published quants. Their quantize scripts ar
 | Ornith-1.0-35B | MoE 35B-A3B, **multimodal** | [`pugant/Ornith-1.0-35B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/Ornith-1.0-35B-ROCmFP4-STRIX_LEAN) |
 | Nemotron-3.5-Lightning-30B-A3B | **Mamba-hybrid** MoE | [`pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN) |
 | Qwen3.6-35B-A3B | MoE 35B-A3B, Q6_0 | [`pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX`](https://huggingface.co/pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX) |
-
-> **Note on the docs** — everything under `docs/` is in Italian; those are the raw working notes from the experiments, kept verbatim on purpose. This README is the English summary.
 
 ---
 

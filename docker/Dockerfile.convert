@@ -1,19 +1,19 @@
-# Derivata da docker-llm-service: aggiunge deps Python per convert_hf_to_gguf.py
-# Il converter del fork ROCmFPX (installato nel container base) richiede il gguf-py
-# custom del fork (ha MODEL_ARCH.DFLASH e altre estensioni non in PyPI).
-# NOTA: main HEAD ha DFLASH; commit 00d5452 no (bug latente del container base).
+# Derived from docker-llm-service: adds the Python deps for convert_hf_to_gguf.py.
+# The ROCmFPX fork converter (installed in the base container) requires the fork's
+# custom gguf-py (it has MODEL_ARCH.DFLASH and other extensions not on PyPI).
+# NOTE: main HEAD has DFLASH; commit 00d5452 does not (latent bug in the base container).
 # NOTE: the base image `docker-llm-service:latest` is NOT publicly pullable — it is
 # built locally from kyuz0/amd-strix-halo-toolboxes; build it first from
 # https://github.com/kyuz0/amd-strix-halo-toolboxes
 FROM docker-llm-service:latest
 
-# Fedora 43 base — dnf per python3-pip + git.
+# Fedora 43 base — dnf for python3-pip + git.
 RUN dnf -y --nodocs --setopt=install_weak_deps=False install python3-pip git \
   && dnf clean all && rm -rf /var/cache/dnf/*
 
-# gguf-py custom dal main HEAD del fork ROCmFPX (ha MODEL_ARCH.DFLASH).
-# Split in due RUN: la prima per gguf-py (cd / prima di rm per evitare cwd issues),
-# la seconda per torch (con --index-url sostitutivo) e gli altri deps.
+# Custom gguf-py from the ROCmFPX fork's main HEAD (has MODEL_ARCH.DFLASH).
+# Split into two RUNs: the first for gguf-py (cd / before rm to avoid cwd issues),
+# the second for torch (with the replacement --index-url) and the other deps.
 RUN git clone --depth=1 --branch main https://github.com/charlie12345/ROCmFPX.git /tmp/ROCmFPX \
   && pip install --no-cache-dir /tmp/ROCmFPX/gguf-py \
   && cd / && rm -rf /tmp/ROCmFPX

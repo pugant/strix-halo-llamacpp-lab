@@ -4,12 +4,12 @@
 # Env: LLMODELS_DIR (default $HOME/llmodels), HF_TOKEN (downloads/uploads).
 # upload-to-hf.py
 #
-# Strategia "private → verify → public":
-#   1. Crea 2 repo PRIVATI
-#   2. Upload tutti i file (resume automatico huggingface_hub)
-#   3. (Flip a public è manuale, dopo verifica utente)
+# Strategy "private → verify → public":
+#   1. Create 2 PRIVATE repos
+#   2. Upload all files (huggingface_hub automatic resume)
+#   3. (Flip to public is manual, after user verification)
 #
-# Resume: huggingface_hub LFS gestisce resume automatico. Re-run sicuro.
+# Resume: huggingface_hub LFS handles automatic resume. Safe to re-run.
 import os, sys, time
 from pathlib import Path
 from huggingface_hub import HfApi
@@ -19,8 +19,8 @@ WS = os.environ.get("LAB_DIR") or os.path.abspath(os.path.join(os.path.dirname(_
 MODELS = os.path.join(os.environ.get("LLMODELS_DIR") or os.path.expanduser("~/llmodels"), "models")
 
 REPOS = [
-    # grug/ornith già pubblicati su HF (2026-08-12), saltati qui
-    # nemotron già pubblicato (2026-08-13), saltato qui
+    # grug/ornith already published on HF (2026-08-12), skipped here
+    # nemotron already published (2026-08-13), skipped here
     {
         "name": "qwen36-35b-q6",
         "repo_id": "pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX",
@@ -28,7 +28,7 @@ REPOS = [
             (f"{WS}/publish/qwen36-35b-q6/.gitattributes", ".gitattributes"),
             (f"{WS}/publish/qwen36-35b-q6/LICENSE",        "LICENSE"),
             (f"{MODELS}/QWEN3.6/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX.gguf", "Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX.gguf"),
-            # README per ultimo (contiene i bench definitivi)
+            # README last (contains the final benches)
             (f"{WS}/publish/qwen36-35b-q6/README.md",      "README.md"),
         ],
     },
@@ -42,7 +42,7 @@ for repo in REPOS:
     log(f"=== {repo['name'].upper()} — {repo['repo_id']}")
     log("=" * 60)
 
-    # Crea repo privato (exist_ok se re-run dopo partial failure)
+    # Create private repo (exist_ok for re-run after partial failure)
     try:
         api.create_repo(repo_id=repo["repo_id"], repo_type="model",
                         private=True, exist_ok=True)
@@ -51,7 +51,7 @@ for repo in REPOS:
         log(f"[✗] create_repo failed: {e}")
         sys.exit(1)
 
-    # Upload file per file (piccoli prima, grandi dopo)
+    # Upload file by file (small ones first, large ones after)
     for local, remote in repo["files"]:
         if not os.path.exists(local):
             log(f"[✗] MISSING: {local}")
@@ -73,8 +73,8 @@ for repo in REPOS:
             log(f"[✗] upload failed: {e}")
             sys.exit(1)
 
-    log(f"[✓] REPO {repo['name'].upper()} COMPLETATO")
+    log(f"[✓] REPO {repo['name'].upper()} COMPLETE")
 
 log("=" * 60)
-log("[✓✓] TUTTI I REPO COMPLETATI — pronto per verifica + flip public")
+log("[✓✓] ALL REPOS COMPLETE — ready for verification + flip to public")
 log("=" * 60)

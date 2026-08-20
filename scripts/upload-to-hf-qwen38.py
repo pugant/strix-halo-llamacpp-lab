@@ -2,7 +2,7 @@
 # Part of strix-halo-llamacpp-lab — see README.md.
 # Replication scripts for the Qwen3.8-27B ROCmFP4-STRIX_LEAN pipeline.
 # Env: LLMODELS_DIR (default $HOME/llmodels), HF_TOKEN (downloads/uploads).
-# upload-to-hf-qwen38.py — strategia private → verify → (flip public manuale, previa conferma utente)
+# upload-to-hf-qwen38.py — strategy private → verify → (manual public flip, pending user confirmation)
 import os, sys, time
 from huggingface_hub import HfApi
 
@@ -15,7 +15,7 @@ FILES = [
     (f"{WS}/publish/qwen38-27b-q4lean/.gitattributes", ".gitattributes"),
     (f"{WS}/publish/qwen38-27b-q4lean/LICENSE",        "LICENSE"),
     (f"{MODELS}/QWEN3.8/Qwen3.8-27B-Q4_0_ROCMFP4_STRIX_LEAN.gguf", "Qwen3.8-27B-Q4_0_ROCMFP4_STRIX_LEAN.gguf"),
-    # README per ultimo (contiene i bench definitivi)
+    # README last (contains the final benches)
     (f"{WS}/publish/qwen38-27b-q4lean/README.md",      "README.md"),
 ]
 
@@ -39,4 +39,4 @@ for local, remote in FILES:
     except Exception as e:
         log(f"[✗] upload failed: {e}"); sys.exit(1)
 
-log("[✓✓] UPLOAD COMPLETATO — pronto per verifica + flip public (conferma utente)")
+log("[✓✓] UPLOAD COMPLETE — ready for verification + flip to public (user confirmation)")
