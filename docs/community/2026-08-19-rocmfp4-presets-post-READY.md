@@ -71,6 +71,8 @@ llama-quantize --imatrix imatrix.gguf model-BF16.gguf out.gguf Q4_0_ROCMFP4_EVEN
 
 Full data, methodology and the addendum bench: see the numbers above; happy to share the corpus prep (wikitext-2 standard + our Italian technical corpus is just our own docs — use any same-language corpus you like, just keep it fixed across arms).
 
+Full data, presets context, patches and a replication guide are now public: https://github.com/pugant/strix-halo-llamacpp-lab
+
 Credits: presets and fork by u/charlie12345 (ROCmFPX); prior community data points that motivated this: the KAT-Coder ROCmFP4 GGUF card (1337Hero) and julianmb's Nemotron ROCmFP4 benchmarks — thanks, this is the controlled version of what you started. NVFP4's block-16 scaling is the obvious prior art for the granularity question.
 
 Caveats: single machine, single model family (dense hybrid SSM); ppl deltas on wiki-style + one technical-language corpus; speed numbers are Vulkan/RADV on gfx1151 — HIP numbers may differ (julianmb saw Vulkan beat ROCm on the fast presets by ~21% pp).
