@@ -2917,6 +2917,58 @@ private:
     llama_memory_buffers & mbufs;
 };
 
+// ckpt split-restore: the device write splits a buffer's rows into one block
+// per contiguous cell range (kv-cache) or per contiguous state-row group
+// (recurrent), while the read always emits one block per layer tensor. When the
+// per-buffer total size matches, the saved blocks are the same rows in the same
+// order, just split differently: copy them serially through cursor views instead
+// of refusing the restore.
+static bool llama_restore_split_buffers(
+        const llama_memory_buffer & cur,   // saved (cpy = source blocks)
+        const llama_memory_buffer & neu) { // current (org = destination views)
+
+    // dedicated ctx for the temporary cursor views (the per-mbuf ctx has no headroom)
+    ggml_init_params ip = {
+        /*.mem_size   =*/ (cur.cpy.size() + neu.org.size()) * 2 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(ip));
+
+    size_t ci = 0, ni = 0;  // block indices
+    size_t co = 0, no = 0;  // element offsets inside the current block
+
+    while (ci < cur.cpy.size() && ni < neu.org.size()) {
+        ggml_tensor * sc = cur.cpy[ci];
+        ggml_tensor * dn = neu.org[ni];
+
+        if (sc->type != dn->type) {
+            return false;
+        }
+
+        const size_t sr = sc->ne[0] - co;
+        const size_t dr = dn->ne[0] - no;
+        const size_t n  = sr < dr ? sr : dr;
+
+        // note: the ggml_view_1d offset is in bytes, co/no count elements
+        const size_t ts = ggml_type_size(sc->type);
+
+        ggml_tensor * vsrc = ggml_view_1d(ctx.get(), sc, n, co * ts);
+        ggml_tensor * vdst = ggml_view_1d(ctx.get(), dn, n, no * ts);
+
+        // the views live in a no_alloc ctx: bind them to the underlying buffers
+        ggml_backend_view_init(vsrc);
+        ggml_backend_view_init(vdst);
+
+        ggml_backend_tensor_copy(vsrc, vdst);
+
+        if (n == sr) { ++ci; co = 0; } else { co += n; }
+        if (n == dr) { ++ni; no = 0; } else { no += n; }
+    }
+
+    return ci == cur.cpy.size() && ni == neu.org.size();
+}
+
 class llama_io_read_device : public llama_io_read_i {
 public:
     llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs) {
@@ -2975,6 +3027,18 @@ public:
             }
 
             const auto & mbuf_cur = it->second;
+
+            // same bytes, different split (multi-range save vs single-block read):
+            // the saved blocks are the same rows in the same order -> serial copy
+            if (mbuf_cur.buf && mbuf_cur.total_size == mbuf.total_size &&
+                    mbuf_cur.cpy.size() != mbuf.org.size() &&
+                    llama_restore_split_buffers(mbuf_cur, mbuf)) {
+                LLAMA_LOG_INFO("%s: restored split device buffers for '%s' "
+                        "(saved tensors=%d, current tensors=%d, size=%zu)\n",
+                        __func__, ggml_backend_buft_name(buft),
+                        mbuf_cur.n_tensors, mbuf.n_tensors, mbuf.total_size);
+                continue;
+            }
 
             if (!mbuf_cur.buf ||
                     mbuf_cur.n_tensors != mbuf.n_tensors ||
