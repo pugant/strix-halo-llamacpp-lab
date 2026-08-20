@@ -94,6 +94,14 @@ If we forgot anyone: it is an omission, not an intent — open an issue and we w
 
 **Measured effect.** ~91% of prefill tokens salvaged on spec-boundary cold starts, on our 12-request agent workload (design doc: [`docs/design/2026-08-19-t7f2-drafter-routing-design.md`](docs/design/2026-08-19-t7f2-drafter-routing-design.md), §4).
 
+### Device split-buffer checkpoint restore (fix)
+
+**What.** A rare failure (1 task in 16 in production logs) — `device checkpoint restore buffer mismatch` refused the draft-state restore during cache salvage and forced a **full** prompt re-processing (~43k tokens, ~2.5 min) even though the target state had already been restored fine.
+
+**Root cause.** The device-side state write emits one block per contiguous cell range (and per state-row group on recurrent memories), while the read always emits one block per layer tensor — same bytes, different split, rejected by the per-buffer geometry check.
+
+**Fix (in production since 2026-08-20).** When the per-buffer total size matches, the saved blocks are copied serially through cursor views instead of refusing the restore (log marker: `restored split device buffers`); a WARN at save time makes the multi-range condition observable. Patch: [`patches/ckpt-device-split-restore/0001-ckpt-device-split-restore-tool-fix-warn.patch`](patches/ckpt-device-split-restore/0001-ckpt-device-split-restore-tool-fix-warn.patch) — 3 commits, including `llama-state-split-test`, a deterministic repro/verification tool (fill a sequence, punch a mid-hole to force 2 physical cell ranges, then save/wipe/restore on device).
+
 ### SPEC_VERIFY_LOG instrumentation
 
 **What.** Optional per-position acceptance logging of the MTP verify batch — [`patches/spec-verify-log/0001-spec-verify-log.patch`](patches/spec-verify-log/0001-spec-verify-log.patch).

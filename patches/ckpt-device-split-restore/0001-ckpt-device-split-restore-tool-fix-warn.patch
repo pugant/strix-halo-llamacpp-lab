@@ -1,0 +1,322 @@
+From ea0c84cb0b55ac2a669ba68d7cf279e16a3c94c4 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Thu, 20 Aug 2026 17:33:59 +0200
+Subject: [PATCH 1/3] =?UTF-8?q?tools:=20state-split-test=20=E2=80=94=20det?=
+ =?UTF-8?q?erministic=20repro=20for=20device=20split-buffer=20restore?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fills a sequence, punches a hole mid-way (2 physical cell ranges), saves
+the state on device, wipes and restores. Exits 1 while the restore refuses
+multi-range saves (saved tensors=100 vs current tensors=80, same size).
+---
+ tools/CMakeLists.txt                        |   1 +
+ tools/state-split-test/CMakeLists.txt       |   7 ++
+ tools/state-split-test/state-split-test.cpp | 124 ++++++++++++++++++++
+ 3 files changed, 132 insertions(+)
+ create mode 100644 tools/state-split-test/CMakeLists.txt
+ create mode 100644 tools/state-split-test/state-split-test.cpp
+
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index b433c91d8..48bd388b2 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -26,6 +26,7 @@ else()
+         add_subdirectory(server)
+     endif()
+     add_subdirectory(tokenize)
++    add_subdirectory(state-split-test)
+     add_subdirectory(parser)
+     add_subdirectory(tts)
+     add_subdirectory(mtmd)
+diff --git a/tools/state-split-test/CMakeLists.txt b/tools/state-split-test/CMakeLists.txt
+new file mode 100644
+index 000000000..1cc7848a7
+--- /dev/null
++++ b/tools/state-split-test/CMakeLists.txt
+@@ -0,0 +1,7 @@
++set(TARGET llama-state-split-test)
++add_executable(${TARGET} state-split-test.cpp)
++if(LLAMA_TOOLS_INSTALL)
++    install(TARGETS ${TARGET} RUNTIME)
++endif()
++target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/tools/state-split-test/state-split-test.cpp b/tools/state-split-test/state-split-test.cpp
+new file mode 100644
+index 000000000..4535e0f6e
+--- /dev/null
++++ b/tools/state-split-test/state-split-test.cpp
+@@ -0,0 +1,124 @@
++// state-split-test — deterministic repro + verification for the device
++// split-buffer checkpoint restore.
++//
++// The device-side KV cache state write emits one io.write_tensor per
++// (layer x k/v x contiguous cell range), while the read always emits one
++// block per (layer x k/v). When the saved sequence state spans more than
++// one physical cell range, the restore used to be refused with
++// "device checkpoint restore buffer mismatch" (same bytes, different split).
++//
++// This tool punches a hole in the middle of a filled sequence (guaranteed
++// 2 physical ranges), saves the state on device, wipes the sequence and
++// restores it.
++//
++// usage: state-split-test <model.gguf>
++// exit 0 = restore OK (pos_min/pos_max verified)
++// exit 1 = restore failed (mismatch / wrong positions)
++// exit 2 = setup error
++
++#include "llama.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++int main(int argc, char ** argv) {
++    if (argc < 2) {
++        fprintf(stderr, "usage: %s <model.gguf>\n", argv[0]);
++        return 2;
++    }
++
++    llama_backend_init();
++
++    llama_model_params mp = llama_model_default_params();
++    mp.n_gpu_layers = 99;
++
++    llama_model * model = llama_model_load_from_file(argv[1], mp);
++    if (!model) {
++        fprintf(stderr, "[setup] model load failed\n");
++        return 2;
++    }
++
++    llama_context_params cp = llama_context_default_params();
++    cp.n_ctx     = 256;
++    cp.n_batch   = 256;
++    cp.n_seq_max = 1;
++
++    llama_context * ctx = llama_init_from_model(model, cp);
++    if (!ctx) {
++        fprintf(stderr, "[setup] ctx init failed\n");
++        return 2;
++    }
++
++    llama_memory_t mem = llama_get_memory(ctx);
++
++    const llama_seq_id seq    = 0;
++    const int          n_fill = 64;
++
++    // 1) fill: decode n_fill tokens at pos 0..n_fill-1
++    llama_batch batch = llama_batch_init(n_fill, 0, 1);
++    batch.n_tokens = n_fill;
++    for (int i = 0; i < n_fill; ++i) {
++        batch.token[i]   = 1;
++        batch.pos[i]     = i;
++        batch.n_seq_id[i] = 1;
++        batch.seq_id[i][0] = seq;
++        batch.logits[i]  = false;
++    }
++    if (llama_decode(ctx, batch) != 0) {
++        fprintf(stderr, "[setup] decode failed\n");
++        return 2;
++    }
++    fprintf(stderr, "[setup] filled %d pos (pos_min=%d pos_max=%d)\n", n_fill,
++            (int) llama_memory_seq_pos_min(mem, seq), (int) llama_memory_seq_pos_max(mem, seq));
++
++    // 2) punch a hole in the middle -> 2 physical cell ranges for seq
++    llama_memory_seq_rm(mem, seq, 30, 32);
++    fprintf(stderr, "[setup] after seq_rm(30,32): pos_min=%d pos_max=%d\n",
++            (int) llama_memory_seq_pos_min(mem, seq), (int) llama_memory_seq_pos_max(mem, seq));
++
++    // 3) device save
++    const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
++
++    // expected positions after the hole (model-agnostic: on hybrid memories the
++    // recurrent part dominates seq_pos_min, so just round-trip what we have)
++    const int pmin_exp = (int) llama_memory_seq_pos_min(mem, seq);
++    const int pmax_exp = (int) llama_memory_seq_pos_max(mem, seq);
++
++    const size_t size = llama_state_seq_get_size_ext(ctx, seq, flags);
++    std::vector<uint8_t> data(size);
++
++    llama_state_seq_storage * storage = llama_state_seq_storage_init();
++
++    const size_t n1 = llama_state_seq_get_data_ext_storage(ctx, data.data(), size, seq, flags, storage);
++    if (n1 != size) {
++        fprintf(stderr, "[setup] save size mismatch n1=%zu size=%zu\n", n1, size);
++        return 2;
++    }
++    fprintf(stderr, "[save] %zu bytes on device\n", n1);
++
++    // 4) wipe the sequence
++    llama_memory_seq_rm(mem, seq, -1, -1);
++    fprintf(stderr, "[wipe] pos_min=%d pos_max=%d\n",
++            (int) llama_memory_seq_pos_min(mem, seq), (int) llama_memory_seq_pos_max(mem, seq));
++
++    // 5) restore
++    const size_t n2 = llama_state_seq_set_data_ext_storage(ctx, data.data(), n1, seq, flags, storage);
++    if (n2 != n1) {
++        fprintf(stderr, "RESTORE FAILED (n2=%zu expected=%zu)\n", n2, n1);
++        llama_state_seq_storage_free(storage);
++        return 1;
++    }
++
++    const int pmin = (int) llama_memory_seq_pos_min(mem, seq);
++    const int pmax = (int) llama_memory_seq_pos_max(mem, seq);
++    fprintf(stderr, "RESTORE OK (pos_min=%d pos_max=%d, expected %d/%d)\n", pmin, pmax, pmin_exp, pmax_exp);
++
++    // round-trip: a second save of the restored state must have the same size
++    const size_t n3 = llama_state_seq_get_data_ext_storage(ctx, data.data(), size, seq, flags, storage);
++    fprintf(stderr, "[roundtrip] second save: %zu bytes (expected %zu)\n", n3, n1);
++
++    llama_state_seq_storage_free(storage);
++
++    return (pmin == pmin_exp && pmax == pmax_exp && n3 == n1) ? 0 : 1;
++}
+-- 
+2.43.0
+
+
+From 6e73c50a1f778333a0294f7513b27fcf6f238eff Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Thu, 20 Aug 2026 17:33:59 +0200
+Subject: [PATCH 2/3] llama: restore split device buffers in checkpoint restore
+
+The device state write emits one block per contiguous cell range (or
+state-row group), the read always emits one block per layer tensor. When
+the per-buffer total size matches, the saved blocks are the same rows in
+the same order, just split differently: copy them serially through cursor
+views instead of refusing the restore (which forced a full prompt
+re-processing on a cache-salvage miss).
+---
+ src/llama-context.cpp | 64 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7c9e43be3..b708f4fcb 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2917,6 +2917,58 @@ private:
+     llama_memory_buffers & mbufs;
+ };
+ 
++// ckpt split-restore: the device write splits a buffer's rows into one block
++// per contiguous cell range (kv-cache) or per contiguous state-row group
++// (recurrent), while the read always emits one block per layer tensor. When the
++// per-buffer total size matches, the saved blocks are the same rows in the same
++// order, just split differently: copy them serially through cursor views instead
++// of refusing the restore.
++static bool llama_restore_split_buffers(
++        const llama_memory_buffer & cur,   // saved (cpy = source blocks)
++        const llama_memory_buffer & neu) { // current (org = destination views)
++
++    // dedicated ctx for the temporary cursor views (the per-mbuf ctx has no headroom)
++    ggml_init_params ip = {
++        /*.mem_size   =*/ (cur.cpy.size() + neu.org.size()) * 2 * ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context_ptr ctx(ggml_init(ip));
++
++    size_t ci = 0, ni = 0;  // block indices
++    size_t co = 0, no = 0;  // element offsets inside the current block
++
++    while (ci < cur.cpy.size() && ni < neu.org.size()) {
++        ggml_tensor * sc = cur.cpy[ci];
++        ggml_tensor * dn = neu.org[ni];
++
++        if (sc->type != dn->type) {
++            return false;
++        }
++
++        const size_t sr = sc->ne[0] - co;
++        const size_t dr = dn->ne[0] - no;
++        const size_t n  = sr < dr ? sr : dr;
++
++        // note: the ggml_view_1d offset is in bytes, co/no count elements
++        const size_t ts = ggml_type_size(sc->type);
++
++        ggml_tensor * vsrc = ggml_view_1d(ctx.get(), sc, n, co * ts);
++        ggml_tensor * vdst = ggml_view_1d(ctx.get(), dn, n, no * ts);
++
++        // the views live in a no_alloc ctx: bind them to the underlying buffers
++        ggml_backend_view_init(vsrc);
++        ggml_backend_view_init(vdst);
++
++        ggml_backend_tensor_copy(vsrc, vdst);
++
++        if (n == sr) { ++ci; co = 0; } else { co += n; }
++        if (n == dr) { ++ni; no = 0; } else { no += n; }
++    }
++
++    return ci == cur.cpy.size() && ni == neu.org.size();
++}
++
+ class llama_io_read_device : public llama_io_read_i {
+ public:
+     llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs) {
+@@ -2976,6 +3028,18 @@ public:
+ 
+             const auto & mbuf_cur = it->second;
+ 
++            // same bytes, different split (multi-range save vs single-block read):
++            // the saved blocks are the same rows in the same order -> serial copy
++            if (mbuf_cur.buf && mbuf_cur.total_size == mbuf.total_size &&
++                    mbuf_cur.cpy.size() != mbuf.org.size() &&
++                    llama_restore_split_buffers(mbuf_cur, mbuf)) {
++                LLAMA_LOG_INFO("%s: restored split device buffers for '%s' "
++                        "(saved tensors=%d, current tensors=%d, size=%zu)\n",
++                        __func__, ggml_backend_buft_name(buft),
++                        mbuf_cur.n_tensors, mbuf.n_tensors, mbuf.total_size);
++                continue;
++            }
++
+             if (!mbuf_cur.buf ||
+                     mbuf_cur.n_tensors != mbuf.n_tensors ||
+                     mbuf_cur.total_size != mbuf.total_size ||
+-- 
+2.43.0
+
+
+From ed2c50177cf3a67fe59d9b66aff2bf8afbd3db55 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Thu, 20 Aug 2026 17:33:59 +0200
+Subject: [PATCH 3/3] llama: warn on multi-range device save in kv-cache state
+ write
+
+Makes the split-save condition observable at save time; the restore now
+goes through the serial split-buffer copy path.
+---
+ src/llama-kv-cache.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 7afd9e5c8..514b51b6f 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1929,7 +1929,6 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
+ }
+ 
+ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+-    GGML_UNUSED(flags);
+ 
+     io.write(&n_stream, sizeof(n_stream));
+ 
+@@ -1976,6 +1975,14 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
+             continue;
+         }
+ 
++        // ckpt split-restore: a multi-range save is stored as split device blocks
++        // and is restored through the serial split-buffer copy path
++        if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && cr.data.size() > 1) {
++            LLAMA_LOG_WARN("%s: saving %d non-contiguous cell ranges for stream %d (seq %d) "
++                    "to device storage; split-buffer restore will be used\n",
++                    __func__, (int) cr.data.size(), s, seq_id);
++        }
++
+         state_write_meta(io, cr, seq_id);
+         state_write_data(io, cr);
+     }
+-- 
+2.43.0
+
