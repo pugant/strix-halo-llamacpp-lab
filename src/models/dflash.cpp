@@ -729,11 +729,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     if (model.dspark_markov_w1) {
         build_dspark_markov_head(*this, model, inp_tokens);
     }
-
-    // DFlash2: build the selector lattice on top of the block logits. No-op for
-    // DFlash1/DSpark (no selector tensors), and skipped for embd (KV-injection)
-    // batches, which return above before reaching here.
-    build_post_sampling();
 }
 
 template <bool is_enc>
