@@ -115,6 +115,16 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// t8 stadio 2 (spec §6): size of the MTP concat head of the round in flight for
+// this sequence (0 = the next common_speculative_accept() will close a plain
+// round, not a composed one). Must be read BEFORE the accept call - it consumes
+// the per-seq round attribution this readout is derived from.
+int32_t common_speculative_concat_head_size(const common_speculative * spec, llama_seq_id seq_id);
+
+// t8 stadio 2 (spec §6): the configured concat head size (--spec-concat-k1,
+// 0 = concat rounds disabled)
+int32_t common_speculative_concat_k1(const common_speculative * spec);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

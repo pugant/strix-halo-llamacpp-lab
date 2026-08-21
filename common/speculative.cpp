@@ -3034,6 +3034,10 @@ struct common_speculative {
 
     // diagnostics: number of concat rounds composed (first one logs at INFO)
     size_t n_concat_rounds = 0;
+
+    // t8 stadio 2 (spec §4, Task 6): the temp > 0 single-drafter fallback
+    // warning is logged once per session (server lifetime), not per request
+    bool concat_temp_fallback_warned = false;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3643,14 +3647,32 @@ void common_speculative_draft(common_speculative * spec) {
             if (dp.drafter == COMMON_SPECULATIVE_TYPE_NONE || dp.drafter == impl->type) {
                 n_drafting_impl++;
             } else if (concat_mtp_phase && dp.drafter == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
-                // concat round: the MTP arm heads it. The arm's effective n_max
-                // already folds dp.n_max in, so clamping dp.n_max to k1 caps the
-                // head at k1 tokens; the original per-request value is restored
-                // right after the call, like the drafting stash below.
-                seq_concat.push_back(seq_id);
-                seq_concat_n_max.push_back(dp.n_max);
-                dp.n_max = dp.n_max >= 0 ? std::min(dp.n_max, spec->concat_k1) : spec->concat_k1;
-                n_drafting_impl++;
+                // t8 stadio 2 (spec §4, Task 6): temp > 0 single-drafter fallback,
+                // BEFORE any composition. A composed round mixes MTP head rows
+                // (which carry no proposal distribution) with DFlash noise rows
+                // (which do), so spec-dists acceptance is impossible on the mixed
+                // segment - the server's size-guard would silently degrade every
+                // such round to exact accept. Route the sequence to the class
+                // drafter instead: a plain draft-dflash round, exactly the
+                // concat_off path, whose dists cover the whole draft so sample
+                // acceptance works at temp > 0. WARNING once per session (spec §4).
+                if (dp.temperature > 0.0f) {
+                    if (!spec->concat_temp_fallback_warned) {
+                        spec->concat_temp_fallback_warned = true;
+                        SPC_WRN("concat mode fallback: temperature > 0 request (seq %d) - spec-dists acceptance is impossible on mixed MTP+DFlash segments; using single-drafter (class) rounds for every temp > 0 request - this warning is logged once per session\n",
+                                (int) seq_id);
+                    }
+                    seq_routed.push_back(seq_id);
+                } else {
+                    // concat round: the MTP arm heads it. The arm's effective n_max
+                    // already folds dp.n_max in, so clamping dp.n_max to k1 caps the
+                    // head at k1 tokens; the original per-request value is restored
+                    // right after the call, like the drafting stash below.
+                    seq_concat.push_back(seq_id);
+                    seq_concat_n_max.push_back(dp.n_max);
+                    dp.n_max = dp.n_max >= 0 ? std::min(dp.n_max, spec->concat_k1) : spec->concat_k1;
+                    n_drafting_impl++;
+                }
             } else {
                 seq_routed.push_back(seq_id);
             }
@@ -3829,6 +3851,32 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         impl_contrib->accept(seq_id, n_accepted);
         impl_contrib->n_call_accept++;
     }
+}
+
+int32_t common_speculative_concat_head_size(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || spec->concat_k1 <= 0) {
+        return 0;
+    }
+
+    if (seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_head.size()) {
+        return 0;
+    }
+
+    // impl_head is non-null only while this sequence's round was composed as a
+    // concat round: set when the head is published in common_speculative_draft(),
+    // consumed here by accept() and cleared wholesale at the top of the next
+    // draft() call. It intentionally survives the server's checkpoint-replay
+    // path (no draft() runs between the restore and the replayed accept), where
+    // the replayed round keeps its original composition attribution.
+    if (spec->impl_head[seq_id] == nullptr) {
+        return 0;
+    }
+
+    return (int32_t) spec->concat_head[seq_id].size();
+}
+
+int32_t common_speculative_concat_k1(const common_speculative * spec) {
+    return spec ? spec->concat_k1 : 0;
 }
 
 // TODO: support the case of more than one speculative implementations having a state

@@ -307,6 +307,13 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // t8 stadio 2 (spec §6, Task 6): per-request concat observability, printed
+    // by print_timings() next to the per-impl statistics (the metric keeps the
+    // server-lifetime total; these reset with the slot like n_draft_total)
+    int32_t n_concat_rounds = 0;       // composed concat rounds verified by this request
+    int32_t n_concat_head_total = 0;   // MTP head tokens composed across those rounds
+    int32_t n_concat_mtp_accepted = 0; // MTP head tokens accepted across those rounds
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -342,6 +349,11 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+
+        // t8 concat observability (per-request, see the fields above)
+        n_concat_rounds = 0;
+        n_concat_head_total = 0;
+        n_concat_mtp_accepted = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -633,6 +645,17 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        // t8 stadio 2 (spec §6, Task 6): concat-round observability next to the
+        // per-impl statistics above (ngram-style marker, per-request like the
+        // slot counters). Only printed when this request actually verified
+        // composed concat rounds - k1 is the configured --spec-concat-k1 and
+        // every concat code path is gated on it
+        if (n_concat_rounds > 0) {
+            SLT_INF(*this, "statistics %16s: k1 = %d, rounds = %d, mtp_accepted = %d/%d\n",
+                    "concat", common_speculative_concat_k1(spec), n_concat_rounds,
+                    n_concat_mtp_accepted, n_concat_head_total);
+        }
     }
 
     json to_json(bool only_metrics = false) const {
@@ -727,6 +750,14 @@ struct server_metrics {
     std::map<std::string, uint64_t> spec_route_cache_rebuilds = {};
     uint64_t spec_route_overrides_total = 0;
 
+    // t8 stadio 2 (spec §6, Task 6): MTP head tokens accepted in composed
+    // concat rounds, exported as spec_route_concat_mtp_accepted_total. The
+    // unlabeled counter is emitted unconditionally at /metrics render time
+    // (like spec_route_override_total), so it is present at 0 from boot with
+    // no pre-registration needed (T7 lesson 8b35a795f: a counter that only
+    // appears on first increment stays invisible until then)
+    uint64_t spec_route_concat_mtp_accepted_total = 0;
+
     void init() {
         t_start = ggml_time_us();
 
@@ -752,6 +783,10 @@ struct server_metrics {
 
     void on_spec_route_cache_rebuild(const std::string & kind) {
         spec_route_cache_rebuilds[kind]++;
+    }
+
+    void on_spec_route_concat_mtp_accepted(uint32_t n_tokens) {
+        spec_route_concat_mtp_accepted_total += n_tokens;
     }
 
     void on_prompt_eval(const server_slot & slot) {
@@ -2625,6 +2660,9 @@ private:
                     res->spec_route_cache_rebuilds = metrics.spec_route_cache_rebuilds;
                     res->spec_route_overrides_total = metrics.spec_route_overrides_total;
 
+                    // t8 stadio 2 (spec §6, Task 6): concat observability counter
+                    res->spec_route_concat_mtp_accepted_total = metrics.spec_route_concat_mtp_accepted_total;
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -4215,7 +4253,28 @@ private:
                         SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                     }
 
+                    // t8 stadio 2 (spec §6, Task 6): concat observability. Read the
+                    // head size BEFORE the accept - common_speculative_accept()
+                    // consumes the per-seq round attribution (impl_head) that marks
+                    // this round as composed. The accepted head tokens are
+                    // min(n_accepted, k1'): the head is the first k1' rows of the
+                    // round, so a partial acceptance inside the head counts its
+                    // accepted prefix and an acceptance reaching past the head
+                    // counts the whole head (same boundary arithmetic as the MTP
+                    // impl's i_h, speculative.cpp accept()).
+                    const int32_t n_concat_head = common_speculative_concat_head_size(spec.get(), slot.id);
+
                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+
+                    if (n_concat_head > 0) {
+                        const int32_t n_concat_mtp = std::min<int32_t>((int32_t) (accepted.size() - 1), n_concat_head);
+
+                        metrics.on_spec_route_concat_mtp_accepted(n_concat_mtp);
+
+                        slot.n_concat_rounds++;
+                        slot.n_concat_head_total += n_concat_head;
+                        slot.n_concat_mtp_accepted += n_concat_mtp;
+                    }
 
                     slot.spec_draft = std::move(accepted);
                     slot.spec_dists.clear();
@@ -4995,6 +5054,14 @@ void server_routes::init_routes() {
                 {"name",  "spec_route_override_total"},
                 {"help",  "Number of tasks launched with an explicit spec_drafter override."},
                 {"value", res_task->spec_route_overrides_total},
+            });
+
+            // t8 stadio 2 (spec §6, Task 6): emitted unconditionally so the
+            // counter is present at 0 from boot (see server_metrics)
+            counter_defs.push_back({
+                {"name",  "spec_route_concat_mtp_accepted_total"},
+                {"help",  "Number of MTP head tokens accepted in composed concat rounds."},
+                {"value", res_task->spec_route_concat_mtp_accepted_total},
             });
 
             for (const auto & [kind, count] : res_task->spec_route_cache_rebuilds) {
