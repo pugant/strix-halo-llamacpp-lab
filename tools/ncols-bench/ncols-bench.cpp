@@ -129,8 +129,11 @@ int main(int argc, char ** argv) {
 
     const int ncols_list[] = { 1, 2, 4, 8, 9, 12, 14, 16 };
 
+    // Nota: le iGPU (Strix Halo, `uma: 1`) si registrano come IGPU, non GPU
+    // (ggml-vulkan.cpp: is_integrated_gpu -> GGML_BACKEND_DEVICE_TYPE_IGPU).
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-    if (!dev) fail("nessun device GPU nel registry (backend Vulkan mancante?)");
+    if (!dev) dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+    if (!dev) fail("nessun device GPU/IGPU nel registry (backend Vulkan mancante?)");
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     if (!backend) fail("init backend GPU fallito");
 
