@@ -411,6 +411,17 @@ struct common_params_speculative {
         if (concat_armed()) {
             n_rs_seq += concat_k1;
         }
+        // ring-window fix (2026-08-21 triage, t8 stadio 2): the same snapshots
+        // gate the server's prompt-cache trailing rollback - the recurrent
+        // seq_rm can only rewind `n_rs_seq` positions, so a client resend that
+        // truncates/mutates the tail of the last assistant turn goes cold once
+        // its delta (cached_tokens - lcp) exceeds n_rs_seq (measured: delta 7
+        // trailing, delta 8 cold with n_max 7, on top of the MTP ring fix).
+        // The effective rollback window is min(this, the MTP ring coverage in
+        // speculative.cpp, RING_N 32 with position-dedup ~ 24 real positions);
+        // floor it at 16 so the window covers ~2x a typical word (>= 12
+        // required, delta 14 included) independently of the draft width.
+        n_rs_seq = std::max<int32_t>(n_rs_seq, 16);
         return (uint32_t) n_rs_seq;
     }
 };

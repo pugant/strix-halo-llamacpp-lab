@@ -1680,7 +1680,42 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     // memory rollback (prompt-cache boundary salvage, see the server) can
     // rewind pending_h to any of the last RING_N positions without a full
     // cold reprocessing.
-    static constexpr uint32_t RING_N = 8;
+    //
+    // Window sizing (2026-08-21 triage, t8 stadio 2): a client resend that
+    // truncates or mutates the tail of the last assistant turn must rewind
+    // pending_h to lcp-1, and that tail is the regenerated last word: its
+    // token length follows the greedy stream, which shifts with kernel
+    // numerics (the VK mul_mat_vec_max_cols 8->16 change moved 9-16-column
+    // MUL_MAT batches from the tiled f16 kernel to the f32 vec kernel).
+    // Causal tail-chop evidence on both the base image and the VK image:
+    // trailing rollback succeeded at tail deltas (cached_tokens - lcp) of
+    // 3-5 tokens and degraded to a cold fallback from 6 tokens on, because
+    // RING_N=8 without position-dedup retained only ~5 distinct positions
+    // (every verify round pushes its rows twice: process() mirrors the
+    // batch, accept() re-pushes verify_h; a partially rejected round also
+    // re-pushes its rejected tail). The window must cover ~2x a typical
+    // word (mutated word plus its template tail) with margin, so the fix
+    // widens the ring rather than masking the symptom.
+    //
+    // Sizing arithmetic (measured on the causal sweep): with the
+    // ring_push() position-dedup below, one slot is allocated per DISTINCT
+    // decoded position, so the ring holds the last RING_N positions of the
+    // stream MINUS the phantom tail: the rejected rows of the FINAL verify
+    // round are never re-decoded and keep occupying the newest ~n_max
+    // slots beyond the stream end (measured extent 8 with n_max 7). Real
+    // distinct-position coverage is therefore RING_N - ~n_max: 8 - 8 ~ 0-5
+    // (the original bug), 16 - 8 ~ 8 (cold fallback still at delta >= 8),
+    // 32 - 8 ~ 24 (covers deltas well past 14; >= 12 required). A no-dedup
+    // ring does not help: re-pushes consume slots at ~2x the batch width
+    // per round and low-acceptance tails measured only ~8 distinct
+    // positions even at 32 slots. The same rollback is ALSO gated by the
+    // target's recurrent snapshot depth (common.h need_n_rs_seq, floored
+    // at 16 by this same triage): the effective window is the minimum of
+    // the two. The serialized ring grows accordingly,
+    // which bumps MTP_STATE_VERSION: pre-widening checkpoints (whose
+    // newest-position ring entries were stale re-pushes) fail validation
+    // and take the existing cold-recreate path.
+    static constexpr uint32_t RING_N = 32;
     std::vector<std::vector<float>> ring_h;      // [n_seq][RING_N * n_embd]
     std::vector<std::vector<llama_pos>> ring_pos; // [n_seq][RING_N]
     std::vector<uint32_t> ring_len;              // [n_seq]
@@ -2328,8 +2363,15 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         }
 
         // all verification rows are valid boundary candidates at their
-        // contiguous positions: keep them in the rollback ring
-        for (int32_t i = 0; i < n_rows; ++i) {
+        // contiguous positions: keep them in the rollback ring.
+        // verify_h mirrors only rows [0, n_rows - 1) - the last row lives
+        // in pending_h (see process()) and was already pushed by process()
+        // with the authoritative embedding. Pushing row n_rows - 1 here
+        // read past the copied region and planted a stale duplicate of the
+        // newest position that shadowed the authoritative row in ring_get
+        // (which scans newest first), so bound the loop to the mirrored
+        // rows.
+        for (int32_t i = 0; i + 1 < n_rows; ++i) {
             ring_push(seq_id, verify_pos_first[seq_id] + i, verify_h[seq_id].data() + (size_t) i * n_embd);
         }
 
@@ -2352,13 +2394,34 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     }
 
     static constexpr uint32_t MTP_STATE_MAGIC       = 0x3250544d; // "MTP2" in little-endian byte order
-    static constexpr uint16_t MTP_STATE_VERSION     = 3;
+    // v4: rollback ring widened 8 -> 32 rows with position-dedup (same
+    // per-entry layout) - old blobs fail the version check below and take
+    // the cold-recreate path
+    static constexpr uint16_t MTP_STATE_VERSION     = 4;
     static constexpr uint16_t MTP_STATE_CURRENT     = 1u << 0;
     static constexpr uint16_t MTP_STATE_PREVIOUS    = 1u << 1;
     static constexpr size_t   MTP_STATE_HEADER      = sizeof(uint32_t) + 2*sizeof(uint16_t) + sizeof(uint32_t) + 2*sizeof(llama_pos);
 
     void ring_push(llama_seq_id seq_id, llama_pos pos, const float * row) {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // position-dedup: a verify round re-pushes rows that process() already
+        // mirrored, and after a partial rejection the next round re-decodes the
+        // rejected tail at the same positions with new content. Update the
+        // existing slot in place so a re-push never consumes a slot: without
+        // dedup RING_N slots hold only ~RING_N/2 (high acceptance) down to
+        // ~RING_N/4 (low acceptance) distinct positions and the rollback
+        // window shrinks with the acceptance rate (causal evidence 2026-08-21:
+        // cold fallback at delta 8/10 with a 32-slot no-dedup ring in a
+        // low-acceptance tail). With dedup RING_N is a guaranteed count of
+        // DISTINCT positions.
+        for (uint32_t i = 0; i < ring_len[seq_id]; ++i) {
+            const uint32_t idx = (ring_head[seq_id] + RING_N - 1 - i) % RING_N;
+            if (ring_pos[seq_id][idx] == pos) {
+                std::memcpy(ring_h[seq_id].data() + (size_t) idx * n_embd, row, row_bytes);
+                return;
+            }
+        }
 
         std::memcpy(ring_h[seq_id].data() + (size_t) ring_head[seq_id] * n_embd, row, row_bytes);
         ring_pos[seq_id][ring_head[seq_id]] = pos;
@@ -2539,6 +2602,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         pending_h_prev_pos[seq_id] = pending_h_prev_valid[seq_id] ? pos_previous : -1;
 
         // v3: trailing ring of recent boundary rows, oldest first
+        // v4: ring capacity 32 with position-dedup (window widening)
         uint32_t ring_count = 0;
         std::memcpy(&ring_count, data.data() + off, sizeof(ring_count)); off += sizeof(ring_count);
 
