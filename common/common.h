@@ -355,6 +355,13 @@ struct common_params_speculative {
     bool mtp_strict = true;
     bool mtp_strict_qwen = false;
 
+    // t8 stadio 2: MTP tokens chained before the draft-dflash block in a concat
+    // round of dual routing. 0 = off (default) - no concat code path runs and the
+    // behavior is identical to the T7 dual routing. Valid range 0..6: a concat
+    // round verifies k1 + dflash n_max (7) + 1 token = at most 14 columns, within
+    // the 16-column dmmv cap of the patched Vulkan backend.
+    int32_t concat_k1 = 0;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 

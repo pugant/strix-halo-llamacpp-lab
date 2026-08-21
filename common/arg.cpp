@@ -3655,6 +3655,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
     add_opt(common_arg(
+        {"--spec-concat-k1"}, "N",
+        string_format("number of MTP tokens chained before the draft-dflash block in a concat round of dual routing, 0 = off (default: %d)", params.speculative.concat_k1),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 6) {
+                throw std::invalid_argument("spec concat k1 must be between 0 and 6 inclusive");
+            }
+            params.speculative.concat_k1 = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CONCAT_K1"));
+    add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
         [](common_params & params, int value) {

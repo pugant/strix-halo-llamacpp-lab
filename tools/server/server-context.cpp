@@ -1317,6 +1317,27 @@ private:
             }
         }
 
+        // t8 stadio 2 (spec §3 'Boot'): --spec-concat-k1 > 0 arms the concat
+        // round mode (MTP k1 tokens + the draft-dflash block in one verify).
+        // Config surface only for now - no round mechanics: the marker just
+        // confirms the boot guard. concat requires dual routing with BOTH
+        // draft-mtp and draft-dflash actually instantiated (a dual config that
+        // degraded to mono at boot counts as not ready, and so does any
+        // single-type server): anything else keeps the T7 routing with a
+        // WARNING, never a boot error (spec §10).
+        if (params_base.speculative.concat_k1 > 0) {
+            const bool concat_ready = spec_dual
+                && spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) > 0
+                && spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) > 0;
+
+            if (concat_ready) {
+                SRV_INF("spec-route: concat mode k1=%d\n", params_base.speculative.concat_k1);
+            } else {
+                SRV_WRN("spec-route: concat mode disabled: --spec-concat-k1 %d requires dual routing (draft-mtp,draft-dflash) with both drafters loaded - keeping the T7 routing\n",
+                        params_base.speculative.concat_k1);
+            }
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
