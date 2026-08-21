@@ -1710,7 +1710,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     // per round and low-acceptance tails measured only ~8 distinct
     // positions even at 32 slots. The same rollback is ALSO gated by the
     // target's recurrent snapshot depth (common.h need_n_rs_seq, floored
-    // at 16 by this same triage): the effective window is the minimum of
+    // at N_RS_SEQ_FLOOR by this same triage): the effective window is the minimum of
     // the two. The serialized ring grows accordingly,
     // which bumps MTP_STATE_VERSION: pre-widening checkpoints (whose
     // newest-position ring entries were stale re-pushes) fail validation

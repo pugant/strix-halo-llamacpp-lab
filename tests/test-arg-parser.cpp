@@ -178,6 +178,19 @@ int main(void) {
         assert(strict_params.speculative.mtp_strict_qwen == false);
         assert(strict_params.speculative.need_n_rs_seq() == 16);
 
+        // pin the pass-through branch of the RS floor (N_RS_SEQ_FLOOR): a round
+        // width wider than the floor must survive the clamp unchanged
+        strict_params.speculative.draft.n_max = 20;
+        assert(strict_params.speculative.need_n_rs_seq() == 20);
+        // and the max() between the floor operands: with concat armed the
+        // round width n_max + k1 (23) wins over the floor (16)
+        strict_params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        strict_params.speculative.concat_k1 = 3;
+        assert(strict_params.speculative.need_n_rs_seq() == 23);
+        strict_params.speculative.concat_k1 = 0;
+        strict_params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        strict_params.speculative.draft.n_max = 6;
+
         common_params cli_strict_params;
         argv = {"binary_name", "-m", "model_file.gguf", "--spec-mtp-strict-qwen"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cli_strict_params, LLAMA_EXAMPLE_CLI));

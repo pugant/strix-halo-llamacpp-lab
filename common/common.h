@@ -393,6 +393,12 @@ struct common_params_speculative {
         return has_mtp && has_dflash;
     }
 
+    // ring-window fix (2026-08-21 triage): minimum recurrent-snapshot depth for
+    // the trailing-rollback window. Rationale: the window must cover ~2x a
+    // typical word (a mutated final word plus its template tail) - the triage
+    // requires >= 12 distinct positions and delta 14 explicitly, so 16.
+    static constexpr int32_t N_RS_SEQ_FLOOR = 16;
+
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
@@ -418,10 +424,14 @@ struct common_params_speculative {
         // its delta (cached_tokens - lcp) exceeds n_rs_seq (measured: delta 7
         // trailing, delta 8 cold with n_max 7, on top of the MTP ring fix).
         // The effective rollback window is min(this, the MTP ring coverage in
-        // speculative.cpp, RING_N 32 with position-dedup ~ 24 real positions);
-        // floor it at 16 so the window covers ~2x a typical word (>= 12
-        // required, delta 14 included) independently of the draft width.
-        n_rs_seq = std::max<int32_t>(n_rs_seq, 16);
+        // speculative.cpp, RING_N 32 with position-dedup ~ 24 real positions).
+        // cost: RS ring scales as (1+n_rs_seq) -> 7->16 is ~x2.125 RS memory
+        // on the hybrid target, for every stateful-spec config incl.
+        // production k1=0 (certified headroom: Task 10). Deliberately
+        // over-broad: the floor also applies to configs without the MTP ring
+        // (EAGLE3/DSpark/DFlash-only pay the RS cost with no window benefit) -
+        // accepted because production always runs MTP in the chain.
+        n_rs_seq = std::max<int32_t>(n_rs_seq, N_RS_SEQ_FLOOR);
         return (uint32_t) n_rs_seq;
     }
 };
