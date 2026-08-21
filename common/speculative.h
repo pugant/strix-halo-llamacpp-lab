@@ -72,6 +72,16 @@ struct common_speculative_draft_params {
 
     float temperature = 0.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // t8 stadio 2 (spec §3): concat round plumbing - when non-null, the pointed
+    // tokens are the MTP head (k1' <= concat_k1) already appended to `result` by
+    // the MTP arm of this round; the draft-dflash arm conditions its noise block
+    // on them (head at n_past+1..n_past+k1', block at n_past+k1'+1..) instead of
+    // using the mask placeholder at those positions. Owned by the harness
+    // (common_speculative::concat_head): set between the MTP and DFlash arms of
+    // the same common_speculative_draft() call and cleared when the round closes.
+    // Null outside concat rounds (and on every k1 = 0 boot: zero code path).
+    const llama_tokens * concat_head = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

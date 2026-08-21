@@ -376,11 +376,42 @@ struct common_params_speculative {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
     }
 
+    // t8 stadio 2 (spec §3): the concat round mechanism is armed - dual
+    // draft-mtp + draft-dflash types with --spec-concat-k1 > 0 (the same guard
+    // as the server boot marker). Every other configuration keeps the T7
+    // behavior bit-for-bit.
+    bool concat_armed() const {
+        if (concat_k1 <= 0) {
+            return false;
+        }
+        const bool has_mtp = std::any_of(types.begin(), types.end(), [&](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        });
+        const bool has_dflash = std::any_of(types.begin(), types.end(), [&](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+        });
+        return has_mtp && has_dflash;
+    }
+
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
-        return needs_rs_seq ? (uint32_t) std::max<int32_t>(0, draft.n_max) : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+        int32_t n_rs_seq = std::max<int32_t>(0, draft.n_max);
+        // t8 stadio 2 (spec §5): a concat round chains k1 MTP head tokens in front
+        // of the draft-dflash block, so a single round can be draft.n_max + k1
+        // tokens long. The RS ring must cover the whole round or every partial
+        // rejection in a concat round silently falls back to the full
+        // checkpoint-restore path (correct but slow - the sizing gap the plan
+        // review flagged). The draft contexts are sized independently (the server
+        // zeroes their n_rs_seq), so this lands on the target context only.
+        if (concat_armed()) {
+            n_rs_seq += concat_k1;
+        }
+        return (uint32_t) n_rs_seq;
     }
 };
 

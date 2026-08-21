@@ -19,6 +19,11 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // t8 stadio 2 (spec §3): concat-round head tokens ahead of the dflash noise
+    // block (0 = none). Widens the selector-lattice block cap of the dflash
+    // graph by this many rows (dflash.block_size + k1). Inert elsewhere.
+    int32_t  dflash_concat_k1 = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 

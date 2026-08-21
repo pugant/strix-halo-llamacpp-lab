@@ -65,6 +65,11 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
+    // t8 stadio 2 (spec §3): concat-round head width for the dflash selector
+    // lattice (see llama_context_params::dflash_concat_k1). Must be in place
+    // before graph_reserve() sizes the worst-case dflash decode graph.
+    cparams.dflash_concat_k1 = std::max(0, params.dflash_concat_k1);
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -2439,8 +2444,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res += lora->get_n_nodes();
     }
     if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        // t8 stadio 2 (spec §3): the selector-lattice block cap is the trained
+        // dflash.block_size widened by the concat-round head width (see
+        // llama_context_params::dflash_concat_k1) - keep the reserve in sync
+        // with the cap build_post_sampling() actually clamps to.
+        const uint32_t block_cap = model.hparams.dflash_block_size +
+            (uint32_t) std::max(0, cparams.dflash_concat_k1);
         const uint32_t selector_tokens = std::min<uint32_t>(
-                n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
+                n_tokens, block_cap * cparams.n_seq_max);
         res += 32*selector_tokens;
     }
     return res;
@@ -3710,6 +3721,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.dflash_concat_k1            =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,

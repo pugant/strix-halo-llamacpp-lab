@@ -1314,67 +1314,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        common_batch_clear(batch);
-
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        std::vector<int32_t> n_dft_v    (n_seq,  0);
 
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
-                continue;
-            }
+        // t8 stadio 2 (spec §3): per-seq MTP head tokens conditioning the block
+        // (0 outside concat rounds; dspark never receives a head)
+        std::vector<int32_t> n_head     (n_seq,  0);
+        // t8: rows this sequence adds to the draft batch (head + block)
+        std::vector<int32_t> n_rows     (n_seq,  0);
 
-            common_sampler_reset(smpls[seq_id].get());
-
-            const int32_t n = (int32_t) dp.n_past;
-
-            const int32_t n_draft = common_speculative_effective_n_max(params, dp);
-
-            const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
-            i_block_beg[seq_id] = batch.n_tokens;
-            n_block    [seq_id] = n_block_tokens;
-            for (int32_t i = 0; i < n_block_tokens; ++i) {
-                // NOTE: unlike upstream, request logits on every noise position
-                // also for DFlash2: build_post_sampling() reads the full-block
-                // logits to build the selector lattice (t_logits->ne[1] must
-                // equal n_tokens).
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
-            }
-        }
-
-        if (batch.n_tokens == 0) {
-            return;
-        }
-
-        // DFlash1 needs no pre-norm output during the noise-block decode; DFlash2
-        // instead reads its selector lattice from the unmasked pre-norm rows of
-        // exactly this decode, so the flag must stay on (set in the constructor).
-        if (!is_dspark && !is_dflash2) {
-            llama_set_embeddings_pre_norm(ctx_dft, false, /*masked*/ false);
-        }
-        int ret = llama_decode(ctx_dft, batch);
-        if (!is_dspark && !is_dflash2) {
-            llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
-        }
-        if (ret != 0) {
-            LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
-            return;
-        }
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] < 0) {
-                continue;
-            }
+        // t8 stadio 2: sample one sequence from the logits/embeddings of the LAST
+        // decode (the next decode overwrites the host buffers). Extracted from
+        // the former single-pass loop so the width-grouped decode below can
+        // sample each group right after its own decode.
+        auto sample_seq = [&](llama_seq_id seq_id, int32_t beg) {
             auto & dp = dparams[seq_id];
 
-            const int32_t beg            = i_block_beg[seq_id];
             const int32_t n_block_tokens = n_block[seq_id];
 
             auto * smpl = smpls[seq_id].get();
             auto & result = *dp.result;
 
-            const int32_t n_draft = common_speculative_effective_n_max(params, dp);
+            const int32_t n_draft = n_dft_v[seq_id];
             const int32_t n_min   = common_speculative_effective_n_min(params, dp, n_draft);
             const float   p_min   = common_speculative_effective_p_min(params, dp);
 
@@ -1398,7 +1360,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
-                    const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
+                    // t8 concat: skip the head rows - the selector lattice walks
+                    // the noise block only, which starts after the head
+                    const float * row = lattice + (size_t) (beg + n_head[seq_id] + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
 
                     if (dp.temperature > 0.0f) {
@@ -1432,7 +1396,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         dp.dists->clear();
                     }
                 }
-                continue;
+                return;
             }
 
             if (is_dspark) {
@@ -1441,7 +1405,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * conf = p_min > 0.0f ? llama_get_embeddings_pre_norm(ctx_dft) : nullptr;
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
-                    const int32_t idx = beg + i;
+                    // t8 concat: n_head is always 0 for dspark (never a head) -
+                    // the offset is kept for symmetry with the other layouts
+                    const int32_t idx = beg + n_head[seq_id] + i;
                     if (conf && conf[(size_t) idx * n_embd_dec] < p_min) {
                         break;
                     }
@@ -1461,7 +1427,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             } else {
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
-                    common_sampler_sample(smpl, ctx_dft, beg + i, true);
+                    // t8 concat: the noise block starts after the head rows
+                    common_sampler_sample(smpl, ctx_dft, beg + n_head[seq_id] + i, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1484,6 +1451,121 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) n_min) {
                 result.clear();
             }
+        };
+
+        // pass 1: per-seq sizing
+        std::vector<llama_seq_id> seqs;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            common_sampler_reset(smpls[seq_id].get());
+
+            const int32_t n_draft = common_speculative_effective_n_max(params, dp);
+
+            const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
+            n_block[seq_id] = n_block_tokens;
+            n_dft_v[seq_id] = n_draft;
+            n_head [seq_id] = (!is_dspark && dp.concat_head) ? (int32_t) dp.concat_head->size() : 0;
+            n_rows [seq_id] = n_head[seq_id] + n_block_tokens;
+            seqs.push_back(seq_id);
+        }
+
+        if (seqs.empty()) {
+            return;
+        }
+
+        // t8 stadio 2: the DFlash2 selector graph requires a uniform per-seq width
+        // within one decode - it derives tokens_per_block = n_tokens / n_seqs_unq
+        // and asserts the exact division, so a batch mixing a concat round
+        // (1 + k1' + n_max rows) with a plain block (1 + n_max rows) would abort.
+        // Group the sequences by width and decode one group at a time, sampling
+        // each group before the next decode overwrites the host buffers. With a
+        // single width (every pre-t8 round) this is exactly the former
+        // one-batch one-decode flow.
+        std::sort(seqs.begin(), seqs.end(), [&](llama_seq_id a, llama_seq_id b) {
+            return n_rows[a] < n_rows[b];
+        });
+
+        size_t g = 0;
+        while (g < seqs.size()) {
+            size_t h = g;
+            while (h < seqs.size() && n_rows[seqs[h]] == n_rows[seqs[g]]) {
+                ++h;
+            }
+
+            common_batch_clear(batch);
+
+            for (size_t s = g; s < h; ++s) {
+                const llama_seq_id seq_id = seqs[s];
+                auto & dp = dparams[seq_id];
+
+                const int32_t n       = (int32_t) dp.n_past;
+                const int32_t n_draft = n_dft_v[seq_id];
+
+                i_block_beg[seq_id] = batch.n_tokens;
+
+                if (n_head[seq_id] > 0) {
+                    // t8 stadio 2 (spec §3) - concat round: the drafting input
+                    // carries the MTP head tokens at positions n+1..n+k1' and the
+                    // noise block shifts to n+k1'+1..n+k1'+n_draft; the anchor
+                    // (id_last @ n) is unchanged. The head replaces the mask
+                    // placeholder at those positions and conditions the block
+                    // through this context's non-causal attention - the head
+                    // tokens are verified by the target in the SAME round, never
+                    // confirmed unverified. All rows keep logits on so
+                    // t_logits->ne[1] stays equal to n_tokens (DFlash2
+                    // build_post_sampling reads the full-block logits).
+                    // dp.result already holds the k1' head tokens: the sampling
+                    // loop APPENDS to it, giving one concatenated draft per seq.
+                    common_batch_add(batch, dp.id_last, n, { seq_id }, true);
+                    for (int32_t j = 0; j < n_head[seq_id]; ++j) {
+                        common_batch_add(batch, (*dp.concat_head)[j], n + 1 + j, { seq_id }, true);
+                    }
+                    for (int32_t i = 1; i <= n_draft; ++i) {
+                        common_batch_add(batch, mask_token_id, n + n_head[seq_id] + i, { seq_id }, true);
+                    }
+                } else {
+                    for (int32_t i = 0; i < n_block[seq_id]; ++i) {
+                        // NOTE: unlike upstream, request logits on every noise position
+                        // also for DFlash2: build_post_sampling() reads the full-block
+                        // logits to build the selector lattice (t_logits->ne[1] must
+                        // equal n_tokens).
+                        common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+                    }
+                }
+            }
+
+            GGML_ASSERT(batch.n_tokens > 0);
+
+            // DFlash1 needs no pre-norm output during the noise-block decode; DFlash2
+            // instead reads its selector lattice from the unmasked pre-norm rows of
+            // exactly this decode, so the flag must stay on (set in the constructor).
+            if (!is_dspark && !is_dflash2) {
+                llama_set_embeddings_pre_norm(ctx_dft, false, /*masked*/ false);
+            }
+            const int ret = llama_decode(ctx_dft, batch);
+            if (!is_dspark && !is_dflash2) {
+                llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
+            }
+            if (ret != 0) {
+                // t8 stadio 2 (spec §10): a failed decode never errors the request
+                // - this group's sequences keep what they already drafted (a
+                // concat head closes a SHORT round of k1' tokens; a plain block
+                // leaves them without a draft this round) and the remaining
+                // groups still run.
+                LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
+                g = h;
+                continue;
+            }
+
+            for (size_t s = g; s < h; ++s) {
+                sample_seq(seqs[s], i_block_beg[seqs[s]]);
+            }
+
+            g = h;
         }
     }
 
@@ -1977,9 +2059,26 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
             const llama_pos pos_needed = p_next - 1;
             if (!pending_h_valid[seq_id] || pending_h_pos[seq_id] != pos_needed) {
-                LOG_WRN("%s: disabling MTP draft for seq_id=%d: boundary pos=%d/%d, needed=%d\n",
-                        __func__, (int) seq_id, (int) pending_h_pos[seq_id],
-                        (int) pending_h_valid[seq_id], (int) pos_needed);
+                // t8 stadio 2 (spec §3/§10): for a sequence routed to draft-dflash
+                // this fires on every concat round that follows a partial
+                // rejection - accept() is dispatched to the round-closing arm only
+                // (multi-impl dispatch is Task 5), so pending_h is not rewound to
+                // the accepted boundary. The head is skipped and the harness
+                // degrades the round to a plain draft-dflash block: every token is
+                // still target-verified, so demote to debug - same treatment as the
+                // neutral resync in process() for sequences routed elsewhere.
+                const bool drafts_this_seq = dparams_routing == nullptr ||
+                    (*dparams_routing)[seq_id].drafter == COMMON_SPECULATIVE_TYPE_NONE ||
+                    (*dparams_routing)[seq_id].drafter == type;
+                if (drafts_this_seq) {
+                    LOG_WRN("%s: disabling MTP draft for seq_id=%d: boundary pos=%d/%d, needed=%d\n",
+                            __func__, (int) seq_id, (int) pending_h_pos[seq_id],
+                            (int) pending_h_valid[seq_id], (int) pos_needed);
+                } else {
+                    LOG_DBG("%s: MTP boundary behind the accepted position for seq_id=%d - concat head skipped, plain dflash round (pos=%d/%d, needed=%d)\n",
+                            __func__, (int) seq_id, (int) pending_h_pos[seq_id],
+                            (int) pending_h_valid[seq_id], (int) pos_needed);
+                }
                 dp.drafting = false;
                 continue;
             }
@@ -2839,6 +2938,16 @@ struct common_speculative {
 
     // which implementaion was used for a given seq_id
     std::vector<common_speculative_impl *> impl_last;
+
+    // t8 stadio 2 (spec §3): concat round configuration (--spec-concat-k1, 0 = off
+    // - every concat branch below is gated on it and k1 = 0 boots run zero new
+    // code) and the per-seq storage backing common_speculative_draft_params::
+    // concat_head during the round in flight.
+    int32_t concat_k1 = 0;
+    std::vector<llama_tokens> concat_head;
+
+    // diagnostics: number of concat rounds composed (first one logs at INFO)
+    size_t n_concat_rounds = 0;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3214,6 +3323,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr)
     };
 
+    // t8 stadio 2 (spec §3): wire the concat configuration into the harness. The
+    // implementations keep receiving only their own draft params (they must not
+    // observe concat state), so the head tokens travel via dparams::concat_head,
+    // backed by this per-seq storage.
+    result->concat_k1 = params.concat_k1;
+    result->concat_head.assign(n_seq, {});
+    if (result->concat_k1 > 0) {
+        LOG_INF("%s: concat mode armed, k1=%d (per-request routing picks the rounds)\n", __func__, result->concat_k1);
+    }
+
     return result;
 }
 
@@ -3349,6 +3468,8 @@ void common_speculative_draft(common_speculative * spec) {
 
         for (auto & dp : dparams) {
             GGML_ASSERT(!dp.drafting || dp.result->empty());
+            // t8 concat: never leak a head pointer across rounds
+            dp.concat_head = nullptr;
 
             if (dp.drafting) {
                 n_drafting++;
@@ -3359,6 +3480,31 @@ void common_speculative_draft(common_speculative * spec) {
             return;
         }
     }
+
+    // t8 stadio 2 (spec §3): concat round support. In a dual MTP+DFlash routing
+    // armed with concat_k1 > 0, a sequence routed to draft-dflash composes its
+    // round as an MTP head of up to k1 tokens followed by the draft-dflash block
+    // conditioned on that head (the head tokens sit at positions n_past+1..n_past+k1'
+    // of the dflash drafting input, where the mask placeholder used to be). This
+    // is the one deliberate break of the first-wins chaining below: the MTP arm
+    // runs first for those sequences but does NOT close the round - the
+    // draft-dflash arm completes and closes it, so impl_last attributes the round
+    // to draft-dflash exactly as in the T7 routing.
+    common_speculative_impl * impl_mtp = nullptr;
+    common_speculative_impl * impl_dflash = nullptr;
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            impl_mtp = impl.get();
+        }
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+            impl_dflash = impl.get();
+        }
+    }
+    // degenerate guard: with a draft-dflash arm that cannot draft at all (n_max
+    // clamped to 0 post-load) the head would close head-only rounds attributed to
+    // dflash - keep the plain T7 routing instead (concat inert)
+    const bool concat_armed = spec->concat_k1 > 0 && impl_mtp != nullptr &&
+            impl_dflash != nullptr && impl_dflash->draft_n_max() > 0;
 
     for (auto & impl : spec->impls) {
         // per-seq drafter routing (see common_speculative_draft_params::drafter):
@@ -3372,6 +3518,14 @@ void common_speculative_draft(common_speculative * spec) {
         int n_drafting_impl = 0;
         std::vector<llama_seq_id> seq_routed;
 
+        // t8 concat: sequences of this MTP-arm iteration that must draft the
+        // round's head (spec §3) - kept drafting (NOT stashed away like the
+        // routed ones) with dp.n_max temporarily clamped to k1 so the MTP arm
+        // produces at most the head
+        std::vector<llama_seq_id> seq_concat;
+        std::vector<int32_t>      seq_concat_n_max;
+        const bool concat_mtp_phase = concat_armed && impl.get() == impl_mtp;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
             auto & dp = dparams[seq_id];
 
@@ -3380,6 +3534,15 @@ void common_speculative_draft(common_speculative * spec) {
             }
 
             if (dp.drafter == COMMON_SPECULATIVE_TYPE_NONE || dp.drafter == impl->type) {
+                n_drafting_impl++;
+            } else if (concat_mtp_phase && dp.drafter == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+                // concat round: the MTP arm heads it. The arm's effective n_max
+                // already folds dp.n_max in, so clamping dp.n_max to k1 caps the
+                // head at k1 tokens; the original per-request value is restored
+                // right after the call, like the drafting stash below.
+                seq_concat.push_back(seq_id);
+                seq_concat_n_max.push_back(dp.n_max);
+                dp.n_max = dp.n_max >= 0 ? std::min(dp.n_max, spec->concat_k1) : spec->concat_k1;
                 n_drafting_impl++;
             } else {
                 seq_routed.push_back(seq_id);
@@ -3405,6 +3568,36 @@ void common_speculative_draft(common_speculative * spec) {
             dparams[seq_id].drafting = true;
         }
 
+        // t8 concat: restore the per-request n_max and publish the head. With a
+        // head of k1' > 0 tokens the round stays open - the draft-dflash arm below
+        // consumes dp.concat_head and closes the round (the first-wins close is
+        // skipped for this sequence in this iteration). With no head (p_min early
+        // stop or a boundary miss) the round degrades to a plain draft-dflash
+        // round, which requires re-arming drafting here because the MTP arm
+        // disables the sequence on a boundary miss (spec §10: never a lost round).
+        for (size_t i = 0; i < seq_concat.size(); ++i) {
+            auto & dp = dparams[seq_concat[i]];
+
+            dp.n_max       = seq_concat_n_max[i];
+            dp.concat_head = nullptr;
+
+            if (!dp.result->empty()) {
+                spec->concat_head[seq_concat[i]] = *dp.result;
+                dp.concat_head = &spec->concat_head[seq_concat[i]];
+
+                spec->n_concat_rounds++;
+                if (spec->n_concat_rounds == 1) {
+                    SPC_INF("concat round composed, k1=%d (head=%zu tokens, seq %d)\n",
+                            spec->concat_k1, dp.result->size(), (int) seq_concat[i]);
+                } else {
+                    SPC_TRC("concat round composed, k1=%d (head=%zu tokens, seq %d)\n",
+                            spec->concat_k1, dp.result->size(), (int) seq_concat[i]);
+                }
+            } else {
+                dp.drafting = true;
+            }
+        }
+
         int n_drafting = 0;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
@@ -3414,23 +3607,37 @@ void common_speculative_draft(common_speculative * spec) {
 
             // a new draft has been sampled
             if (dp.drafting && !result.empty()) {
-                dp.drafting = false;
+                // t8 concat: during the MTP arm's iteration a stashed head is
+                // conditioning, not a completed round - the draft-dflash arm below
+                // closes it (spec §3)
+                if (!(impl.get() == impl_mtp && dp.concat_head != nullptr)) {
+                    dp.drafting = false;
 
-                if (dp.n_max >= 0 && (int) result.size() > dp.n_max) {
-                    LOG_DBG("%s: truncating draft to %d tokens\n", __func__, dp.n_max);
-                    result.resize(dp.n_max);
-                }
+                    // t8 concat (spec §10): the round-level n_max is per-SEQ and
+                    // counts the whole round - the k1' head tokens drafted by the
+                    // MTP arm sit on top of the closing arm's own budget, so the
+                    // shared-result truncate extends the cap by the head size
+                    // (zero extra on every non-concat round: identical behavior)
+                    const int32_t n_max_round = dp.n_max + (dp.concat_head ? (int32_t) dp.concat_head->size() : 0);
+                    if (dp.n_max >= 0 && (int) result.size() > n_max_round) {
+                        LOG_DBG("%s: truncating draft to %d tokens\n", __func__, n_max_round);
+                        result.resize(n_max_round);
+                    }
 
-                if (!result.empty()) {
-                    LOG_DBG("%s: called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n", __func__,
-                            common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
-                            impl.get()->n_call_draft, result.size());
+                    // t8 concat: the round is closed - release the head plumbing
+                    dp.concat_head = nullptr;
 
-                    // remember which implementation was used
-                    spec->impl_last[seq_id] = impl.get();
+                    if (!result.empty()) {
+                        LOG_DBG("%s: called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n", __func__,
+                                common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
+                                impl.get()->n_call_draft, result.size());
 
-                    impl->n_gen_drafts++;
-                    impl->n_gen_tokens += result.size();
+                        // remember which implementation was used
+                        spec->impl_last[seq_id] = impl.get();
+
+                        impl->n_gen_drafts++;
+                        impl->n_gen_tokens += result.size();
+                    }
                 }
             }
 
@@ -3451,6 +3658,9 @@ void common_speculative_draft(common_speculative * spec) {
         if (dp.drafting) {
             dp.drafting = false;
         }
+
+        // t8 concat: never leak a head pointer across rounds
+        dp.concat_head = nullptr;
     }
 }
 
