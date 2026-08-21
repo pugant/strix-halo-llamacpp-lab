@@ -91,7 +91,7 @@ bool cpu_reference(const void * qa, const float * hb, int ncols, std::vector<flo
     ggml_backend_t cpu = ggml_backend_dev_init(cpu_dev, nullptr);
     if (!cpu) return false;
 
-    struct ggml_init_params ip = { 16 * 1024 * 1024, nullptr, false };
+    struct ggml_init_params ip = { 16 * 1024 * 1024, nullptr, /*no_alloc=*/true };
     struct ggml_context * ctx = ggml_init(ip);
     struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0_ROCMFP4_FAST, kK, kM);
     struct ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kK, ncols);
@@ -167,7 +167,7 @@ int main(int argc, char ** argv) {
 
     for (int ncols : ncols_list) {
         // --- grafo per questo punto ---
-        struct ggml_init_params ip = { 16 * 1024 * 1024, nullptr, false };
+        struct ggml_init_params ip = { 16 * 1024 * 1024, nullptr, /*no_alloc=*/true };
         BenchPoint bp = {};
         bp.backend = backend;
         bp.ctx     = ggml_init(ip);
