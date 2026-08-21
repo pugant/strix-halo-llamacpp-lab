@@ -44,8 +44,10 @@ uint32_t next_u32() {
     return (uint32_t)(g_rng >> 32);
 }
 
-// ~N(0,1) approssimata (somma di 4 uniformi): i valori esatti non contano,
-// conta la riproducibilita' e una scala ragionevole per le scale UE4M3.
+// Approssimazione gaussiana via somma di 4 uniformi in [0,1): media 0,
+// stddev ~0.577 (non 1). I valori esatti non contano: conta la
+// riproducibilita' (seed fissi) e una scala ragionevole per le scale UE4M3;
+// la soglia del CHECK e' relativa alla scala effettiva dei dati.
 float next_float() {
     float acc = 0.0f;
     for (int i = 0; i < 4; ++i) {
@@ -56,6 +58,14 @@ float next_float() {
 
 void fail(const char * msg) {
     fprintf(stderr, "ncols-bench: FATAL: %s\n", msg);
+    exit(1);
+}
+
+void usage_exit(const char * prog, const char * why) {
+    fprintf(stderr, "ncols-bench: %s\n%s <max_cols_label> [warmup=10] [iters=50] [runs=5]\n"
+                    "  max_cols_label: etichetta della build (8 o 16)\n"
+                    "  vincoli: argc <= 5, warmup >= 0, iters >= 1, runs >= 1\n",
+            why, prog);
     exit(1);
 }
 
@@ -74,7 +84,6 @@ double sample_stddev(const std::vector<double> & v) {
 }
 
 struct BenchPoint {
-    ggml_backend_t          backend;
     struct ggml_context * ctx;
     ggml_gallocr_t          galloc;
     struct ggml_cgraph *    graph;
@@ -122,10 +131,15 @@ bool cpu_reference(const void * qa, const float * hb, int ncols, std::vector<flo
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc > 5) usage_exit(argv[0], "troppi argomenti");
     const char * max_cols_label = argc > 1 ? argv[1] : "8";
     const int    warmup         = argc > 2 ? std::atoi(argv[2]) : 10;
     const int    iters          = argc > 3 ? std::atoi(argv[3]) : 50;
     const int    runs           = argc > 4 ? std::atoi(argv[4]) : 5;
+    // Guardie: iters=0 produrrebbe t_us inf e runs<=0 righe vuote nei log.
+    if (warmup < 0) usage_exit(argv[0], "warmup deve essere >= 0");
+    if (iters < 1)  usage_exit(argv[0], "iters deve essere >= 1");
+    if (runs < 1)   usage_exit(argv[0], "runs deve essere >= 1");
 
     const int ncols_list[] = { 1, 2, 4, 8, 9, 12, 14, 16 };
 
@@ -169,7 +183,6 @@ int main(int argc, char ** argv) {
         // --- grafo per questo punto ---
         struct ggml_init_params ip = { 16 * 1024 * 1024, nullptr, /*no_alloc=*/true };
         BenchPoint bp = {};
-        bp.backend = backend;
         bp.ctx     = ggml_init(ip);
         if (!bp.ctx) fail("ggml_init fallita");
         bp.a = ggml_new_tensor_2d(bp.ctx, GGML_TYPE_Q4_0_ROCMFP4_FAST, kK, kM);
