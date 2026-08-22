@@ -3665,6 +3665,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CONCAT_K1"));
     add_opt(common_arg(
+        {"--spec-concat-exclusion"}, {"--no-spec-concat-exclusion"},
+        string_format("exclude pattern-like (copy-mode) windows from the concat round of dual routing (default: %s)",
+            params.speculative.concat_exclusion ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.concat_exclusion = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CONCAT_EXCLUSION"));
+    add_opt(common_arg(
+        {"--spec-concat-selftest"}, "FNAME",
+        "run the concat-exclusion detector parity selftest against this fixtures file (JSON from scripts/t8-b2-detector.py --dump-fixtures) and exit before loading any model",
+        [](common_params & params, const std::string & value) {
+            params.speculative.concat_selftest = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CONCAT_SELFTEST"));
+    add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
         [](common_params & params, int value) {

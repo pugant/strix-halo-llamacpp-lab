@@ -14,6 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "spec-concat-exclusion.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -24,6 +25,7 @@
 #include <cinttypes>
 #include <ctime>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <filesystem>
 #include <mutex>
@@ -1370,6 +1372,23 @@ private:
             } else {
                 SRV_WRN("spec-route: concat mode disabled: --spec-concat-k1 %d requires dual routing (draft-mtp,draft-dflash) with both drafters loaded - keeping the T7 routing\n",
                         params_base.speculative.concat_k1);
+            }
+        }
+
+        // t8 branch-2: pattern-window exclusion for the concat round
+        // (--spec-concat-exclusion, default enabled). Config + library surface
+        // only for now: the detector ships as the header-only
+        // spec_concat_exclusion namespace, parity-certified against the Python
+        // reference by --spec-concat-selftest; the per-round wiring is the next
+        // task. The marker reports the effective state next to the concat boot
+        // guard - an explicitly disabled exclusion on a configured concat mode
+        // re-exposes the copy-mode collapse the detector prevents, so that
+        // combination logs a WARNING.
+        if (params_base.speculative.concat_k1 > 0) {
+            if (params_base.speculative.concat_exclusion) {
+                SRV_INF("%s", "spec-route: concat exclusion enabled (detector parity gate: --spec-concat-selftest)\n");
+            } else {
+                SRV_WRN("%s", "spec-route: concat exclusion disabled by --no-spec-concat-exclusion - pattern-like (copy-mode) windows keep the concat round\n");
             }
         }
 
@@ -4591,6 +4610,97 @@ private:
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
     }
 };
+
+//
+// t8 branch-2 (gate G1): fixture parity selftest of the C++ concat-exclusion
+// detector against the certified Python reference. The fixtures file is the
+// contract (scripts/t8-b2-detector.py --dump-fixtures): every window carries
+// the expected (gated, segnale) produced by the reference, and this routine
+// must reproduce ALL of them with spec_concat_exclusion::gating(). Pure I/O -
+// called pre-load from main() (no backend init, no model, no inference).
+// Returns 0 on PASS (n/n), 1 on FAIL or unreadable/incompatible fixtures.
+//
+int server_spec_concat_selftest(const std::string & fixtures_path) {
+    std::ifstream f(fixtures_path);
+    if (!f) {
+        fprintf(stderr, "spec-concat-selftest: FAIL cannot open fixtures file '%s'\n", fixtures_path.c_str());
+        return 1;
+    }
+
+    json data;
+    try {
+        data = json::parse(f);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "spec-concat-selftest: FAIL JSON parse error in '%s': %s\n", fixtures_path.c_str(), e.what());
+        return 1;
+    }
+
+    // everything below dereferences the parsed schema (at()/conversions throw
+    // on incomplete or malformed fixtures): a bad fixtures file must FAIL
+    // cleanly, never crash the server with an uncaught exception
+    try {
+        // constants contract: refuse to certify parity against fixtures generated
+        // with different pre-registered constants (they are a different contract)
+        const auto want_const = [&](const char * key, auto value, const char * name) {
+            const auto & j = data.at("constants").at(key);
+            if (j != json(value)) {
+                fprintf(stderr, "spec-concat-selftest: FAIL constants mismatch: %s in '%s' differs from the C++ pre-registered value\n",
+                        name, fixtures_path.c_str());
+                return false;
+            }
+            return true;
+        };
+        if (!want_const("w",         spec_concat_exclusion::W,        "w") ||
+            !want_const("p_min",     spec_concat_exclusion::P_MIN,    "p_min") ||
+            !want_const("p_max",     spec_concat_exclusion::P_MAX,    "p_max") ||
+            !want_const("theta_ac",  spec_concat_exclusion::THETA_AC, "theta_ac") ||
+            !want_const("m",         spec_concat_exclusion::M,        "m")) {
+            return 1;
+        }
+
+        int n_pass = 0;
+        int n_total = 0;
+        for (const auto & fx : data.at("fixtures")) {
+            const std::string id = fx.at("id");
+            const std::vector<llama_token> tokens = fx.at("tokens");
+            const bool want_gated = fx.at("gated");
+            std::string want_segnale; // "" == None in the reference
+            if (!fx.at("segnale").is_null()) {
+                want_segnale = fx.at("segnale");
+            }
+
+            const auto res = spec_concat_exclusion::gating(tokens);
+            const std::string got_segnale(res.segnale ? res.segnale : "");
+
+            n_total++;
+            if (res.gated == want_gated && got_segnale == want_segnale) {
+                n_pass++;
+            } else {
+                fprintf(stderr, "spec-concat-selftest: FAIL fixture '%s': got (%s, \"%s\"), want (%s, \"%s\")\n",
+                        id.c_str(),
+                        res.gated ? "true" : "false", got_segnale.c_str(),
+                        want_gated ? "true" : "false", want_segnale.c_str());
+            }
+        }
+
+        if (n_total == 0) {
+            fprintf(stderr, "spec-concat-selftest: FAIL no fixtures found in '%s'\n", fixtures_path.c_str());
+            return 1;
+        }
+
+        if (n_pass == n_total) {
+            fprintf(stderr, "spec-concat-selftest: PASS %d/%d\n", n_pass, n_total);
+            return 0;
+        }
+        // the summary line is what the lab gating greps: a failed run must say
+        // FAIL here, PASS only on a full pass
+        fprintf(stderr, "spec-concat-selftest: FAIL %d/%d\n", n_pass, n_total);
+        return 1;
+    } catch (const std::exception & e) {
+        fprintf(stderr, "spec-concat-selftest: FAIL malformed fixtures in '%s': %s\n", fixtures_path.c_str(), e.what());
+        return 1;
+    }
+}
 
 //
 // server_context (public API)
