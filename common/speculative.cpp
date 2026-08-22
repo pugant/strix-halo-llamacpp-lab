@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "spec-concat-exclusion.h"
 
 #include <algorithm>
 #include <cassert>
@@ -3102,6 +3103,23 @@ struct common_speculative {
     // t8 stadio 2 (spec §4, Task 6): the temp > 0 single-drafter fallback
     // warning is logged once per session (server lifetime), not per request
     bool concat_temp_fallback_warned = false;
+
+    // t8 branch-2 (spec §3): pattern-window exclusion for the concat round
+    // (--spec-concat-exclusion, default enabled). Inert unless concat rounds
+    // are armed: the gate lives inside the concat branch of
+    // common_speculative_draft(), so a k1 = 0 boot runs none of it
+    // (structural inertia; the bit-identical certification is gate G0 of the
+    // branch-2 plan).
+    bool concat_exclusion = true;
+
+    // t8 branch-2 (spec §3): cumulative exclusion counters - TELEMETRY ONLY:
+    // they feed no decision and no mechanism state (zero hysteresis by
+    // design) and are read as per-request deltas like the impl counters.
+    // total counts the rounds the gate evaluated (concat-eligible windows),
+    // gated the rounds routed down the plain path; both stay zero while the
+    // exclusion flag is off (the gate does not run at all).
+    size_t n_concat_excl_total = 0;
+    size_t n_concat_excl_gated = 0;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3482,6 +3500,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     // observe concat state), so the head tokens travel via dparams::concat_head,
     // backed by this per-seq storage.
     result->concat_k1 = params.concat_k1;
+    result->concat_exclusion = params.concat_exclusion;
     result->concat_head.assign(n_seq, {});
     result->impl_head.assign(n_seq, nullptr);
     if (result->concat_k1 > 0) {
@@ -3728,14 +3747,51 @@ void common_speculative_draft(common_speculative * spec) {
                     }
                     seq_routed.push_back(seq_id);
                 } else {
-                    // concat round: the MTP arm heads it. The arm's effective n_max
-                    // already folds dp.n_max in, so clamping dp.n_max to k1 caps the
-                    // head at k1 tokens; the original per-request value is restored
-                    // right after the call, like the drafting stash below.
-                    seq_concat.push_back(seq_id);
-                    seq_concat_n_max.push_back(dp.n_max);
-                    dp.n_max = dp.n_max >= 0 ? std::min(dp.n_max, spec->concat_k1) : spec->concat_k1;
-                    n_drafting_impl++;
+                    // t8 branch-2 (spec §3): pattern-window exclusion gate - it runs
+                    // BEFORE the round becomes a concat round (the head is published,
+                    // and its injection armed, only through seq_concat below). The
+                    // detector reads the last W confirmed tokens ending at the anchor
+                    // (dp.id_last @ dp.n_past, wiring map section 4.2): the drafting
+                    // prompt tail by pointer plus the anchor token, no per-round copy
+                    // of the slot buffer. A gated (pattern-like / copy-mode) window
+                    // routes the sequence down the PLAIN path - the exact k1 = 0
+                    // behavior for this round: stashed away from this MTP arm like
+                    // any other foreign-drafter sequence (the same mechanism as the
+                    // temp > 0 fallback above), so the draft-dflash arm drafts it
+                    // from the mask placeholder (dp.concat_head stays null: no head
+                    // injection, no "concat round composed" marker, no impl_head
+                    // attribution, no n_concat_rounds bump). Ungated windows compose
+                    // the concat round unchanged. --no-spec-concat-exclusion skips
+                    // the gate entirely (A-noexclusion test arm). The counters below
+                    // are TELEMETRY ONLY (spec §3): they feed no decision and no
+                    // mechanism state.
+                    bool excl_round_gated = false;
+                    if (spec->concat_exclusion && dp.prompt != nullptr) {
+                        const auto & prompt = *dp.prompt;
+                        const auto gres = spec_concat_exclusion::gating(
+                                prompt.data(), prompt.size(), dp.id_last);
+                        spec->n_concat_excl_total++;
+                        if (gres.gated) {
+                            excl_round_gated = true;
+                            spec->n_concat_excl_gated++;
+                            SPC_INF("spec-concat: gated p=%d segnale=%s (seq %d)\n",
+                                    gres.p_best, gres.segnale, (int) seq_id);
+                        }
+                    }
+
+                    if (excl_round_gated) {
+                        // plain round for this sequence in this round (k1 = 0 path)
+                        seq_routed.push_back(seq_id);
+                    } else {
+                        // concat round: the MTP arm heads it. The arm's effective n_max
+                        // already folds dp.n_max in, so clamping dp.n_max to k1 caps the
+                        // head at k1 tokens; the original per-request value is restored
+                        // right after the call, like the drafting stash below.
+                        seq_concat.push_back(seq_id);
+                        seq_concat_n_max.push_back(dp.n_max);
+                        dp.n_max = dp.n_max >= 0 ? std::min(dp.n_max, spec->concat_k1) : spec->concat_k1;
+                        n_drafting_impl++;
+                    }
                 }
             } else {
                 seq_routed.push_back(seq_id);
@@ -4058,5 +4114,22 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+    }
+
+    // t8 branch-2 (spec §3): cumulative concat-exclusion telemetry, printed
+    // next to the per-impl counters above. TELEMETRY ONLY - never a decision
+    // input, never mechanism state (zero hysteresis by design); read as
+    // per-request deltas like the impl counters. total = rounds the gate
+    // evaluated (concat-eligible windows), gated = rounds sent down the plain
+    // path. Double-gated on the same condition the counters accumulate under:
+    // k1 > 0 (a k1 = 0 boot never runs the gate and must not see new
+    // statistics output) AND the exclusion flag on - with the flag off the
+    // gate never runs, the counters stay zero and the line is not printed
+    // (quality review: do not report empty exclusion telemetry).
+    if (spec->concat_k1 > 0 && spec->concat_exclusion) {
+        LOG_INF("statistics %16s: #excl rounds = %6zu, #gated rounds = %5zu\n",
+                "concat-exclusion",
+                spec->n_concat_excl_total,
+                spec->n_concat_excl_gated);
     }
 }

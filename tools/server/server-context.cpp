@@ -1369,26 +1369,29 @@ private:
 
             if (concat_ready) {
                 SRV_INF("spec-route: concat mode k1=%d\n", params_base.speculative.concat_k1);
+
+                // t8 branch-2: pattern-window exclusion for the concat round
+                // (--spec-concat-exclusion, default enabled). The per-round gate
+                // runs inside the concat branch of common_speculative_draft():
+                // a pattern-like (copy-mode) confirmed window takes that round
+                // down the plain draft-dflash path instead of the MTP->DFlash
+                // concat round. The marker is nested inside the concat_ready
+                // guard (Task 5 review): a degraded dual boot never reaches
+                // here, so "concat mode disabled" can no longer be read next to
+                // an exclusion state line. Detector constants are printed from
+                // the header, not re-typed - a registered amendment keeps the
+                // marker truthful. An explicitly disabled exclusion on a
+                // configured concat mode re-exposes the copy-mode collapse the
+                // detector prevents, so that combination logs a WARNING.
+                if (params_base.speculative.concat_exclusion) {
+                    SRV_INF("spec-route: concat exclusion active (theta_ac=%.2f m=%d w=%d)\n",
+                            spec_concat_exclusion::THETA_AC, spec_concat_exclusion::M, spec_concat_exclusion::W);
+                } else {
+                    SRV_WRN("%s", "spec-route: concat exclusion disabled by --no-spec-concat-exclusion - pattern-like (copy-mode) windows keep the concat round\n");
+                }
             } else {
                 SRV_WRN("spec-route: concat mode disabled: --spec-concat-k1 %d requires dual routing (draft-mtp,draft-dflash) with both drafters loaded - keeping the T7 routing\n",
                         params_base.speculative.concat_k1);
-            }
-        }
-
-        // t8 branch-2: pattern-window exclusion for the concat round
-        // (--spec-concat-exclusion, default enabled). Config + library surface
-        // only for now: the detector ships as the header-only
-        // spec_concat_exclusion namespace, parity-certified against the Python
-        // reference by --spec-concat-selftest; the per-round wiring is the next
-        // task. The marker reports the effective state next to the concat boot
-        // guard - an explicitly disabled exclusion on a configured concat mode
-        // re-exposes the copy-mode collapse the detector prevents, so that
-        // combination logs a WARNING.
-        if (params_base.speculative.concat_k1 > 0) {
-            if (params_base.speculative.concat_exclusion) {
-                SRV_INF("%s", "spec-route: concat exclusion enabled (detector parity gate: --spec-concat-selftest)\n");
-            } else {
-                SRV_WRN("%s", "spec-route: concat exclusion disabled by --no-spec-concat-exclusion - pattern-like (copy-mode) windows keep the concat round\n");
             }
         }
 

@@ -364,11 +364,11 @@ struct common_params_speculative {
 
     // t8 branch-2: pattern-window exclusion for the concat round (default
     // enabled; effective only while concat_k1 > 0). The detector
-    // (common/spec-concat-exclusion.h) flags copy-mode windows so the wiring
-    // can send them down the plain round instead of the MTP->DFlash concat
-    // round. Config + library surface only for now - the per-round wiring is
-    // the next task. --no-spec-concat-exclusion re-exposes the copy-mode
-    // collapse (diagnostic escape hatch, logs a WARNING at boot).
+    // (common/spec-concat-exclusion.h) flags copy-mode windows so the per-round
+    // wiring (common_speculative_draft()) sends them down the plain
+    // draft-dflash round instead of the MTP->DFlash concat round.
+    // --no-spec-concat-exclusion re-exposes the copy-mode collapse (diagnostic
+    // escape hatch, logs a WARNING at boot).
     bool concat_exclusion = true;
 
     // t8 branch-2: run the fixture parity selftest of the C++ detector

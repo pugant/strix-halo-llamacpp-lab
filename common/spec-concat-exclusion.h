@@ -30,6 +30,12 @@ constexpr int    M        = 4;   // minimum size of a constant class
 struct gating_result {
     bool        gated;
     const char * segnale; // "ac" | "classe" | "ac+classe", nullptr when not gated
+    // DIAGNOSTIC ONLY - never a decision input, and deliberately NOT part of
+    // the fixture contract (the selftest certifies gated+segnale only): the
+    // period of the best signal - the AC argmax lag when AC fired, otherwise
+    // the period of the constant class found; -1 when not gated. AC argmax
+    // ties resolve to the smallest lag (deterministic).
+    int         p_best;
 };
 
 // section 4.1: lag-p autocorrelation, match count over i in [p, n-1] with
@@ -66,7 +72,13 @@ inline double score_ac(const std::vector<llama_token> & tokens, int p) {
 // (tokens[i] == tokens[i-p]) and the class has at least m positions. The scan
 // starts at i = r + p, so the index r (r < p) is NOT in the class - its
 // comparison tokens[r] vs tokens[r-p] is not valid.
-inline bool has_constant_class(const std::vector<llama_token> & tokens, int m = M) {
+//
+// constant_class_period() below carries the scan and returns the period of
+// the FIRST class found (scan order p asc, r asc), -1 when none exists - it
+// feeds gating_result::p_best. has_constant_class() delegates to it so the
+// decision surface and the diagnostic twin can never drift apart; the scan
+// body is verbatim the certified one.
+inline int constant_class_period(const std::vector<llama_token> & tokens, int m = M) {
     const int n = (int) tokens.size();
     for (int p = P_MIN; p <= P_MAX; ++p) {
         for (int r = 0; r < p; ++r) {
@@ -85,11 +97,18 @@ inline bool has_constant_class(const std::vector<llama_token> & tokens, int m = 
                 }
             }
             if (all_match) {
-                return true;
+                return p;
             }
         }
     }
-    return false;
+    return -1;
+}
+
+// kept as documented surface - no runtime caller after Task 6 (gating() uses
+// constant_class_period() directly); it stays for parity with the Python
+// reference API and the fixtures contract readers.
+inline bool has_constant_class(const std::vector<llama_token> & tokens, int m = M) {
+    return constant_class_period(tokens, m) >= 0;
 }
 
 // section 4.3: the per-round verdict. Windows with fewer than W tokens are
@@ -109,7 +128,7 @@ inline bool has_constant_class(const std::vector<llama_token> & tokens, int m = 
 inline gating_result gating(const std::vector<llama_token> & tokens) {
     const int n = (int) tokens.size();
     if (n < W) {
-        return { false, nullptr };
+        return { false, nullptr, -1 };
     }
 
     bool ac = false;
@@ -117,24 +136,59 @@ inline gating_result gating(const std::vector<llama_token> & tokens) {
     // multiply): a future amendment of THETA_AC must break this build instead
     // of letting the two forms diverge silently
     static_assert(THETA_AC == 0.6, "integer AC comparison hard-codes theta 0.6 - update match*10 > (n-p)*6 together with THETA_AC");
-    for (int p = P_MIN; p <= P_MAX && !ac; ++p) {
+    // diagnostic AC argmax (gating_result::p_best): exact cross-multiplied
+    // score comparison, m_p/(n-p) > m_q/(n-q) as m_p*(n-q) > m_q*(n-p); ties
+    // keep the smallest lag (strict >). Never a decision input - the decision
+    // stays the per-lag integer threshold below.
+    int p_ac_best = -1;
+    int m_ac_best = 0;
+    for (int p = P_MIN; p <= P_MAX; ++p) {
         if (n <= p) {
             continue; // score 0.0, never above theta
         }
-        ac = score_ac_matches(tokens, p) * 10 > (n - p) * 6;
+        const int matches = score_ac_matches(tokens, p);
+        if (matches * 10 > (n - p) * 6) {
+            ac = true;
+        }
+        if (p_ac_best < 0 || matches * (n - p_ac_best) > m_ac_best * (n - p)) {
+            p_ac_best = p;
+            m_ac_best = matches;
+        }
     }
-    const bool classe = has_constant_class(tokens);
+    const int  p_classe = constant_class_period(tokens);
+    const bool classe   = p_classe >= 0;
 
     if (ac && classe) {
-        return { true, "ac+classe" };
+        return { true, "ac+classe", p_ac_best };
     }
     if (ac) {
-        return { true, "ac" };
+        return { true, "ac", p_ac_best };
     }
     if (classe) {
-        return { true, "classe" };
+        return { true, "classe", p_classe };
     }
-    return { false, nullptr };
+    return { false, nullptr, -1 };
+}
+
+// t8 branch-2 (Task 6 wiring): pointer + count + anchor overload for the
+// runtime hot path. The confirmed window is TWO pieces in the caller's
+// buffers: the last confirmed tokens live at the tail of the drafting prompt
+// buffer (tok/n) and the anchor token id_last sits in its own draft-params
+// field at position n_past (wiring map section 4.2) - so the wiring passes
+// the prompt tail by pointer (no per-round copy of the slot buffer) plus the
+// anchor separately. The window handed to the certified vector gating()
+// above is exactly the last W confirmed tokens ending at the anchor; a
+// shorter prompt yields a shorter window, which gating() keeps ungated
+// (section 4.4: short windows are never gated).
+inline gating_result gating(const llama_token * tok, size_t n, llama_token last) {
+    const size_t take = n < (size_t) (W - 1) ? n : (size_t) (W - 1);
+    std::vector<llama_token> window;
+    window.reserve(take + 1);
+    for (size_t i = n - take; i < n; ++i) {
+        window.push_back(tok[i]);
+    }
+    window.push_back(last);
+    return gating(window);
 }
 
 } // namespace spec_concat_exclusion
