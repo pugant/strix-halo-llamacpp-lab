@@ -116,6 +116,7 @@ Transparency is part of the method. These were built, measured, and rejected:
 - **Typical-acceptance MTP decoding** — typical sampling was *always* worse than exact match (best case Δ −0.24). Closed NO-GO.
 - **Reasoning-pressure steering (notice + squeeze)** — [`patches/reasoning-pressure/0010-reasoning-pressure.patch`](patches/reasoning-pressure/0010-reasoning-pressure.patch), design in [`docs/design/2026-08-17-reasoning-pressure-design.md`](docs/design/2026-08-17-reasoning-pressure-design.md). 9/10 runs exhausted the budget anyway, and cache resend broke under pressure. NO-GO, kept for the record.
 - **Thinkingcap budget-aware anchor line** — the anchor line caused quality regressions. NO-GO.
+- **Dual-drafter same-round synergy (T8)** — conditioning the DFlash2 block on the MTP head token, and every follow-up design (pattern exclusion, deeper drafts, a two-root verify tree). Closed by measurement, not fatigue: the full story with all the numbers is in [`docs/research/dual-drafter-synergy.md`](docs/research/dual-drafter-synergy.md). The realized synergy is the per-request **routing** described above.
 
 Negative results are results. They are kept in the repo so nobody (ourselves included) has to re-run them.
 
@@ -296,6 +297,7 @@ llama-server -m Qwen3.8-27B-Q4_0_ROCMFP4_STRIX_LEAN.gguf \
 Flag notes, learned the hard way:
 
 - `--spec-type` takes a **comma-separated list** of draft implementations. There is **no** `--spec-draft-type` flag.
+- `--spec-draft-p-split` is accepted for CLI compatibility but is a **no-op in `llama-server`** — its only consumer is the upstream `examples/speculative` example.
 - The `-k` / `-v` variants floating around in discussions are KV-cache type flags, not drafter selection.
 - In dual mode the server clamps MTP to n-max 6 and DFlash2 to 7 (its block size is 8).
 - The DFlash2 drafter is [`incoai/Qwen3.8-27B-DFlash2-GGUF`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF) (1.9B params; the Q4_K_M file is ≈ 1.1 GB).
