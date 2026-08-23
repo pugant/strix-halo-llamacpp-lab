@@ -38,6 +38,8 @@
 
 Full narrative with all 26 data tables: **[docs/research/dual-drafter-synergy.md](docs/research/dual-drafter-synergy.md)**.
 
+Also in this series: **[ROCmFP3 (Q3_0_ROCMFPX) on Qwen3.8-27B: not a true 3-bit on hybrid gated-deltanet architectures](docs/research/2026-08-23-rocmfp3-quality-speed.md)** — the T5 thread, closed NO-GO: K-quant-protected attention pushes the "3.50 bpw" preset to 4.44/5.72 effective bpw, so there are no bytes to save and tg only pays the K-quant-path tax.
+
 ---
 
 ## ⚠️ Read this first
