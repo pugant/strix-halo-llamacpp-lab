@@ -22,6 +22,24 @@
 
 ---
 
+## 📖 Featured research note
+
+**[Dual-drafter synergy: a research line closed by measurement](docs/research/dual-drafter-synergy.md)** — the full story of our attempt to make two speculative drafters *cooperate inside a single decode round*. The routing server above already runs both drafters, one per request; the bet was to make them cooperate in the same round (condition the DFlash2 block on the MTP head token) for **3–5× the accepted tokens per round**. Seven gated steps later, the whole same-round design space is closed by data — the last step by pure arithmetic: even under *perfect* complementarity between the two chains, no same-round design can meet any positive throughput criterion. The realized synergy is **alternation**: per-request routing, **+19% agentic**, in production since 2026-08-20.
+
+| Design | Closed by | One-line epitaph |
+|---|---|---|
+| Concat, k1=1 (condition block on head) | Phase A gate: 0.831 < 0.90 content-controlled; −27.7% tok/s | The head is accepted 98%; the conditioned block is the problem |
+| …failure mode | Phase 0: copy-at-period, 103/111 increment-slot proposals, 47/47 categorical stops | Not wiring — the drafter clones the pattern item when conditioned |
+| Exclusion (gate the concat off on patterns) | G3: 0.8346 < 0.90 with recovery real (−27.7% → −2.0% tok/s) but ceiling 0.86 | A perfect in-region detector cannot fix windows with non-pattern content |
+| Pooled "value" on residual | Deep-dive: same-slots ratio ≤ 1.0 in 8/9 windows vs pooled 1.36 | The metric was gameable by slot selection |
+| KV-pollution rescue / clean-context value | 2×2 twin: same-slots ratio 0.81 ≤ 1.00, cost 7% tok/s, on the maximally favorable context | The conditioned draft accepts less than plain, pollution or not |
+| Depth (n-max 8/9) | Clamped to 7 by the drafter's trained block size; DF8/DF9 bit-identical to DF7 | Bottleneck is draft length, not acceptance (0.92 conditional at pos 7) |
+| Coverage (two-root tree) | Counterfactual: −20.1% det / −17.6% prose; Fréchet max 7.63 < 8.25 needed (det), 2.96 < 3.02 (prose) | No correlation between the chains can meet any positive criterion |
+
+Full narrative with all 26 data tables: **[docs/research/dual-drafter-synergy.md](docs/research/dual-drafter-synergy.md)**.
+
+---
+
 ## ⚠️ Read this first
 
 Full transparency, before anything else:
