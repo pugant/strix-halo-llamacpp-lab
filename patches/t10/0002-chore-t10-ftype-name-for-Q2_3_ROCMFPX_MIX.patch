@@ -1,0 +1,28 @@
+From 87d7b52bc14c2c113cff3601ab206b8cf3025ce0 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 24 Aug 2026 15:00:45 +0200
+Subject: [PATCH 2/3] chore(t10): ftype name for Q2_3_ROCMFPX_MIX
+
+Add the missing llama_model_ftype_name case so the model loader logs
+file type 118 as Q2_3_ROCMFPX_MIX instead of 'unknown, may not work'.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/llama-model-loader.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index e2b5adefe..0a57364a8 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -54,6 +54,7 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
+         case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT: return "Q8_0_ROCMFPX_AGENT";
+         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN: return "Q6_0_ROCMFPX_LEAN";
+         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN: return "Q6_0_ROCMFPX_AGENT_LEAN";
++        case LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX: return "Q2_3_ROCMFPX_MIX";
+         case LLAMA_FTYPE_MOSTLY_Q4_1:     return "Q4_1";
+         case LLAMA_FTYPE_MOSTLY_Q5_0:     return "Q5_0";
+         case LLAMA_FTYPE_MOSTLY_Q5_1:     return "Q5_1";
+-- 
+2.43.0
+

@@ -1,0 +1,95 @@
+From 8ce2f6f2959e2871cb86984d191e148cc6139b57 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 24 Aug 2026 15:27:36 +0200
+Subject: [PATCH 3/3] feat(t10): Q2_3_ROCMFPX_MIX_V2 variant
+
+Predefined F5-d ppl-gate fallback (plan Task 12): identical routing to
+Q2_3_ROCMFPX_MIX except the 48 fused deltanet attn_qkv projections are
+raised Q3_0_ROCMFPX -> Q4_0_ROCMFP4 (ftypes 118 -> 120). Additive only.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ include/llama.h             |  1 +
+ src/llama-model-loader.cpp  |  1 +
+ src/llama-quant.cpp         | 14 ++++++++++++--
+ tools/quantize/quantize.cpp |  1 +
+ 4 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/include/llama.h b/include/llama.h
+index 925e129c5..6bcc70a87 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -172,6 +172,7 @@ extern "C" {
+         LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN = 117, // ROCmFPx 6-bit agent routing without Q8-heavy boosts
+         LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX      = 118, // ROCmFPx 2/3-bit mix: Q2 FFN, Q3 attn projections
+         LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX          = 119, // ROCmFPx 2-bit S40 codebook + dual UE4M3 scales
++        LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX_V2   = 120, // T10 F5-d fallback: MIX with fused attn_qkv on Q4_0_ROCMFP4
+ 
+         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
+     };
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 0a57364a8..1c1bf54f9 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -55,6 +55,7 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
+         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN: return "Q6_0_ROCMFPX_LEAN";
+         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN: return "Q6_0_ROCMFPX_AGENT_LEAN";
+         case LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX: return "Q2_3_ROCMFPX_MIX";
++        case LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX_V2: return "Q2_3_ROCMFPX_MIX_V2";
+         case LLAMA_FTYPE_MOSTLY_Q4_1:     return "Q4_1";
+         case LLAMA_FTYPE_MOSTLY_Q5_0:     return "Q5_0";
+         case LLAMA_FTYPE_MOSTLY_Q5_1:     return "Q5_1";
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index d8a3d2aa0..33cc6a825 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -497,7 +497,13 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+     // projections, with the STRIX_LEAN protections (attn K/V, token
+     // embeddings, output head, MTP drafter) kept in place.
+     auto rocmfpx_is_q23_mix = [] (llama_ftype ftype) {
+-        return ftype == LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX;
++        return ftype == LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX ||
++               ftype == LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX_V2;
++    };
++    // T10 F5-d predefined fallback (plan Task 12): V2 == MIX with the ONLY
++    // change being the fused attn_qkv raised Q3_0_ROCMFPX -> Q4_0_ROCMFP4.
++    auto rocmfpx_is_q23_mix_v2 = [] (llama_ftype ftype) {
++        return ftype == LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX_V2;
+     };
+     auto rocmfpx_is_q3_family = [&] (llama_ftype ftype) {
+         return ftype == LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX || rocmfpx_is_q3_agent(ftype);
+@@ -718,7 +724,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+             // Mixed 2/3-bit: the fused deltanet QKV projection rides the 3-bit
+             // layout, while attention V (and attn_kv_b, where present) keeps
+             // the dual-scale ROCmFP4 protection used by the STRIX/LEAN recipes.
+-            new_type = category == tensor_category::ATTENTION_QKV ? GGML_TYPE_Q3_0_ROCMFPX : GGML_TYPE_Q4_0_ROCMFP4;
++            // V2 (F5-d fallback): the single delta is QKV itself raised to
++            // Q4_0_ROCMFP4; everything else is byte-identical routing.
++            new_type = (category == tensor_category::ATTENTION_QKV && !rocmfpx_is_q23_mix_v2(ftype))
++                     ? GGML_TYPE_Q3_0_ROCMFPX : GGML_TYPE_Q4_0_ROCMFP4;
+         }
+         else if (rocmfpx_is_q3_family(ftype)) {
+             auto info = layer_from_name(name, qs.model.hparams.n_layer);
+@@ -1251,6 +1260,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
+         case LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX: return GGML_TYPE_Q3_0_ROCMFPX;
+         case LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX: return GGML_TYPE_Q2_0_ROCMFPX;
+         case LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX: return GGML_TYPE_Q2_0_ROCMFPX;
++        case LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX_V2: return GGML_TYPE_Q2_0_ROCMFPX;
+         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX: return GGML_TYPE_Q6_0_ROCMFPX;
+         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN: return GGML_TYPE_Q6_0_ROCMFPX;
+         case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX: return GGML_TYPE_Q8_0_ROCMFPX;
+diff --git a/tools/quantize/quantize.cpp b/tools/quantize/quantize.cpp
+index 46f14962e..205c41631 100644
+--- a/tools/quantize/quantize.cpp
++++ b/tools/quantize/quantize.cpp
+@@ -46,6 +46,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
+     { "Q3_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX,          " 3.50 bpw ROCmFPx experimental, ROCm/Vulkan staging", },
+     { "Q2_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX,          " 2.50 bpw ROCmFPx S40 codebook + dual UE4M3 scales", },
+     { "Q2_3_ROCMFPX_MIX",      LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX,      " ~3.0 bpw ROCmFPx mix: Q2 FFN, Q3 attn, K/V+embd+output protected", },
++    { "Q2_3_ROCMFPX_MIX_V2",   LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX_V2,   " T10 fallback: MIX with fused attn_qkv raised to Q4_0_ROCMFP4", },
+     { "Q6_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX,          " 6.50 bpw ROCmFPx experimental, ROCm/Vulkan staging", },
+     { "Q8_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX,          " 8.25 bpw ROCmFPx experimental, ROCm/Vulkan staging", },
+     { "Q3_0_ROCMFPX_AGENT",    LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT,    " agent/tool-call coherent ROCmFPx Q3 routing", },
+-- 
+2.43.0
+

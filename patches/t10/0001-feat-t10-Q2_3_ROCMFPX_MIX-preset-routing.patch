@@ -1,0 +1,175 @@
+From 7194cb52221f42c2e0d9391a8dee4dbd39967624 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 24 Aug 2026 14:51:11 +0200
+Subject: [PATCH 1/3] feat(t10): Q2_3_ROCMFPX_MIX preset routing
+
+New additive quantize preset (ftype 118) per T10 spec section 6:
+- ffn_up/gate/down -> Q2_0_ROCMFPX (preset base type)
+- attn_qkv/attn_q/attn_output + OTHER attn_gate/ssm_out -> Q3_0_ROCMFPX
+- attn_k/attn_v stay protected on Q4_0_ROCMFP4 (as STRIX_LEAN)
+- token_embd -> Q5_K, output -> Q4_0_ROCMFP4_FAST (explicit branches)
+- nextn.eh_proj and draft-sensitive projections pinned to Q8_0
+- imatrix: standard has_imatrix path, no special casing
+No existing preset routing line is modified (additive only).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ include/llama.h             |  1 +
+ src/llama-quant.cpp         | 60 ++++++++++++++++++++++++++++++++++---
+ tools/quantize/quantize.cpp |  1 +
+ 3 files changed, 58 insertions(+), 4 deletions(-)
+
+diff --git a/include/llama.h b/include/llama.h
+index 46cad043c..925e129c5 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -170,6 +170,7 @@ extern "C" {
+         LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT    = 115, // ROCmFPx 8-bit agent/tool-call coherent routing
+         LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN     = 116, // ROCmFPx 6-bit size/speed-biased routing
+         LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN = 117, // ROCmFPx 6-bit agent routing without Q8-heavy boosts
++        LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX      = 118, // ROCmFPx 2/3-bit mix: Q2 FFN, Q3 attn projections
+         LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX          = 119, // ROCmFPx 2-bit S40 codebook + dual UE4M3 scales
+ 
+         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 76d76c298..d8a3d2aa0 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -493,6 +493,12 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+     auto rocmfpx_is_q8_agent = [] (llama_ftype ftype) {
+         return ftype == LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT;
+     };
++    // T10 mixed 2/3-bit preset: Q2_0_ROCMFPX FFN, Q3_0_ROCMFPX attention
++    // projections, with the STRIX_LEAN protections (attn K/V, token
++    // embeddings, output head, MTP drafter) kept in place.
++    auto rocmfpx_is_q23_mix = [] (llama_ftype ftype) {
++        return ftype == LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX;
++    };
+     auto rocmfpx_is_q3_family = [&] (llama_ftype ftype) {
+         return ftype == LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX || rocmfpx_is_q3_agent(ftype);
+     };
+@@ -614,6 +620,13 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+                       ftype == LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX ||
+                       ftype == LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN) ? GGML_TYPE_Q4_0_ROCMFP4_FAST : GGML_TYPE_Q4_0_ROCMFP4);
+             }
++            else if (rocmfpx_is_q23_mix(ftype)) {
++                // T10 mixed 2/3-bit preset: token embeddings are decode-cold
++                // and stay at Q5_K like STRIX_LEAN; the output head (and the
++                // nextn shared head routed here as OUTPUT) keeps the
++                // single-scale speed layout it uses in the LEAN recipe.
++                new_type = category == tensor_category::TOKEN_EMBD ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_0_ROCMFP4_FAST;
++            }
+             else if (ggml_type rocmfpx_type = rocmfpx_sensitive_tensor_type(ftype); rocmfpx_type < GGML_TYPE_COUNT) {
+                 new_type = rocmfpx_type;
+             }
+@@ -655,6 +668,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+                 new_type = (ftype == LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN ||
+                             ftype == LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN) ? GGML_TYPE_Q5_K : GGML_TYPE_Q6_K;
+             }
++            else if (rocmfpx_is_q23_mix(ftype)) {
++                // Same Q5_K embedding precision as the STRIX_LEAN recipe.
++                new_type = GGML_TYPE_Q5_K;
++            }
+             else if (ggml_type rocmfpx_type = rocmfpx_sensitive_tensor_type(ftype); rocmfpx_type < GGML_TYPE_COUNT) {
+                 new_type = rocmfpx_type;
+             }
+@@ -697,7 +714,13 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+             }
+         }
+     } else if (category_is_attn_v(category)) {
+-        if (rocmfpx_is_q3_family(ftype)) {
++        if (rocmfpx_is_q23_mix(ftype)) {
++            // Mixed 2/3-bit: the fused deltanet QKV projection rides the 3-bit
++            // layout, while attention V (and attn_kv_b, where present) keeps
++            // the dual-scale ROCmFP4 protection used by the STRIX/LEAN recipes.
++            new_type = category == tensor_category::ATTENTION_QKV ? GGML_TYPE_Q3_0_ROCMFPX : GGML_TYPE_Q4_0_ROCMFP4;
++        }
++        else if (rocmfpx_is_q3_family(ftype)) {
+             auto info = layer_from_name(name, qs.model.hparams.n_layer);
+             new_type = rocmfpx_q3_attn_kv_type(info.first, info.second, ftype);
+         }
+@@ -764,7 +787,11 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+         }
+         ++qs.i_attention_wv;
+     } else if (category == tensor_category::ATTENTION_K) {
+-        if (rocmfpx_is_q3_family(ftype)) {
++        if (rocmfpx_is_q23_mix(ftype)) {
++            // The KV path is not touched: dual-scale ROCmFP4 as in LEAN.
++            new_type = GGML_TYPE_Q4_0_ROCMFP4;
++        }
++        else if (rocmfpx_is_q3_family(ftype)) {
+             auto info = layer_from_name(name, qs.model.hparams.n_layer);
+             new_type = rocmfpx_q3_attn_kv_type(info.first, info.second, ftype);
+         }
+@@ -799,7 +826,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+             new_type = GGML_TYPE_IQ2_S;
+         }
+     } else if (category == tensor_category::ATTENTION_Q) {
+-        if (rocmfpx_is_q3_family(ftype)) {
++        if (rocmfpx_is_q23_mix(ftype)) {
++            new_type = GGML_TYPE_Q3_0_ROCMFPX;
++        }
++        else if (rocmfpx_is_q3_family(ftype)) {
+             // Q projection carries arithmetic/reasoning detail; Q5_K is a
+             // small size premium that restores strict JSON following.
+             new_type = rocmfpx_is_q3_agent(ftype) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
+@@ -890,7 +920,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+         }
+         ++qs.i_ffn_down;
+     } else if (category == tensor_category::ATTENTION_OUTPUT) {
+-        if (rocmfpx_is_q3_family(ftype)) {
++        if (rocmfpx_is_q23_mix(ftype)) {
++            new_type = GGML_TYPE_Q3_0_ROCMFPX;
++        }
++        else if (rocmfpx_is_q3_family(ftype)) {
+             new_type = rocmfpx_is_q3_agent(ftype) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
+         }
+         else if (rocmfpx_is_q6_family(ftype)) {
+@@ -1010,6 +1043,24 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+         }
+         ++qs.i_ffn_up;
+     }
++    else if (category == tensor_category::OTHER && rocmfpx_is_q23_mix(ftype)) {
++        // GDN projections that have no dedicated category, plus the drafter
++        // protections for the mixed preset.
++        if (tensor_is_draft_sensitive_projection(name.c_str())) {
++            // eh_proj & friends gate MTP draft-token acceptance. Q2_0_ROCMFPX
++            // is not in the wrapper's bump list, so pin them here explicitly.
++            new_type = GGML_TYPE_Q8_0;
++        }
++        else if (name.find("attn_gate") != std::string::npos ||
++                 name.find("ssm_out")  != std::string::npos) {
++            // qwen35 GDN gating/output projections: 3-bit, like the other
++            // attention projections of this preset.
++            new_type = GGML_TYPE_Q3_0_ROCMFPX;
++        }
++        // Everything else (small ssm_* tensors, misc projections) keeps the
++        // preset base type Q2_0_ROCMFPX, subject to the standard shape
++        // fallback below.
++    }
+ 
+     return new_type;
+ }
+@@ -1199,6 +1250,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
+         case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN: return GGML_TYPE_Q4_0_ROCMFP4_FAST;
+         case LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX: return GGML_TYPE_Q3_0_ROCMFPX;
+         case LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX: return GGML_TYPE_Q2_0_ROCMFPX;
++        case LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX: return GGML_TYPE_Q2_0_ROCMFPX;
+         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX: return GGML_TYPE_Q6_0_ROCMFPX;
+         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN: return GGML_TYPE_Q6_0_ROCMFPX;
+         case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX: return GGML_TYPE_Q8_0_ROCMFPX;
+diff --git a/tools/quantize/quantize.cpp b/tools/quantize/quantize.cpp
+index d6404090a..46f14962e 100644
+--- a/tools/quantize/quantize.cpp
++++ b/tools/quantize/quantize.cpp
+@@ -45,6 +45,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
+     { "Q4_0_ROCMFP4_STRIX_LEAN", LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN, " ~4.38 bpw ROCmFP4 Strix K/V + Q5_K token embeddings", },
+     { "Q3_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX,          " 3.50 bpw ROCmFPx experimental, ROCm/Vulkan staging", },
+     { "Q2_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX,          " 2.50 bpw ROCmFPx S40 codebook + dual UE4M3 scales", },
++    { "Q2_3_ROCMFPX_MIX",      LLAMA_FTYPE_MOSTLY_Q2_3_ROCMFPX_MIX,      " ~3.0 bpw ROCmFPx mix: Q2 FFN, Q3 attn, K/V+embd+output protected", },
+     { "Q6_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX,          " 6.50 bpw ROCmFPx experimental, ROCm/Vulkan staging", },
+     { "Q8_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX,          " 8.25 bpw ROCmFPx experimental, ROCm/Vulkan staging", },
+     { "Q3_0_ROCMFPX_AGENT",    LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT,    " agent/tool-call coherent ROCmFPx Q3 routing", },
+-- 
+2.43.0
+
