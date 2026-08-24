@@ -40,6 +40,8 @@ Full narrative with all 26 data tables: **[docs/research/dual-drafter-synergy.md
 
 Also in this series: **[ROCmFP3 (Q3_0_ROCMFPX) on Qwen3.8-27B: not a true 3-bit on hybrid gated-deltanet architectures](docs/research/2026-08-23-rocmfp3-quality-speed.md)** — the T5 thread, closed NO-GO: K-quant-protected attention pushes the "3.50 bpw" preset to 4.44/5.72 effective bpw, so there are no bytes to save and tg only pays the K-quant-path tax.
 
+And closing the dual-drafter line itself: **[Per-round drafter switching: the twin-run measurement that closed the line](docs/research/per-round-drafter-switching.md)** — the T9 thread. Same-round cooperation (featured above) was closed by measurement; the last untested axis was choosing the drafter *per decode round*. A shadow drafter wired into the server's round loop produced the first public same-round paired dataset for an MTP6/DFlash2 pair (1,433 rounds, published with the note). Two findings close it: acceptance correlation ρ = +0.729 pooled (round difficulty dominates drafter complementarity) and a twin cost of ~83 ms/round to keep the second drafter synchronized — more than an entire MTP round itself, so every per-round oracle loses to the best static drafter by 66-74%. The run's own pre-registered timing gate declared the measurement NO-GO, so the numbers are published as exploratory; per-request routing remains the practical boundary of the two-drafter idea.
+
 ---
 
 ## ⚠️ Read this first
