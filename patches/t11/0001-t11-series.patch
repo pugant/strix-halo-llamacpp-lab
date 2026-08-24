@@ -1,0 +1,1249 @@
+From 6312d00ea95ab077d43ed338d30065e6598ef0bb Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 24 Aug 2026 19:48:35 +0200
+Subject: [PATCH 1/4] feat(t11): draft-chain fused path behind SPEC_DRAFT_FUSED
+ + draft_aborted counter
+
+Leva (b1) del piano T11: il round di drafting MTP collassato in un unico
+grafo chained, dietro env SPEC_DRAFT_FUSED=1 (default OFF = path main
+identico, zero allocazioni per-round aggiuntive; l'unica aggiunta sempre
+attiva e' il contatore draft_aborted, v. sotto).
+
+Route scelta per il graph builder (documentata, alternativa a un builder
+dedicato): il driver in common/speculative.cpp invia un batch sintetico
+causale di N token (N = n_max effettivo; riga 0 = coppia (id_last,
+pending_h), le altre righe servono solo a prenotare celle KV e posizioni
+attraverso il macchinario standard find_slot/mask/set_input) e llama_decode
+lo decodifica col nuovo gtype LLM_GRAPH_TYPE_DECODER_MTP_FUSED. Il gtype -
+non un flag interno al builder - e' parte della chiave di reuse del grafo,
+quindi un grafo fused non puo' mai essere riusato da un decode per-token e
+viceversa, senza logica di reuse nuova. qwen35.cpp graph_mtp costruisce la
+variante fused (unroll N blocchi con wiring in-graph: token successivo =
+get_rows(tok_embd, argmax(logits[k-1])), h = pre-norm hidden di step k-1;
+per-step view di pos/k_idxs/v_idxs/kq_mask; ogni step mantiene le shape
+1-colonna del grafo per-token, quindi stessi kernel di proiezione e stesso
+path di scrittura KV via set_rows). Il corpo del builder legacy e' intatto.
+
+p_min resta host-side (ggml non ha control-flow dati-dipendente): il fused
+calcola tutti gli N step, legge le N righe di logits dopo l'unica sync e le
+percorre con gli STESSI criteri del loop legacy (stessa chiamata
+common_sampler_sample_top_k_probs, stesso ordine sample->id->gate->accept->
+push), quindi token draft e semantica p_min/n_max/n_min sono identici a
+parita' di logits. Drift numerico DICHIARATO (gestito dal content-control
+degli A/B): (1) tie-break greedy su tie esatti di logit = primo indice
+(argmax ggml) invece dell'ordine di partial_sort host; (2) con backend
+sampling attivo il campionamento del drafter passa da catena GPU top-k a
+host (configurazione backend_sampling=0, gia' supportata dal loop legacy) -
+necessario perche' llama_decode rifiuta batch multi-output per sequenze con
+catena backend attached e needs_raw_logits sopprimerebbe il readback dei
+logits; (3) con p_min>0 la coda gia' calcolata degli step abortiti e' sprecata
+(le celle KV extra vengono ripulite dai trim posizionali esistenti).
+
+Envelope del fused (fuori cui fallback al loop legacy): singola sequenza in
+drafting, singola testa MTP allenata, KV proprio non condiviso, arch con
+builder fused (qwen35), n_max in [1, 32] e <= n_batch; anche un fallimento
+di llama_decode ripristina il batch di round e ricade nel loop legacy.
+
+Contatore draft_aborted (DEVIAZIONE DOCUMENTATA dal piano, direttiva
+controller): NON gated su SPEC_DRAFT_FUSED - Step 9.2 lo consuma con FUSED
+off per le pendenze per-k. E' pura osservabilita' (un incremento size_t e un
+campo di log), non tocca il path dati: incrementato al break p_min del loop
+legacy e alla troncatura host-side del fused, esposto come
+'draft_aborted = N' nella riga statistics del drafter.
+
+Ordine build/commit INVERTITO rispetto al piano (direttiva controller): la
+recipe usa git archive HEAD, quindi il commit precede la build.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/speculative.cpp | 151 ++++++++++++++++++++++-
+ src/llama-context.cpp  |  27 ++++-
+ src/llama-context.h    |   2 +
+ src/llama-cparams.h    |   6 +
+ src/llama-ext.h        |  14 +++
+ src/llama-graph.h      |   6 +
+ src/models/models.h    |   8 ++
+ src/models/qwen35.cpp  | 269 ++++++++++++++++++++++++++++++++++++++++-
+ 8 files changed, 478 insertions(+), 5 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 9671f452c..00954445b 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -72,6 +72,19 @@ static float common_speculative_effective_p_min(
+     return std::max(0.0f, std::min(p_min, 1.0f));
+ }
+ 
++// t11 (b1): SPEC_DRAFT_FUSED=1 collapses the MTP draft round into a single
++// chained graph (one submit+sync+readback instead of one per drafted token,
++// see llama_set_mtp_draft_fused and the qwen35 fused graph variant). Read
++// once per process; with the flag absent the drafting path is exactly the
++// legacy per-token loop.
++static bool common_speculative_draft_fused_enabled() {
++    static const bool enabled = [] {
++        const char * var = getenv("SPEC_DRAFT_FUSED");
++        return var != nullptr && std::atoi(var) == 1;
++    }();
++    return enabled;
++}
++
+ struct common_speculative_config {
+     common_speculative_type type;
+     common_params_speculative params;
+@@ -178,6 +191,11 @@ struct common_speculative_impl {
+     size_t n_gen_tokens = 0; // number of tokens generated by this implementation.
+     size_t n_acc_tokens = 0; // number of tokens accepted by the target model.
+ 
++    // t11: draft head-calls dropped by the p_min gate (legacy loop break or
++    // fused host-side truncation). Pure observability - active regardless of
++    // SPEC_DRAFT_FUSED so the per-k slopes can be measured with the flag off.
++    size_t n_draft_aborted = 0;
++
+     std::vector<size_t> n_acc_tokens_per_pos; // number of tokens accepted per draft position.
+ 
+     // TODO: track performance of most recent calls
+@@ -1624,6 +1642,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+     static constexpr int32_t MTP_DRAFT_TOP_K = 10;
+ 
++    // t11 (b1): upper bound on the unrolled fused draft chain (must stay in
++    // sync with the defensive cap of the qwen35 fused graph builder)
++    static constexpr int32_t MTP_FUSED_MAX_STEPS = 32;
++
+     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
+ 
+     llama_batch batch;
+@@ -1762,7 +1784,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+ 
+         // offload draft sampling to the backend
+         backend_chains.assign(n_seq, nullptr);
+-        if (this->params.backend_sampling) {
++        if (this->params.backend_sampling && !common_speculative_draft_fused_enabled()) {
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(MTP_DRAFT_TOP_K));
+@@ -1774,6 +1796,16 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+                 }
+                 backend_chains[seq_id] = chain;
+             }
++        } else if (this->params.backend_sampling) {
++            // t11 (b1): with SPEC_DRAFT_FUSED the draft round submits a
++            // synthetic batch with one output row per drafted step, which
++            // llama_decode rejects for sequences with an attached backend
++            // chain ("at most one output token per sequence"), and the chain
++            // would anyway suppress the raw-logits read-back the fused walk
++            // consumes (needs_raw_logits). Keep the MTP sampling on the host
++            // instead - exactly the backend_sampling=0 configuration, which
++            // the legacy loop already supports for its own fallback rounds.
++            LOG_INF("%s: SPEC_DRAFT_FUSED active: draft sampling kept on the host (no backend chain)\n", __func__);
+         }
+ 
+         char arch_dft[64] = {};
+@@ -2106,6 +2138,104 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+         return true;
+     }
+ 
++    // t11 (b1): one fused draft round for a single drafting sequence. Builds a
++    // synthetic causal batch of n_max rows (row 0 carries the real boundary
++    // pair: dp.id_last + pending_h; the remaining rows only book KV cells and
++    // positions) and decodes it through the staged fused graph, which unrolls
++    // the whole chain in one submit. All n_max logits rows are then read back
++    // with a single sync and walked host-side with the SAME sampler calls and
++    // the SAME p_min/n_max semantics as the legacy loop, so the drafted tokens
++    // are identical for identical logits. Declared drift (content-controlled
++    // in the A/B): the chain's greedy tie-break on exact logit ties follows
++    // ggml argmax (first index) instead of the host partial_sort order, and
++    // any p_min abort wastes the already-computed tail steps (their KV cells
++    // are dropped by the existing position-based trims).
++    //
++    // Returns false when the round was NOT executed (out of the fused
++    // envelope, or the fused decode failed) after restoring the round-start
++    // batch, so the caller can fall back to the legacy per-token loop.
++    bool draft_fused(common_speculative_draft_params_vec & dparams) {
++        llama_seq_id seq_id = -1;
++        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
++            if (drafting[s]) {
++                seq_id = s;
++                break;
++            }
++        }
++        GGML_ASSERT(seq_id >= 0 && "draft_fused called without a drafting sequence");
++
++        auto & dp = dparams[seq_id];
++
++        const int32_t n_max = common_speculative_effective_n_max(params, dp);
++        const int32_t n_b   = (int32_t) llama_n_batch(params.ctx_dft);
++
++        if (n_max <= 0 || n_max > MTP_FUSED_MAX_STEPS || n_max > n_b) {
++            return false;
++        }
++
++        const llama_pos p_next = dp.pos_next >= 0 ? dp.pos_next : dp.n_past;
++        const size_t row_bytes = (size_t) n_embd * sizeof(float);
++
++        common_batch_clear(batch);
++
++        common_speculative_batch_add_one_seq(batch, dp.id_last, p_next, seq_id, true);
++        std::memcpy(batch.embd, pending_h[seq_id].data(), row_bytes);
++
++        for (int32_t k = 1; k < n_max; ++k) {
++            // dummy ids: the fused graph consumes only row 0 of the token input
++            common_speculative_batch_add_one_seq(batch, dp.id_last, p_next + k, seq_id, true);
++            std::memset(batch.embd + (size_t) k * n_embd, 0, row_bytes);
++        }
++
++        llama_set_mtp_draft_fused(params.ctx_dft, true);
++        const int ret = llama_decode(params.ctx_dft, batch);
++        llama_set_mtp_draft_fused(params.ctx_dft, false);
++
++        if (ret != 0) {
++            LOG_WRN("%s: fused llama_decode returned %d - falling back to the per-token loop\n", __func__, ret);
++
++            // restore the round-start batch the legacy loop expects
++            common_batch_clear(batch);
++            common_speculative_batch_add_one_seq(batch, dp.id_last, p_next, seq_id, true);
++            std::memcpy(batch.embd, pending_h[seq_id].data(), row_bytes);
++            i_last[seq_id] = batch.n_tokens - 1;
++
++            return false;
++        }
++
++        const bool log_debug = LOG_LEVEL_DEBUG <= common_log_get_verbosity_thold();
++
++        auto & result = *dp.result;
++        auto * smpl   = smpls[seq_id].get();
++
++        // host-side greedy walk: same order of operations as the legacy loop
++        // (sample top-k -> greedy id -> p_min gate -> accept -> push)
++        for (int32_t k = 0; k < n_max; ++k) {
++            const auto * cur_p = common_sampler_sample_top_k_probs(smpl, params.ctx_dft, k, MTP_DRAFT_TOP_K);
++
++            if (log_debug) {
++                for (int c = 0; c < std::min(3, (int) cur_p->size); ++c) {
++                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
++                            seq_id, c, k, cur_p->data[c].id, cur_p->data[c].p,
++                            common_token_to_piece(params.ctx_dft, cur_p->data[c].id).c_str());
++                }
++            }
++
++            const llama_token id = cur_p->data[0].id;
++
++            if (cur_p->data[0].p < common_speculative_effective_p_min(params, dp)) {
++                n_draft_aborted++; // t11: p_min-gated head-calls (host-side truncation)
++                break;
++            }
++
++            common_sampler_accept(smpl, id, true);
++
++            result.push_back(id);
++        }
++
++        return true;
++    }
++
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
+ 
+@@ -2176,10 +2306,23 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+             return;
+         }
+ 
++        // t11 (b1): SPEC_DRAFT_FUSED collapses the round into one chained
++        // graph (see draft_fused). Envelope: a single drafting sequence, a
++        // single trained MTP head, own (non-shared) KV cache, an arch with a
++        // fused graph builder - anything else keeps the legacy per-token
++        // loop, as does any fused-decode failure.
++        bool fused_done = false;
++
++        if (common_speculative_draft_fused_enabled() &&
++                !chain_heads && !is_mem_shared && n_mtp_layers == 1 && n_drafting == 1 &&
++                llama_model_mtp_draft_fused_supported(llama_get_model(params.ctx_dft))) {
++            fused_done = draft_fused(dparams);
++        }
++
+         int i = 0;
+         const bool log_debug = LOG_LEVEL_DEBUG <= common_log_get_verbosity_thold();
+ 
+-        while (n_drafting > 0) {
++        while (!fused_done && n_drafting > 0) {
+             // each step decodes under a different head, i.e. a different decoder layer, and
+             // KV is per layer. process() filled this layer's KV only for positions < n_past
+             // (prompt + accepted prefix) — nothing in the draft region yet. so reset the
+@@ -2239,6 +2382,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+                 const llama_token id = cur_p->data[0].id;
+ 
+                 if (cur_p->data[0].p < common_speculative_effective_p_min(params, dp)) {
++                    n_draft_aborted++; // t11: p_min-gated head-calls (also with SPEC_DRAFT_FUSED off)
+                     drafting[seq_id] = 0;
+                     n_drafting--;
+                     continue;
+@@ -4105,13 +4249,14 @@ void common_speculative_print_stats(const common_speculative * spec) {
+             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
+         }
+ 
+-        LOG_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
++        LOG_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu, draft_aborted = %6zu%s%s\n",
+                 common_speculative_type_to_str(impl->type).c_str(),
+                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
+                 impl->n_gen_drafts,
+                 impl->n_acc_drafts,
+                 impl->n_gen_tokens,
+                 impl->n_acc_tokens,
++                impl->n_draft_aborted,
+                 str_stats.c_str(),
+                 str_perf.c_str());
+     }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index dc520bde5..14a975b82 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1230,6 +1230,10 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
+     cparams.nextn_layer_offset = offset;
+ }
+ 
++void llama_context::set_mtp_draft_fused(bool value) {
++    cparams.mtp_draft_fused = value;
++}
++
+ void llama_context::set_causal_attn(bool value) {
+     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+ 
+@@ -1947,7 +1951,19 @@ int llama_context::decode(const llama_batch & batch_inp, uint32_t n_ubatch_overr
+ 
+         ggml_status status;
+ 
+-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
++        llm_graph_type gtype = ctx_type_to_graph_type(cparams.ctx_type);
++
++        // t11 (b1): a staged fused draft round decodes through the chained
++        // N-step MTP graph (only archs with a fused builder dispatch it - the
++        // others would silently fall to their main decoder graph). The gtype
++        // change also invalidates graph reuse in both directions (fused vs
++        // per-token topologies must not mix).
++        if (cparams.mtp_draft_fused && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
++                model.arch == LLM_ARCH_QWEN35) {
++            gtype = LLM_GRAPH_TYPE_DECODER_MTP_FUSED;
++        }
++
++        const auto * res = process_ubatch(ubatch, gtype, mctx.get(), status);
+ 
+         if (!res) {
+             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+@@ -3982,6 +3998,15 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
+     ctx->set_nextn_layer_offset(offset);
+ }
+ 
++void llama_set_mtp_draft_fused(llama_context * ctx, bool value) {
++    ctx->set_mtp_draft_fused(value);
++}
++
++bool llama_model_mtp_draft_fused_supported(const llama_model * model) {
++    // the only arch with a fused MTP draft-chain graph variant (qwen35.cpp)
++    return model->arch == LLM_ARCH_QWEN35;
++}
++
+ void llama_set_mtp_speculative_step(int32_t step) {
+     llm_graph_set_mtp_speculative_step(step);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 87fdb0294..19d4d1e19 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -118,6 +118,8 @@ struct llama_context {
+     void set_mtp_source(llama_context * src);
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
++    // t11 (b1): stage the fused MTP draft-chain graph for the next decode(s)
++    void set_mtp_draft_fused(bool value);
+     void set_causal_attn(bool value);
+     void set_warmup(bool value);
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index da55ea6cb..563531562 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -19,6 +19,12 @@ struct llama_cparams {
+ 
+     int32_t  nextn_layer_offset = 0;
+ 
++    // t11 (b1): staged per-call switch selecting the fused MTP draft-chain
++    // graph (LLM_GRAPH_TYPE_DECODER_MTP_FUSED) for the llama_decode calls it
++    // wraps - see llama_set_mtp_draft_fused. Only consulted for MTP contexts;
++    // default false keeps the per-token decode path exactly as before.
++    bool     mtp_draft_fused = false;
++
+     // t8 stadio 2 (spec §3): concat-round head tokens ahead of the dflash noise
+     // block (0 = none). Widens the selector-lattice block cap of the dflash
+     // graph by this many rows (dflash.block_size + k1). Inert elsewhere.
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 66c3d9cbc..4660c0137 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -118,6 +118,20 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t
+ // This is process-thread state rather than context state and defaults to zero.
+ LLAMA_API void llama_set_mtp_speculative_step(int32_t step);
+ 
++// t11 (b1): stage the fused MTP draft-chain graph for the llama_decode call(s)
++// this wraps: one graph computes a whole N-step draft round (the next step's
++// token id is the argmax of the previous step's logits and the h input is
++// wired tensor-to-tensor, so a single submit+sync replaces N of them). The
++// staged batch is a synthetic causal N-token batch for one sequence; only its
++// first token/embd row is consumed by the graph. Restore false right after
++// the decode. Inert on non-MTP contexts.
++LLAMA_API void llama_set_mtp_draft_fused(struct llama_context * ctx, bool value);
++
++// t11 (b1): whether this model's MTP head has a fused draft-chain graph
++// variant (currently qwen35 only). The speculative driver checks this before
++// staging a fused round.
++LLAMA_API bool llama_model_mtp_draft_fused_supported(const struct llama_model * model);
++
+ // mirrors:
+ // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+ LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 4942d5f2f..68e1d6bfa 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -34,6 +34,12 @@ enum llm_graph_type {
+     LLM_GRAPH_TYPE_ENCODER,
+     LLM_GRAPH_TYPE_DECODER,
+     LLM_GRAPH_TYPE_DECODER_MTP,
++    // t11 (b1): the fused N-step MTP draft chain - one graph computes a whole
++    // draft round (next token = argmax of the previous step's logits, h wired
++    // tensor-to-tensor). A distinct gtype rather than a builder-internal flag
++    // because the gtype is part of the graph-reuse key: a fused graph must
++    // never be reused for a per-token MTP decode and vice versa.
++    LLM_GRAPH_TYPE_DECODER_MTP_FUSED,
+ };
+ 
+ enum llm_ffn_op_type {
+diff --git a/src/models/models.h b/src/models/models.h
+index c02fc18f8..2bf5fcf42 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1931,6 +1931,14 @@ struct llama_model_qwen35 : public llama_model_base {
+ 
+     struct graph_mtp : public llm_graph_context {
+         graph_mtp(const llama_model & model, const llm_graph_params & params);
++    private:
++        // t11 (b1): fused draft chain - unrolls the MTP block n_tokens times in
++        // a single graph with the step-to-step wiring in-graph (next token id =
++        // argmax of the previous step's logits via get_rows on the token
++        // embedding, h input = the previous step's pre-norm hidden state).
++        // Only the first row of the batch inputs (token + h boundary) is
++        // consumed; the remaining rows feed positions/KV-slot booking only.
++        void build_fused(const llama_model & model, int il, int * sections, int64_t n_embd_head);
+     };
+ 
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 3b56e4c9f..9e25300a3 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "llama-kv-cache.h"
+ #include "llama-memory-recurrent.h"
+ 
+ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+@@ -130,7 +131,8 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+ }
+ 
+ std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const llm_graph_params & params) const {
+-    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
++    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP ||
++        params.gtype == LLM_GRAPH_TYPE_DECODER_MTP_FUSED) {
+         return std::make_unique<graph_mtp>(*this, params);
+     }
+     return std::make_unique<graph>(*this, params);
+@@ -509,6 +511,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     int sections[4];
+     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+ 
++    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP_FUSED) {
++        build_fused(model, il, sections, n_embd_head);
++        return;
++    }
++
+     auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+ 
+     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+@@ -632,3 +639,263 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     res->t_logits = cur;
+     ggml_build_forward_expand(gf, cur);
+ }
++
++// t11 (b1): local copy of ggml_mul_mat_aux (file-local in llama-graph.cpp) -
++// the KV-cache rotation-compensation view used by llm_graph_context::build_attn
++static ggml_tensor * ggml_mul_mat_aux_mtp(
++        ggml_context * ctx,
++        ggml_tensor * cur,
++        ggml_tensor * rot) {
++    const auto n = rot->ne[0];
++
++    ggml_tensor * res;
++
++    if (!ggml_is_contiguous(cur)) {
++        res = ggml_cont_2d   (ctx, cur, n, ggml_nelements(cur)/n);
++    } else {
++        res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
++    }
++    res = ggml_mul_mat   (ctx, rot, res);
++    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
++    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
++
++    return res;
++}
++
++// t11 (b1): the per-token MTP draft loop pays one submit+sync+readback per
++// drafted token because each step's input (greedy token id + h row) only
++// exists on the host after reading the previous step's outputs. This variant
++// unrolls the block n_tokens times inside ONE graph and keeps that wiring
++// in-graph, so a whole draft round costs a single submit+sync+readback:
++//
++//   step 0: token = batch token row 0,  h = batch embd row 0   (host inputs)
++//   step k: token = get_rows(tok_embd, argmax(logits[k-1])),   (in-graph)
++//           h     = pre-norm hidden state of step k-1           (tensor wiring)
++//
++// Each step keeps the exact shapes of the per-token graph (1-column
++// matmuls, one KV row written through the shared set_rows inputs, one
++// causal mask column), so projection kernels and the KV write path are
++// unchanged; only the number of host round-trips changes (N -> 1). ggml has
++// no data-dependent control flow, so all n_tokens steps are computed
++// unconditionally: the p_min early stop stays on the host (it truncates the
++// read-back logits rows), and the existing position-based KV trims drop
++// whatever tail cells the unused steps wrote.
++//
++// Outputs: t_logits [n_vocab, n_steps] (one column per step, gathered by the
++// out_ids input exactly like the standard graph when n_steps == n_tokens)
++// and t_h_pre_norm [n_embd, n_steps] (the per-step boundary rows the legacy
++// loop would have read back to feed the next step).
++//
++// Only row 0 of the token/embd batch inputs is consumed: the draft driver
++// submits a synthetic causal batch whose remaining rows exist to book KV
++// cells and positions through the standard find_slot/mask machinery.
++void llama_model_qwen35::graph_mtp::build_fused(const llama_model & model, int il, int * sections, int64_t n_embd_head) {
++    const auto & layer = model.layers[il];
++
++    // defensive cap: the graph must stay within the reserved node budget even
++    // if a reserve pass ever ran while the fused flag is staged (it does not,
++    // in practice - the driver only stages the flag around draft decodes)
++    const int64_t n_steps = std::min<int64_t>(n_tokens, 64);
++
++    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
++
++    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++    ggml_set_input(inp->tokens);
++
++    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
++    ggml_set_input(inp->embd);
++    ggml_set_name(inp->embd, "mtp_h_input");
++
++    ggml_tensor * inp_tokens = inp->tokens;
++    ggml_tensor * h_input    = inp->embd;
++
++    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
++
++    res->add_input(std::move(inp));
++
++    ggml_tensor * inp_pos = build_inp_pos();
++    auto * inp_attn       = build_attn_inp_kv();
++
++    // step 0 inputs: the real (token, h) boundary pair from the host
++    ggml_tensor * tok = ggml_view_1d(ctx0, inp_tokens, 1, 0);
++    ggml_tensor * h_in = ggml_view_2d(ctx0, h_input, hparams.n_embd, 1, h_input->nb[1], 0);
++
++    const int64_t n_pos = hparams.n_pos_per_embd();
++
++    ggml_tensor * v_idxs_all = inp_attn->get_v_idxs();
++    const int64_t v_rows_per_tok = v_idxs_all->ne[0] / n_tokens;
++    ggml_tensor * kq_mask_all    = inp_attn->get_kq_mask();
++
++    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
++            ? layer.nextn.shared_head_norm
++            : model.output_norm;
++    GGML_ASSERT(head_norm_w && "QWEN35 MTP: missing both nextn.shared_head_norm and output_norm");
++
++    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
++    GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
++
++    ggml_tensor * h_cat      = nullptr; // [n_embd, k+1] per-step boundary rows
++    ggml_tensor * logits_cat = nullptr; // [n_vocab, k+1] per-step logits
++
++    for (int64_t k = 0; k < n_steps; ++k) {
++        ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, tok);
++        cb(tok_embd, "mtp_tok_embd", il);
++
++        ggml_tensor * h_norm = build_norm(h_in, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
++        cb(h_norm, "mtp_hnorm", il);
++
++        ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
++        cb(e_norm, "mtp_enorm", il);
++
++        ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
++        cb(concat, "mtp_concat", il);
++
++        ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat);
++        cb(cur, "mtp_eh_proj", il);
++
++        ggml_tensor * inpSA = cur;
++
++        cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++        cb(cur, "mtp_attn_norm", il);
++
++        ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
++        cb(Qcur_full, "mtp_Qcur_full", il);
++
++        ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full,
++                n_embd_head, n_head, 1,
++                ggml_element_size(Qcur_full) * n_embd_head * 2,
++                ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
++                0);
++        Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
++        cb(Qcur, "mtp_Qcur_normed", il);
++
++        ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full,
++                n_embd_head, n_head, 1,
++                ggml_element_size(Qcur_full) * n_embd_head * 2,
++                ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
++                ggml_element_size(Qcur_full) * n_embd_head);
++        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, 1);
++        cb(gate, "mtp_gate", il);
++
++        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
++        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, 1);
++        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
++        cb(Kcur, "mtp_Kcur_normed", il);
++
++        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
++        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, 1);
++        cb(Vcur, "mtp_Vcur", il);
++
++        ggml_tensor * pos_k = ggml_view_1d(ctx0, inp_pos, n_pos, k*n_pos*inp_pos->nb[0]);
++
++        Qcur = ggml_rope_multi(ctx0, Qcur, pos_k, nullptr,
++                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
++                ext_factor, attn_factor, beta_fast, beta_slow);
++        Kcur = ggml_rope_multi(ctx0, Kcur, pos_k, nullptr,
++                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
++                ext_factor, attn_factor, beta_fast, beta_slow);
++
++        // per-step attention: one KV row write + one causal mask column
++        // (mirrors llm_graph_context::build_attn for the kv-cache input)
++        const auto * mctx_cur = inp_attn->mctx;
++
++        if (inp_attn->self_k_rot) {
++            Qcur = ggml_mul_mat_aux_mtp(ctx0, Qcur, inp_attn->self_k_rot);
++            Kcur = ggml_mul_mat_aux_mtp(ctx0, Kcur, inp_attn->self_k_rot);
++        }
++
++        if (inp_attn->self_v_rot) {
++            Vcur = ggml_mul_mat_aux_mtp(ctx0, Vcur, inp_attn->self_v_rot);
++        }
++
++        // these nodes are added to the graph together so that they are not reordered
++        // by doing so, the number of splits in the graph is reduced
++        ggml_build_forward_expand(gf, Qcur);
++        ggml_build_forward_expand(gf, Vcur);
++        ggml_build_forward_expand(gf, Kcur);
++
++        {
++            ggml_tensor * k_idxs_k = ggml_view_1d(ctx0, inp_attn->get_k_idxs(), 1, k*inp_attn->get_k_idxs()->nb[0]);
++            ggml_tensor * v_idxs_k = ggml_view_1d(ctx0, v_idxs_all, v_rows_per_tok, k*v_rows_per_tok*v_idxs_all->nb[0]);
++
++            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, k_idxs_k, il));
++            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, v_idxs_k, il));
++        }
++
++        const float kq_scale = hparams.f_attention_scale == 0.0f
++                ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
++
++        ggml_tensor * kq_mask_k = ggml_view_2d(ctx0, kq_mask_all,
++                kq_mask_all->ne[0], 1, kq_mask_all->nb[1], k*kq_mask_all->nb[1]);
++
++        cur = build_attn_mha(
++            /* q        */ Qcur,
++            /* k        */ mctx_cur->get_k(ctx0, il),
++            /* v        */ mctx_cur->get_v(ctx0, il),
++            /* kq_b     */ nullptr,
++            /* kq_mask  */ kq_mask_k,
++            /* sinks    */ nullptr,
++            /* v_mla    */ nullptr,
++                         kq_scale, il);
++        cb(cur, "kqv_out", il);
++
++        if (inp_attn->self_v_rot) {
++            cur = ggml_mul_mat_aux_mtp(ctx0, cur, inp_attn->self_v_rot);
++        }
++
++        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
++        cur = build_lora_mm(layer.wo, cur, layer.wo_s);
++        cb(cur, "mtp_attn_out", il);
++
++        cur = ggml_add(ctx0, cur, inpSA);
++        cb(cur, "mtp_attn_residual", il);
++
++        ggml_tensor * ffn_residual = cur;
++        cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
++        cb(cur, "mtp_attn_post_norm", il);
++
++        cur = build_ffn(cur,
++                layer.ffn_up,   nullptr, layer.ffn_up_s,
++                layer.ffn_gate, nullptr, layer.ffn_gate_s,
++                layer.ffn_down, nullptr, layer.ffn_down_s,
++                nullptr,
++                LLM_FFN_SILU, LLM_FFN_PAR, il);
++        cb(cur, "mtp_ffn_out", il);
++
++        cur = ggml_add(ctx0, cur, ffn_residual);
++        cb(cur, "mtp_post_ffn", il);
++
++        cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
++        cb(cur, "h_nextn", -1);
++
++        ggml_tensor * logits = build_lora_mm(head_w, cur);
++        cb(logits, "result_output", -1);
++
++        h_cat      = h_cat      ? ggml_concat(ctx0, h_cat,      cur,    /*dim=*/ 1) : cur;
++        logits_cat = logits_cat ? ggml_concat(ctx0, logits_cat, logits, /*dim=*/ 1) : logits;
++
++        if (k + 1 < n_steps) {
++            // chain the next step's inputs in-graph (the core of the fusion)
++            tok  = ggml_argmax(ctx0, logits);
++            h_in = cur;
++        }
++    }
++
++    res->t_h_pre_norm = h_cat;
++
++    ggml_tensor * out = logits_cat;
++
++    if (n_steps == n_tokens) {
++        // all fused batch rows carry logits=1, so out_ids is the identity -
++        // the gather is kept for structural parity with the standard graph
++        ggml_tensor * inp_out_ids = build_inp_out_ids();
++        out = ggml_get_rows(ctx0, logits_cat, inp_out_ids);
++    }
++
++    res->t_logits = out;
++
++    // t_h_pre_norm is not on the logits path: expand it explicitly so the
++    // concat stays in the graph (the context extracts it as an output)
++    ggml_build_forward_expand(gf, h_cat);
++    ggml_build_forward_expand(gf, out);
++}
+-- 
+2.43.0
+
+
+From 866d92dcb5855232a7f38da5f5a3e0b1aeacde62 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 24 Aug 2026 20:20:30 +0200
+Subject: [PATCH 2/4] fix(t11): fused draft marker format + envelope guards +
+ exception safety
+
+Review follow-up del commit 6312d00ea (verdetto WITH FIXES, nessun
+Critical, cinque fix - tutte in common/speculative.cpp tranne l'assert
+difensivo in qwen35.cpp; nessuna tocca il path dati):
+
+1. marker: la riga statistics ora stampa 'draft_aborted=%6zu' (senza spazi
+   attorno a '=') - il gate del piano grep-a 'draft_aborted=' nei log.
+
+2. envelope: il reject del fused round ora include anche n_max >
+   llama_n_ubatch(ctx_dft). Un decode spezzato in piu' ubatch eseguirebbe
+   un grafo fused per ubatch e i successivi riavvierebbero la catena da
+   una riga dummy h azzerata: draft silenziosamente sbagliati invece che
+   crash (falso NO-GO di misura). Pattern idiomatico del drafter sibling.
+
+3. exception safety: la stage/unstage di mtp_draft_fused attorno a
+   llama_decode ora passa da un piccolo scope guard: llama_decode puo'
+   lanciare (sched_reserve), e il flag rimasto staged farebbe prendere il
+   gtype fused al prossimo decode di ctx_dft (un mirror di process()).
+
+4. provenance A/B: LOG_WRN once-per-process ai due siti di reject
+   dell'envelope + marker once-per-process 'SPEC_DRAFT_FUSED engaged' al
+   primo round fused eseguito: i log di Task 6 provano l'engagement reale
+   (il boot-log del ctor prova solo che l'env e' stato letto).
+
+5. assert difensivo: commento di MTP_FUSED_MAX_STEPS riscritto
+   sull'invariante reale (driver_cap <= builder_cap); il builder qwen35
+   ora GGML_ASSERT-a n_tokens <= 64 e la gather out_ids e' incondizionata
+   - il truncation path silenzioso (over-read trap) non esiste piu'.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/speculative.cpp | 62 +++++++++++++++++++++++++++++++++++-------
+ src/models/qwen35.cpp  | 29 ++++++++++----------
+ 2 files changed, 66 insertions(+), 25 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 00954445b..6cbb91513 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1642,8 +1642,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+     static constexpr int32_t MTP_DRAFT_TOP_K = 10;
+ 
+-    // t11 (b1): upper bound on the unrolled fused draft chain (must stay in
+-    // sync with the defensive cap of the qwen35 fused graph builder)
++    // t11 (b1): upper bound on the unrolled fused draft chain. Real invariant:
++    // this must stay <= the defensive cap of the qwen35 fused graph builder
++    // (64 there, which asserts n_tokens within it) - the builder hard-fails
++    // rather than silently building a truncated chain.
+     static constexpr int32_t MTP_FUSED_MAX_STEPS = 32;
+ 
+     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
+@@ -2168,8 +2170,18 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+ 
+         const int32_t n_max = common_speculative_effective_n_max(params, dp);
+         const int32_t n_b   = (int32_t) llama_n_batch(params.ctx_dft);
+-
+-        if (n_max <= 0 || n_max > MTP_FUSED_MAX_STEPS || n_max > n_b) {
++        const int32_t n_ub  = (int32_t) llama_n_ubatch(params.ctx_dft);
++
++        if (n_max <= 0 || n_max > MTP_FUSED_MAX_STEPS || n_max > n_b || n_max > n_ub) {
++            // n_ubatch included: a split decode would run one fused graph per
++            // ubatch and the later ones would silently restart the chain from
++            // a zeroed-h dummy row (wrong drafts, not a crash)
++            static bool warned = false;
++            if (!warned) {
++                warned = true;
++                LOG_WRN("%s: SPEC_DRAFT_FUSED: n_max=%d outside the fused envelope (cap=%d, n_batch=%d, n_ubatch=%d) - using the legacy per-token loop\n",
++                        __func__, n_max, MTP_FUSED_MAX_STEPS, n_b, n_ub);
++            }
+             return false;
+         }
+ 
+@@ -2187,9 +2199,16 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+             std::memset(batch.embd + (size_t) k * n_embd, 0, row_bytes);
+         }
+ 
++        // t11 review: llama_decode can throw (sched_reserve paths) - never let
++        // the flag stay staged or the next ctx_dft decode (a process() mirror
++        // batch) would silently take the fused graph type
++        struct mtp_draft_fused_stage {
++            llama_context * ctx;
++            ~mtp_draft_fused_stage() { llama_set_mtp_draft_fused(ctx, false); }
++        } stage{params.ctx_dft};
++
+         llama_set_mtp_draft_fused(params.ctx_dft, true);
+         const int ret = llama_decode(params.ctx_dft, batch);
+-        llama_set_mtp_draft_fused(params.ctx_dft, false);
+ 
+         if (ret != 0) {
+             LOG_WRN("%s: fused llama_decode returned %d - falling back to the per-token loop\n", __func__, ret);
+@@ -2203,6 +2222,18 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+             return false;
+         }
+ 
++        {
++            // once-per-process engagement marker: proves in the smoke/A-B logs
++            // that rounds actually took the fused path (the ctor boot-log only
++            // proves the flag was read)
++            static bool engaged = false;
++            if (!engaged) {
++                engaged = true;
++                LOG_INF("%s: SPEC_DRAFT_FUSED engaged: first fused draft round executed (n_max=%d, seq %d)\n",
++                        __func__, n_max, (int) seq_id);
++            }
++        }
++
+         const bool log_debug = LOG_LEVEL_DEBUG <= common_log_get_verbosity_thold();
+ 
+         auto & result = *dp.result;
+@@ -2313,10 +2344,21 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+         // loop, as does any fused-decode failure.
+         bool fused_done = false;
+ 
+-        if (common_speculative_draft_fused_enabled() &&
+-                !chain_heads && !is_mem_shared && n_mtp_layers == 1 && n_drafting == 1 &&
+-                llama_model_mtp_draft_fused_supported(llama_get_model(params.ctx_dft))) {
+-            fused_done = draft_fused(dparams);
++        if (common_speculative_draft_fused_enabled()) {
++            if (!chain_heads && !is_mem_shared && n_mtp_layers == 1 && n_drafting == 1 &&
++                    llama_model_mtp_draft_fused_supported(llama_get_model(params.ctx_dft))) {
++                fused_done = draft_fused(dparams);
++            } else {
++                // once-per-process: a config that never enters the envelope must
++                // not look "fused" in the logs while it measures the legacy loop
++                static bool warned = false;
++                if (!warned) {
++                    warned = true;
++                    LOG_WRN("%s: SPEC_DRAFT_FUSED active but this round is outside the fused envelope (n_drafting=%d, chain_heads=%d, is_mem_shared=%d, n_mtp_layers=%d, arch_supported=%d) - using the legacy per-token loop\n",
++                            __func__, n_drafting, (int) chain_heads, (int) is_mem_shared, n_mtp_layers,
++                            (int) llama_model_mtp_draft_fused_supported(llama_get_model(params.ctx_dft)));
++                }
++            }
+         }
+ 
+         int i = 0;
+@@ -4249,7 +4291,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
+             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
+         }
+ 
+-        LOG_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu, draft_aborted = %6zu%s%s\n",
++        LOG_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu, draft_aborted=%6zu%s%s\n",
+                 common_speculative_type_to_str(impl->type).c_str(),
+                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
+                 impl->n_gen_drafts,
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 9e25300a3..cc771d413 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -682,9 +682,9 @@ static ggml_tensor * ggml_mul_mat_aux_mtp(
+ // whatever tail cells the unused steps wrote.
+ //
+ // Outputs: t_logits [n_vocab, n_steps] (one column per step, gathered by the
+-// out_ids input exactly like the standard graph when n_steps == n_tokens)
+-// and t_h_pre_norm [n_embd, n_steps] (the per-step boundary rows the legacy
+-// loop would have read back to feed the next step).
++// out_ids input exactly like the standard graph) and t_h_pre_norm
++// [n_embd, n_steps] (the per-step boundary rows the legacy loop would have
++// read back to feed the next step).
+ //
+ // Only row 0 of the token/embd batch inputs is consumed: the draft driver
+ // submits a synthetic causal batch whose remaining rows exist to book KV
+@@ -692,10 +692,13 @@ static ggml_tensor * ggml_mul_mat_aux_mtp(
+ void llama_model_qwen35::graph_mtp::build_fused(const llama_model & model, int il, int * sections, int64_t n_embd_head) {
+     const auto & layer = model.layers[il];
+ 
+-    // defensive cap: the graph must stay within the reserved node budget even
+-    // if a reserve pass ever ran while the fused flag is staged (it does not,
+-    // in practice - the driver only stages the flag around draft decodes)
+-    const int64_t n_steps = std::min<int64_t>(n_tokens, 64);
++    // defensive cap: the driver only stages the fused graph with
++    // n_max <= MTP_FUSED_MAX_STEPS (32, which must stay <= this cap). Assert
++    // loudly on a longer chain instead of silently truncating it: the out_ids
++    // gather below indexes logits_cat with values up to n_outputs-1 <
++    // n_tokens, so a truncated chain would over-read.
++    GGML_ASSERT(n_tokens <= 64 && "fused MTP draft chain longer than the builder cap");
++    const int64_t n_steps = n_tokens;
+ 
+     auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+ 
+@@ -883,14 +886,10 @@ void llama_model_qwen35::graph_mtp::build_fused(const llama_model & model, int i
+ 
+     res->t_h_pre_norm = h_cat;
+ 
+-    ggml_tensor * out = logits_cat;
+-
+-    if (n_steps == n_tokens) {
+-        // all fused batch rows carry logits=1, so out_ids is the identity -
+-        // the gather is kept for structural parity with the standard graph
+-        ggml_tensor * inp_out_ids = build_inp_out_ids();
+-        out = ggml_get_rows(ctx0, logits_cat, inp_out_ids);
+-    }
++    // all fused batch rows carry logits=1, so out_ids is the identity -
++    // the gather is kept for structural parity with the standard graph
++    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * out = ggml_get_rows(ctx0, logits_cat, inp_out_ids);
+ 
+     res->t_logits = out;
+ 
+-- 
+2.43.0
+
+
+From 517afc7cc5ad3b54f90e6e14e5bc7038fb0d3985 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 24 Aug 2026 21:17:31 +0200
+Subject: [PATCH 3/4] feat(t11): vulkan verify dispatch switch 2-9 cols behind
+ GGML_VK_VERIFY_SWITCH
+
+Leva (a) del piano T11 (hook verificati nel report F0, sezione "Leva (a)").
+Un mul_mat quantizzato con N = dst->ne[1] in 2..9 e batch 1 oggi va SEMPRE
+sul ramo VEC (DMMV, soglia mul_mat_vec_max_cols=16 a :324); il verify MTP
+a n6 sta in quella forbice. HIP fa lo stesso crossover a ne11>8 (MMVQ->MMQ);
+su Vulkan non esisteva pino equivalente.
+
+Env GGML_VK_VERIFY_SWITCH (getenv UNA volta alla creazione del device,
+campo vk_device_struct::verify_switch accanto a mmvq_mode, pattern del
+backend; boot marker `vk-verify-switch active (mode=...)` via GGML_LOG_INFO):
+
+- "=1" (default del flag, alias "f32acc" e qualsiasi altro valore non vuoto):
+  devia al dispatch batched (ggml_vk_mul_mat_q_f16) FORZANDO la pipeline
+  .f32acc per quel nodo: skip della preferenza MMQ q8_1 (quantize_y) +
+  esito selettore non-.f16acc via GGML_PREC_F32. NOTA (F0 [corr. review]):
+  la ricetta .f32acc e' in AND-form - prec != DEFAULT da solo NON bypassa
+  quantize_y finche' integer-dot e' attivo, quindi il bypass agisce su
+  entrambi i punti, per-call (il selettore condiviso NON e' toccato e gli
+  altri mul_mat passano il loro op_params[0] come prima).
+- "=mmq": stessa deviazione ma selezione batched NATURALE (su RADV ->
+  MMQ q8_1, attivazioni quantizzate: stessa numerica che il backend usa
+  oggi per ne11>16; drift dichiarato piu' ampio, zero chirurgia).
+
+NESSUNA inversione del default: "=1" = f32acc forzato (primario, come da
+spec), "=mmq" = naturale. Non e' stato necessario toccare il selettore
+condiviso, quindi il fallback "=1 -> naturale / =f32acc -> forzato" del
+controller non serve.
+
+Righe toccate oltre al ramo di dispatch (tutte in ggml-vulkan.cpp):
+- firma di ggml_vk_mul_mat_q_f16: + bool force_f32acc = false (default
+  arg; gli altri 2 call-site invariati);
+- inizializzatore quantize_y: prefisso !force_f32acc;
+- le 3 chiamate al selettore usano la locale `prec` (= GGML_PREC_F32 solo
+  quando force_f32acc, altrimenti dst->op_params[0] come prima).
+
+Guard rail: la deviazione avviene SOLO se la pipeline batched di
+destinazione esiste per src0->type (lookup speculare ai primi due tentativi
+del callee, gate ggml_is_quantized + src0 dim01-contiguo); altrimenti resta
+VEC con LOG_WRN una tantum. Il LEAN e' un mix {100,101}: entrambi i tipi
+hanno pipeline batched q8_1 + .f16acc/.f32acc (CREATE_MMQ/CREATE_MM2,
+verificato). Default OFF = bit-identico a main: il dispatch cortocircuita
+sul campo device, il callee riceve false e valuta le stesse espressioni.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 92 +++++++++++++++++++++++++---
+ 1 file changed, 85 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 5392e2e2a..c76bd28f1 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -704,6 +704,11 @@ struct vk_device_struct {
+     // 0: default, 1: force mmvq, -1: disable mmvq
+     int32_t mmvq_mode;
+ 
++    // T11 leva (a): 0: off, 1: divert verify-sized quantized mul_mats (N=2..9) from the VEC
++    // dispatch to the batched MMQ dispatch with forced .f32acc pipeline,
++    // 2: same divert but natural batched selection (MMQ q8_1 on integer-dot devices).
++    int32_t verify_switch;
++
+     bool subgroup_size_control;
+     uint32_t subgroup_min_size;
+     uint32_t subgroup_max_size;
+@@ -6449,6 +6454,20 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             device->mmvq_mode = 1;
+         }
+ 
++        // T11 leva (a): divert quantized mul_mats with 2..9 rows (batch 1) from the VEC
++        // (DMMV) dispatch to the batched MMQ dispatch, behind GGML_VK_VERIFY_SWITCH.
++        // "mmq" = natural batched selection (MMQ q8_1 on integer-dot devices, same numerics
++        // as ne11 > mul_mat_vec_max_cols today); any other non-empty value ("1"/"f32acc") =
++        // force the .f32acc pipeline for the diverted nodes. Default (unset) = off.
++        device->verify_switch = 0;
++        if (const char * vk_verify_switch_env = getenv("GGML_VK_VERIFY_SWITCH")) {
++            if (vk_verify_switch_env[0] != '\0') {
++                device->verify_switch = strcmp(vk_verify_switch_env, "mmq") == 0 ? 2 : 1;
++                GGML_LOG_INFO("ggml_vulkan: vk-verify-switch active (mode=%s): quantized mul_mat N=2..9 diverted to batched MMQ dispatch\n",
++                              device->verify_switch == 2 ? "mmq" : "f32acc");
++            }
++        }
++
+         return device;
+     }
+ 
+@@ -8695,7 +8714,7 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
+     return pipeline;
+ }
+ 
+-static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
++static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k, bool force_f32acc = false) {
+     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
+     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
+     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
+@@ -8751,14 +8770,18 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+ 
+     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
+ 
+-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
++    // T11 leva (a): force_f32acc (diverted verify nodes, GGML_VK_VERIFY_SWITCH=1/f32acc) skips
++    // the MMQ q8_1 preference (quantize_y ignores prec) and requests a non-.f16acc selector
++    // outcome via GGML_PREC_F32 for this node only.
++    bool quantize_y = !force_f32acc && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
++    const ggml_prec prec = force_f32acc ? GGML_PREC_F32 : (ggml_prec)dst->op_params[0];
+ 
+     // Check for mmq first
+-    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
++    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, prec) : nullptr;
+ 
+     if (mmp == nullptr) {
+         // Fall back to f16 dequant mul mat
+-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
++        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, prec);
+         quantize_y = false;
+     }
+ 
+@@ -8767,7 +8790,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+ 
+     if (qx_needs_dequant) {
+         // Fall back to dequant + f16 mulmat
+-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (ggml_prec)dst->op_params[0]);
++        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, prec);
+     }
+ 
+     // Not implemented
+@@ -9478,12 +9501,66 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
+         }, pc, { (uint32_t)ne03, (uint32_t)ne01, (uint32_t)ne12 });
+ }
+ 
++// T11 leva (a) - GGML_VK_VERIFY_SWITCH: returns the divert mode for this MUL_MAT node, or 0
++// (no divert). Diverts quantized weights x single-batch activations with N (dst->ne[1]) in
++// 2..9 from the VEC (DMMV) dispatch to the batched MMQ dispatch already used for
++// ne11 > mul_mat_vec_max_cols - the crossover HIP hardcodes at ne11 > 8.
++// mode 1 (GGML_VK_VERIFY_SWITCH=1/f32acc) additionally forces the .f32acc pipeline,
++// mode 2 (=mmq) keeps the natural batched selection (MMQ q8_1 on integer-dot devices).
++// Only diverts when the destination pipeline actually exists for src0->type, mirroring the
++// first pipeline lookups of ggml_vk_mul_mat_q_f16; otherwise keeps VEC (one-time warning).
++static int ggml_vk_verify_switch_mode(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    static bool warned_no_batched_pipeline = false;
++
++    const int32_t mode = ctx->device->verify_switch;
++    if (mode == 0 ||
++        dst->ne[1] < 2 || dst->ne[1] > 9 ||
++        src1->ne[2] * src1->ne[3] != 1 ||
++        !ggml_is_quantized(src0->type) ||
++        !ggml_vk_dim01_contiguous(src0)) {
++        return 0;
++    }
++
++    // Mirrors ggml_vk_mul_mat_q_f16 (the BF16 conjunct cannot hold: src0 is quantized).
++    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
++                              !ggml_vk_dim01_contiguous(src1);
++    const bool quantize_y = mode != 1 && ctx->device->integer_dot_product &&
++                            src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
++                            !y_non_contig && (src1->ne[1] * src1->ne[0]) % 4 == 0;
++    // mode 1 requests a non-.f16acc selector outcome (GGML_PREC_F32) instead of the node's prec.
++    const ggml_prec prec = mode == 1 ? GGML_PREC_F32 : (ggml_prec)dst->op_params[0];
++
++    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, prec) : nullptr;
++    if (mmp == nullptr) {
++        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? GGML_TYPE_F16 : src1->type, prec);
++    }
++    if (mmp == nullptr) {
++        // Without a quantized batched pipeline the callee would fall back to a full-dequant
++        // f16 matmul - keep the default VEC dispatch instead.
++        if (!warned_no_batched_pipeline) {
++            warned_no_batched_pipeline = true;
++            GGML_LOG_WARN("ggml_vulkan: vk-verify-switch: no batched pipeline for type %s, keeping VEC dispatch\n",
++                          ggml_type_name(src0->type));
++        }
++        return 0;
++    }
++    return mode;
++}
++
+ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+     ggml_tensor * dst = cgraph->nodes[node_idx];
+     ggml_tensor * src0 = dst->src[0];
+     ggml_tensor * src1 = dst->src[1];
+     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
+ 
++    // T11 leva (a): with GGML_VK_VERIFY_SWITCH active, quantized 2..9-row single-batch
++    // mul_mats are diverted from the VEC (DMMV) branch below to the batched MMQ dispatch.
++    // Short-circuits on the device field so the env-absent path is identical to the default.
++    int verify_switch_mode = 0;
++    if (ctx->device->verify_switch != 0) {
++        verify_switch_mode = ggml_vk_verify_switch_mode(ctx, src0, src1, dst);
++    }
++
+     // Handle huge A matrix by splitting the M dimensions. This works well for convolution use cases
+     // where the M dimension is very large.
+     // Split_k doesn't work with M splitting.
+@@ -9532,11 +9609,12 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
+         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
+     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
+     // when ne12 and ne13 are one.
+-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
++    } else if (verify_switch_mode == 0 && (dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
+                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+     } else {
+-        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
++        // T11 leva (a): diverted verify nodes only - mode 1 requests the .f32acc pipeline.
++        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false, verify_switch_mode == 1);
+     }
+ }
+ 
+-- 
+2.43.0
+
+
+From 1df4db2aaf1ec545bf6c2229d49fdb2280180675 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 24 Aug 2026 21:34:59 +0200
+Subject: [PATCH 4/4] fix(t11): verify-switch mirror back-reference + named
+ window constants
+
+Review follow-up sul commit 517afc7cc (tre soli punti, nessun cambio
+semantico):
+
+- back-reference nel callee: sopra il blocco quantize_y/prec/mmp di
+  ggml_vk_mul_mat_q_f16 ora c'e' il NOTE "keep in sync" verso
+  ggml_vk_verify_switch_mode() (il mirror puntava al callee ma non
+  viceversa: chi modifica il callee non aveva avviso del drift);
+- finestra 2..9 promossa a costanti nominate verify_switch_min_cols /
+  verify_switch_max_cols (int64_t, accanto a mul_mat_vec_max_cols :324),
+  gate dell'helper sulle costanti e marker boot interpolato %ld..%ld:
+  un futuro sweep non puo' lasciare un literal stale nel log;
+- commento init: "2..9 rows" -> "2..9 result columns (dst->ne[1])".
+
+Non fatto (da review): strcasecmp hardening, refactor della ternaria
+const, conversione a enum, refactor del selettore condiviso.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index c76bd28f1..dcc6480c7 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -324,6 +324,11 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+ static constexpr uint32_t mul_mat_vec_max_cols = 16;
+ static constexpr uint32_t p021_max_gqa_ratio = 8;
+ 
++// T11 leva (a): GGML_VK_VERIFY_SWITCH divert window on dst->ne[1] (result columns of the
++// verify batch; HIP's MMVQ->MMQ crossover sits at ne11 > 8).
++static constexpr int64_t verify_switch_min_cols = 2;
++static constexpr int64_t verify_switch_max_cols = 9;
++
+ enum vk_device_architecture {
+     OTHER,
+     AMD_GCN,
+@@ -6454,8 +6459,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             device->mmvq_mode = 1;
+         }
+ 
+-        // T11 leva (a): divert quantized mul_mats with 2..9 rows (batch 1) from the VEC
+-        // (DMMV) dispatch to the batched MMQ dispatch, behind GGML_VK_VERIFY_SWITCH.
++        // T11 leva (a): divert quantized mul_mats with 2..9 result columns (dst->ne[1],
++        // batch 1) from the VEC (DMMV) dispatch to the batched MMQ dispatch, behind
++        // GGML_VK_VERIFY_SWITCH.
+         // "mmq" = natural batched selection (MMQ q8_1 on integer-dot devices, same numerics
+         // as ne11 > mul_mat_vec_max_cols today); any other non-empty value ("1"/"f32acc") =
+         // force the .f32acc pipeline for the diverted nodes. Default (unset) = off.
+@@ -6463,8 +6469,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
+         if (const char * vk_verify_switch_env = getenv("GGML_VK_VERIFY_SWITCH")) {
+             if (vk_verify_switch_env[0] != '\0') {
+                 device->verify_switch = strcmp(vk_verify_switch_env, "mmq") == 0 ? 2 : 1;
+-                GGML_LOG_INFO("ggml_vulkan: vk-verify-switch active (mode=%s): quantized mul_mat N=2..9 diverted to batched MMQ dispatch\n",
+-                              device->verify_switch == 2 ? "mmq" : "f32acc");
++                GGML_LOG_INFO("ggml_vulkan: vk-verify-switch active (mode=%s): quantized mul_mat N=%ld..%ld diverted to batched MMQ dispatch\n",
++                              device->verify_switch == 2 ? "mmq" : "f32acc",
++                              (long) verify_switch_min_cols, (long) verify_switch_max_cols);
+             }
+         }
+ 
+@@ -8773,6 +8780,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+     // T11 leva (a): force_f32acc (diverted verify nodes, GGML_VK_VERIFY_SWITCH=1/f32acc) skips
+     // the MMQ q8_1 preference (quantize_y ignores prec) and requests a non-.f16acc selector
+     // outcome via GGML_PREC_F32 for this node only.
++    // NOTE: ggml_vk_verify_switch_mode() mirrors these lookups for the GGML_VK_VERIFY_SWITCH existence check - keep in sync.
+     bool quantize_y = !force_f32acc && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+     const ggml_prec prec = force_f32acc ? GGML_PREC_F32 : (ggml_prec)dst->op_params[0];
+ 
+@@ -9514,7 +9522,7 @@ static int ggml_vk_verify_switch_mode(ggml_backend_vk_context * ctx, const ggml_
+ 
+     const int32_t mode = ctx->device->verify_switch;
+     if (mode == 0 ||
+-        dst->ne[1] < 2 || dst->ne[1] > 9 ||
++        dst->ne[1] < verify_switch_min_cols || dst->ne[1] > verify_switch_max_cols ||
+         src1->ne[2] * src1->ne[3] != 1 ||
+         !ggml_is_quantized(src0->type) ||
+         !ggml_vk_dim01_contiguous(src0)) {
+-- 
+2.43.0
+
