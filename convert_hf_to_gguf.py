@@ -6047,7 +6047,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         start = idx * self._ple_rows_per_shard
         # the shard may still be lazy here; force it, so exactly one shard is resident
         if isinstance(shard, LazyTorchTensor):
-            eager = shard.to_eager().to(torch.float32).contiguous()
+            eager = LazyTorchTensor.to_eager(shard).to(torch.float32).contiguous()
         else:
             eager = shard.to(torch.float32).contiguous()
         self._ple_map[start:start + rows] = eager.numpy()
