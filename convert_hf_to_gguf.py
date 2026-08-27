@@ -5884,6 +5884,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_multipliers: list[int] | None = None
         self._ple_head_offsets: list[int] | None = None
         self._ple_head_vocab_sizes: list[int] | None = None
+        self._ple_scale: float | None = None
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -5967,6 +5968,13 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self._ple_head_vocab_sizes = [int(x) for x in data_torch.tolist()]
             return []
 
+        if name.endswith("ple_embedding.ngram_embedding.weight_scale"):
+            # FP8 PLE table: one per-tensor scale shared by all shards (0.0002 on the
+            # official release); the scale itself is not a GGUF tensor. Applied to the
+            # finished table in _finish_ple_table, so arrival order does not matter.
+            self._ple_scale = float(data_torch.tolist()[0])
+            return []
+
         if ".ngram_embedding.shard_" in name:
             return self._place_ple_shard(data_torch, name)
 
@@ -6045,6 +6053,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             )
 
         start = idx * self._ple_rows_per_shard
+        # an FP8 table without its per-tensor scale would be silently wrong, not broken
+        if shard.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and self._ple_scale is None:
+            raise ValueError("FP8 PLE shard seen before ngram_embedding.weight_scale")
         # the shard may still be lazy here; force it, so exactly one shard is resident
         if isinstance(shard, LazyTorchTensor):
             eager = LazyTorchTensor.to_eager(shard).to(torch.float32).contiguous()
@@ -6070,6 +6081,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
         raw = np.memmap(self._ple_path, dtype=np.float32, mode="r+",
                         shape=(total_rows, self._ple_row_dim))
+        if self._ple_scale is not None and self._ple_scale != 1.0:
+            # dequantize the FP8 table: one in-place multiply over the mmap
+            np.multiply(raw, np.float32(self._ple_scale), out=raw)
+            raw.flush()
         return torch.from_numpy(np.asarray(raw))
 
     def prepare_tensors(self):
