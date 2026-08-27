@@ -227,15 +227,7 @@ uint32_t llama_hparams::ple_conv_state() const {
     }
 
     // dilation equals the n-gram size, matching the reference module
-    return (ple_conv_kernel - 1) * ple_ngram_size * dsv4_hc_mult * n_embd;
-}
-
-bool llama_hparams::is_ple(uint32_t il) const {
-    if (il < n_layer_all) {
-        return is_ple_impl[il];
-    }
-
-    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
+    return (ple_conv_kernel - 1) * ple_ngram_size * n_hc * n_embd;
 }
 
 uint32_t llama_hparams::n_pos_per_embd() const {

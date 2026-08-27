@@ -107,7 +107,8 @@ public:
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+                 const char *   name_tag = "");
 
     ~llama_kv_cache() = default;
 
@@ -290,6 +291,9 @@ private:
 
     std::vector<llama_kv_cells> v_cells;
 
+    // prefix for the cache tensor names: "" for the main cache, "idx_" for the qwen4exp indexer
+    const char * name_tag = "";
+
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
 
@@ -378,6 +382,9 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // predecessors from the KV cells, for the qwen4exp PLE n-gram hash
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

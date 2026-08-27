@@ -70,6 +70,28 @@ std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
 
+// reshape into rows of rot-width, multiply, reshape back; the hadamard hint
+// lets the backends pick a kernel for sign-flip projections (qwen4exp QSA)
+static inline ggml_tensor * llama_mul_mat_hadamard(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        ggml_tensor * rot) {
+    const auto n = rot->ne[0];
+
+    ggml_tensor * res;
+
+    if (!ggml_is_contiguous(cur)) {
+        res = ggml_cont_2d(ctx, cur, n, ggml_nelements(cur)/n);
+    } else {
+        res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
+    }
+    res = ggml_mul_mat(ctx, rot, res);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+    return res;
+}
+
 #define LLAMA_TENSOR_NAME_FATTN   "__fattn__"
 #define LLAMA_TENSOR_NAME_FGDN_AR "__fgdn_ar__"
 #define LLAMA_TENSOR_NAME_FGDN_CH "__fgdn_ch__"

@@ -107,7 +107,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         s_l[i] = s;
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
-        if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
+        if (hparams.ple_conv_state() > 0 && hparams.ple_layer_arr[i]) {
             ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows);
             ggml_format_name(p, "cache_ple_r_l%d", i);
             p_l[i] = p;

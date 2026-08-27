@@ -15,6 +15,9 @@ struct llama_kv_cell_ext {
     llama_pos x = 0;
     llama_pos y = 0;
 
+    // token id, needed by the PLE n-gram hash (qwen4exp)
+    llama_token tok = LLAMA_TOKEN_NULL;
+
     // return true if the current 2D spatial position is greater than other
     bool is_2d_gt(llama_pos ox, llama_pos oy) const {
         return (y > oy) || (y == oy && x > ox);
@@ -94,6 +97,26 @@ public:
 
     bool get_has_shift() const {
         return has_shift;
+    }
+
+    // qwen4exp PLE: visit every (seq_id, pos, tok) of the sequences in `seqs`
+    // whose position falls in [p_min, p_max); a cell shared by multiple
+    // sequences is visited once per sequence it belongs to
+    template <typename F>
+    void for_each_token_in(const std::bitset<LLAMA_MAX_SEQ> & seqs, llama_pos p_min, llama_pos p_max, const F & fn) const {
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            const llama_pos p = pos[i];
+
+            if (p < p_min || p >= p_max || p == -1) {
+                continue;
+            }
+
+            for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (seqs.test(s) && seq[i].test(s)) {
+                    fn((llama_seq_id) s, p, ext[i].tok);
+                }
+            }
+        }
     }
 
     // move cell isrc to idst (used during defrag)

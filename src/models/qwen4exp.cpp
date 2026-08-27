@@ -9,6 +9,10 @@
 // PLE hash lookup), adapted to this fork's field and tensor names.
 
 #include "models.h"
+#include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
+#include "llama-kv-cache.h"
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -452,7 +456,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     res->add_input(std::move(qsa));
 
     // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
-    ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
+    ggml_tensor * k_raw = build_lora_mm(model.layers[il].indexer_k_proj, cur);
     k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
     cb(k_raw, "indexer_k_raw", il);
 
@@ -479,16 +483,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+    pooled = build_norm(pooled, model.layers[il].indexer_k_norm, nullptr, LLM_NORM_RMS, il);
     pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
     cb(pooled, "indexer_k", il);
 
-    ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
+    ggml_tensor * q = build_lora_mm(model.layers[il].indexer_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
-    q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
+    q = build_norm(q, model.layers[il].indexer_q_norm, nullptr, LLM_NORM_RMS, il);
     q = ggml_rope_multi(ctx0, q, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
