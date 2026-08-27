@@ -6093,6 +6093,15 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             raise ValueError(
                 f"unprocessed PLE embedding shards: {sorted(self._ple_pending)}"
             )
+        # every tensor has been quantized and spilled by now, so the Q8 copy of
+        # the table exists on its own: releasing the mmap here instead of at the
+        # end of write() drops ~205 GB from the peak disk usage of the weight write
+        if self._ple_map is not None:
+            self._ple_map.flush()
+            del self._ple_map
+            self._ple_map = None
+        if self._ple_path is not None and self._ple_path.exists():
+            self._ple_path.unlink()
 
     def write(self):
         try:
