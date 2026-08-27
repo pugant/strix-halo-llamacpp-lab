@@ -1983,6 +1983,17 @@ struct llama_model_qwen35moe : public llama_model_base {
 };
 
 
+// Qwen3.8-Flash-Next: quantization-side only in this fork (load_arch_hparams /
+// load_arch_tensors); the inference graph is not ported yet and build_arch_graph aborts.
+struct llama_model_qwen4exp : public llama_model_base {
+    llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_mistral3 : public llama_model_base {
     llama_model_mistral3(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
