@@ -33,7 +33,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.attn_compress_ratio, hparams.n_layer_all, false);
+    ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.attn_compress_ratio, hparams.n_layer, false);
 
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
     std::fill(hparams.ple_layer_arr.begin(), hparams.ple_layer_arr.end(), false);
@@ -45,7 +45,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         std::vector<uint32_t> ple_layers;
         ml.get_arr(LLM_KV_PLE_LAYERS, ple_layers);
         for (uint32_t il : ple_layers) {
-            GGML_ASSERT(il < hparams.n_layer_all);
+            GGML_ASSERT(il < hparams.n_layer);
             hparams.ple_layer_arr[il] = true;
         }
 
@@ -71,12 +71,12 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     {
         uint32_t full_attn_interval = 4;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
-        for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
-            hparams.recurrent_layer_arr[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
+        for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+            hparams.recurrent_layer_arr[i] = (i < hparams.n_layer) && ((i + 1) % full_attn_interval != 0);
         }
     }
 
-    switch (hparams.n_layer()) {
+    switch (hparams.n_layer) {
         case 48: type = LLM_TYPE_A3B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }

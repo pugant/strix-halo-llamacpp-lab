@@ -622,6 +622,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_INDEXER_COMPRESSOR_KV,                  "blk.%d.indexer_compressor_kv" },
     { LLM_TENSOR_INDEXER_COMPRESSOR_GATE,                "blk.%d.indexer_compressor_gate" },
     { LLM_TENSOR_INDEXER_COMPRESSOR_NORM,                "blk.%d.indexer_compressor_norm" },
+    { LLM_TENSOR_INDEXER_Q_PROJ,                         "blk.%d.indexer.q_proj" },
+    { LLM_TENSOR_INDEXER_K_PROJ,                         "blk.%d.indexer.k_proj" },
+    { LLM_TENSOR_INDEXER_Q_NORM,                         "blk.%d.indexer.q_norm" },
     { LLM_TENSOR_HC_ATTN_BASE,                           "blk.%d.hc_attn_base" },
     { LLM_TENSOR_HC_ATTN_FN,                             "blk.%d.hc_attn_fn" },
     { LLM_TENSOR_HC_ATTN_SCALE,                          "blk.%d.hc_attn_scale" },
@@ -874,6 +877,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_INDEXER_PROJ,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_INDEXER_ATTN_K,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_INDEXER_ATTN_Q_B,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INDEXER_Q_PROJ,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}}, // qwen4exp
+    {LLM_TENSOR_INDEXER_K_PROJ,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}}, // qwen4exp
+    {LLM_TENSOR_INDEXER_Q_NORM,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},     // qwen4exp
     {LLM_TENSOR_OUTPUT_HC_BASE,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
     {LLM_TENSOR_OUTPUT_HC_FN,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_OUTPUT_HC_SCALE,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_SCALE}},
