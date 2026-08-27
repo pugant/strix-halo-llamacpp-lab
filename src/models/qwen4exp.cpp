@@ -579,7 +579,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    // the F32 base mask: the _cnv one follows the cache dtype and ggml_fill wants F32
+    ggml_tensor * kq_mask = inp->self_kq_mask;
 
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
@@ -606,6 +607,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
+
+    // the fork's flash-attn path takes an F16 mask, like every other input does
+    if (cparams.flash_attn) {
+        kq_mask_top_k = ggml_cast(ctx0, kq_mask_top_k, GGML_TYPE_F16);
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
