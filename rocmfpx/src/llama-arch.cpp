@@ -1079,6 +1079,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_QWEN4EXP:   // T19: hybrid_idx memory (GDN ring + PLE row + QSA idx) supports per-row rollback
             return true;
         default:
             return false;

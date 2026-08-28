@@ -1,0 +1,35 @@
+From 463c0f632fa0fea99db164fe39a4b5c7c6478ef4 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Fri, 28 Aug 2026 16:03:27 +0200
+Subject: [PATCH] arch(qwen4exp): enable RS rollback (ring-salvage) for the
+ hybrid_idx memory
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The T16 port built the full RS chain (hybrid_idx seq_rm over recr+idx+attn,
+ring widened to 1+n_rs_seq incl. the PLE conv row, need_n_rs_seq sizing) but never
+listed the arch, so n_rs_seq was clamped to 0 and every partial verify rejection
+paid a full checkpoint restore (~115-148 MiB) — the 'speculative replay stalled'
+thrashing seen in production at long ctx.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/llama-arch.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index b5b595665..da06ebf94 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -1079,6 +1079,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
+         case LLM_ARCH_QWEN35:
+         case LLM_ARCH_QWEN35MOE:
+         case LLM_ARCH_DEEPSEEK4:
++        case LLM_ARCH_QWEN4EXP:   // T19: hybrid_idx memory (GDN ring + PLE row + QSA idx) supports per-row rollback
+             return true;
+         default:
+             return false;
+-- 
+2.43.0
+
