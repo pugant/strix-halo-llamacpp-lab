@@ -91,7 +91,8 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
-    switch (hparams.n_layer) {
+    // label by the trunk-only count: the draft carries one extra NextN/MTP block
+    switch (hparams.n_layer - hparams.nextn_predict_layers) {
         case 48: type = LLM_TYPE_A3B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
