@@ -760,6 +760,17 @@ struct server_metrics {
     // appears on first increment stays invisible until then)
     uint64_t spec_route_concat_mtp_accepted_total = 0;
 
+    // t20 f3 (pi-stack): draft rounds attributed per drafter family, exported
+    // as spec_route_ngram_drafts_total (ngram-*, pure prompt lookup with no
+    // model call) and spec_route_model_drafts_total (draft-mtp / draft-dflash
+    // per the routing). Unlabeled scalars emitted unconditionally at render
+    // time like spec_route_concat_mtp_accepted_total above, so both are
+    // present at 0 from boot: the F3 engagement smoke must distinguish
+    // "drafter never engaged" (absent from boot would be ambiguous) from
+    // "engaged with zero delta".
+    uint64_t spec_route_ngram_drafts_total  = 0;
+    uint64_t spec_route_model_drafts_total = 0;
+
     void init() {
         t_start = ggml_time_us();
 
@@ -789,6 +800,23 @@ struct server_metrics {
 
     void on_spec_route_concat_mtp_accepted(uint32_t n_tokens) {
         spec_route_concat_mtp_accepted_total += n_tokens;
+    }
+
+    // t20 f3 (pi-stack): count one draft round by drafter family. The if/else
+    // makes a round land on exactly one counter: every ngram-* impl drafts
+    // from the prompt alone, every other drafting impl is a model drafter
+    // (draft-mtp / draft-dflash on this server; the name prefixes are the
+    // stable common_speculative_type_to_str convention, same one
+    // spec_route_short_name() strips). NONE - no round attributed for the
+    // seq - is not a round and stays uncounted.
+    void on_spec_route_round_drafter(common_speculative_type type) {
+        const std::string name = common_speculative_type_to_str(type);
+
+        if (name.rfind("ngram-", 0) == 0) {
+            spec_route_ngram_drafts_total++;
+        } else if (name.rfind("draft-", 0) == 0) {
+            spec_route_model_drafts_total++;
+        }
     }
 
     void on_prompt_eval(const server_slot & slot) {
@@ -2685,6 +2713,10 @@ private:
                     // t8 stadio 2 (spec §6, Task 6): concat observability counter
                     res->spec_route_concat_mtp_accepted_total = metrics.spec_route_concat_mtp_accepted_total;
 
+                    // t20 f3 (pi-stack): per-drafter draft-round counters
+                    res->spec_route_ngram_drafts_total  = metrics.spec_route_ngram_drafts_total;
+                    res->spec_route_model_drafts_total = metrics.spec_route_model_drafts_total;
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -4295,7 +4327,17 @@ private:
                     // impl's i_h, speculative.cpp accept()).
                     const int32_t n_concat_head = common_speculative_concat_head_size(spec.get(), slot.id);
 
+                    // t20 f3 (pi-stack): drafter of the round being closed. Read next
+                    // to the concat-head readout for symmetry, but unlike impl_head
+                    // the impl_last attribution survives the accept call below.
+                    const common_speculative_type round_drafter = common_speculative_round_drafter_type(spec.get(), slot.id);
+
                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+
+                    // t20 f3 (pi-stack): per-round and OUTSIDE the concat if below -
+                    // an ngram round never satisfies n_concat_head > 0, so counting
+                    // inside it would leave spec_route_ngram_drafts_total stuck at 0.
+                    metrics.on_spec_route_round_drafter(round_drafter);
 
                     if (n_concat_head > 0) {
                         const int32_t n_concat_mtp = std::min<int32_t>((int32_t) (accepted.size() - 1), n_concat_head);
@@ -5184,6 +5226,21 @@ void server_routes::init_routes() {
                 {"name",  "spec_route_concat_mtp_accepted_total"},
                 {"help",  "Number of MTP head tokens accepted in composed concat rounds."},
                 {"value", res_task->spec_route_concat_mtp_accepted_total},
+            });
+
+            // t20 f3 (pi-stack): emitted unconditionally so both counters are
+            // present at 0 from boot (see server_metrics) - the engagement
+            // smoke reads their delta across the F3 replay
+            counter_defs.push_back({
+                {"name",  "spec_route_ngram_drafts_total"},
+                {"help",  "Number of draft rounds attributed to the ngram drafter."},
+                {"value", res_task->spec_route_ngram_drafts_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "spec_route_model_drafts_total"},
+                {"help",  "Number of draft rounds attributed to a model drafter (MTP or DFlash)."},
+                {"value", res_task->spec_route_model_drafts_total},
             });
 
             for (const auto & [kind, count] : res_task->spec_route_cache_rebuilds) {

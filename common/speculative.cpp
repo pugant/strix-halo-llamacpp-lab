@@ -3995,6 +3995,23 @@ int32_t common_speculative_concat_head_size(const common_speculative * spec, lla
     return (int32_t) spec->concat_head[seq_id].size();
 }
 
+// t20 f3 (pi-stack): impl_last[seq_id] is set when a round closes in
+// common_speculative_draft() (first non-empty draft of the closing arm) and is
+// NOT cleared by common_speculative_accept() - only the in-flight impl_head
+// attribution is - so this readout keeps naming the drafter of the round the
+// server is about to close (or has just closed) with that accept call.
+enum common_speculative_type common_speculative_round_drafter_type(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_last.size()) {
+        return COMMON_SPECULATIVE_TYPE_NONE;
+    }
+
+    if (spec->impl_last[seq_id] == nullptr) {
+        return COMMON_SPECULATIVE_TYPE_NONE;
+    }
+
+    return spec->impl_last[seq_id]->type;
+}
+
 int32_t common_speculative_concat_k1(const common_speculative * spec) {
     return spec ? spec->concat_k1 : 0;
 }
