@@ -899,6 +899,16 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         io.write(&r_size_row, sizeof(r_size_row));
 
         write_rows(r_l[il], r_size_row);
+
+        // Write the PLE conv state right after the R rows, mirroring the order
+        // state_read_data expects (type is implicit in the reader, only the row
+        // size is round-tripped)
+        if (p_l[il] != nullptr) {
+            const uint64_t p_size_row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
+            io.write(&p_size_row, sizeof(p_size_row));
+
+            write_rows(p_l[il], p_size_row);
+        }
     }
 
     if (!s_trans) {
