@@ -1,0 +1,27 @@
+From fab110074822b4a86229a861590db261f45ba9da Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Fri, 28 Aug 2026 15:06:13 +0200
+Subject: [PATCH 2/2] fix(server): pass a format arg to the skip SLT_WRN (empty
+ __VA_ARGS__ breaks build)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index d38c7988e..debe94eda 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3719,7 +3719,7 @@ private:
+                             //       informed of the image via the trunk hidden state at draft time,
+                             //       and the target verify keeps the output correct either way.
+                             if (slot.spec_drafter_active == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+-                                SLT_WRN(slot, "skipping image chunk on MTP draft context (embd input not supported)\n");
++                                SLT_WRN(slot, "skipping image chunk on MTP draft context (%d positions not replayed)\n", (int) n_tokens_out);
+                             } else {
+                                 res = input_tokens.process_chunk(slot.ctx_dft, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                                 if (res != 0) {
+-- 
+2.43.0
+

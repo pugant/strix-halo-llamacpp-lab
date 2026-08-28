@@ -1,0 +1,46 @@
+From ca51316e56f5f6edd6682f387b876464561d38db Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Fri, 28 Aug 2026 15:02:35 +0200
+Subject: [PATCH 1/2] fix(server): skip image-chunk replay on the MTP drafter
+ (mmproj x draft-mtp abort)
+
+An image chunk is embd-only (ubatch.token == NULL) but graph_mtp requires
+token input, so replaying the chunk on the MTP draft context aborts the
+server. Skip the replay when the active drafter is draft-mtp: the head stays
+informed of the image via the trunk hidden state at draft time, and the
+target verify keeps the output correct either way.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 70f65ff9a..d38c7988e 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3713,9 +3713,18 @@ private:
+                             //       for now, we skip this for simplicity
+                             //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
+                             // spec-route: the image chunk becomes rows of the ACTIVE drafter's context
+-                            res = input_tokens.process_chunk(slot.ctx_dft, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+-                            if (res != 0) {
+-                                GGML_ABORT("failed to process multi-modal data on draft context\n");
++                            // spec-route (mmproj x MTP): the MTP draft graph requires token input
++                            //       (qwen4exp graph_mtp asserts on ubatch.token) and an image chunk is
++                            //       embd-only. Skip the replay on the MTP drafter: the head stays
++                            //       informed of the image via the trunk hidden state at draft time,
++                            //       and the target verify keeps the output correct either way.
++                            if (slot.spec_drafter_active == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
++                                SLT_WRN(slot, "skipping image chunk on MTP draft context (embd input not supported)\n");
++                            } else {
++                                res = input_tokens.process_chunk(slot.ctx_dft, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
++                                if (res != 0) {
++                                    GGML_ABORT("failed to process multi-modal data on draft context\n");
++                                }
+                             }
+                         }
+ 
+-- 
+2.43.0
+
