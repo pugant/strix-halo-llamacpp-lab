@@ -3719,7 +3719,7 @@ private:
                             //       informed of the image via the trunk hidden state at draft time,
                             //       and the target verify keeps the output correct either way.
                             if (slot.spec_drafter_active == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-                                SLT_WRN(slot, "skipping image chunk on MTP draft context (embd input not supported)\n");
+                                SLT_WRN(slot, "skipping image chunk on MTP draft context (%d positions not replayed)\n", (int) n_tokens_out);
                             } else {
                                 res = input_tokens.process_chunk(slot.ctx_dft, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
                                 if (res != 0) {
