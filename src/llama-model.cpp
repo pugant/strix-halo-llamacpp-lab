@@ -1648,7 +1648,7 @@ const float * llama_model::tensor_split() const {
 }
 
 uint32_t llama_model::n_embd_pre_norm() const {
-    return arch == LLM_ARCH_DEEPSEEK4 ? hparams.n_embd * hparams.n_hc : hparams.n_embd;
+    return (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_QWEN4EXP) ? hparams.n_embd * hparams.n_hc : hparams.n_embd;
 }
 
 uint32_t llama_model::n_gpu_layers() const {
