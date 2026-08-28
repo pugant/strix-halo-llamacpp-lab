@@ -1,0 +1,83 @@
+From 50da948d34ae8d0867e7d36b299cec5be43e73f7 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Fri, 28 Aug 2026 09:42:42 +0200
+Subject: [PATCH 3/8] model(qwen4exp-mtp): T4 export wide residual as
+ t_h_pre_norm on the target side
+
+---
+ src/models/qwen4exp.cpp | 40 +++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 35 insertions(+), 5 deletions(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 6fc35b6ed..f739f9538 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -339,7 +339,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+             n_embd, hc, n_tokens, 1);
+     cb(res_hc, "hc_init", -1);
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    // NextN/MTP layers are loaded as extra blocks but never run in the main pass
++    const int n_main = n_layer - (int) hparams.nextn_predict_layers;
++
++    for (int il = 0; il < n_main; ++il) {
+         res->t_layer_inp[il] = res_hc;
+ 
+         if (hparams.ple_layer_arr[il]) {
+@@ -362,6 +365,20 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+         }
+ 
++        // an unmasked MTP export needs a hidden row for every token, so in that case the
++        // gather is deferred until after t_h_pre_norm is taken below
++        const bool gather_now = !cparams.embeddings_pre_norm || cparams.embeddings_pre_norm_masked;
++
++        if (il == n_main - 1 && inp_out_ids && gather_now) {
++            // everything below is per token, so drop the rows that produce no output
++            cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
++            inject = ggml_get_rows(ctx0, inject, inp_out_ids);
++
++            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
++            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
++            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
++        }
++
+         res_hc = build_hc_combine(res_hc, cur, inject, il);
+ 
+         cur = build_hc_mix(res_hc,
+@@ -380,15 +397,28 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+         cb(res_hc, "l_last", il);
+     }
+ 
++    // The MTP head consumes the wide residual, before the head mixer collapses it. Export the
++    // combine result itself rather than a reshape of it: a pure view gets no backend assignment
++    // from the scheduler, and the readback in llama_context looks one up. It is contiguous, so
++    // [n_embd, hc, rows] already has the [n_embd_out, rows] layout the reader expects, and it
++    // carries exactly the right rows either way -- gathered above when masked, ungathered when not.
++    if (cparams.embeddings_pre_norm) {
++        cb(res_hc, "h_pre_norm", -1);
++        res->t_h_pre_norm = res_hc;
++
++        // deferred from the last layer: collapse to the output rows now that the export is taken
++        if (!cparams.embeddings_pre_norm_masked && inp_out_ids) {
++            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
++            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
++            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
++        }
++    }
++
+     // the final mixer is the output norm: there is no separate one
+     ggml_tensor * cur = build_hc_mix(res_hc,
+             model.output_hc_norm, model.output_hc_down, model.output_hc_up,
+             nullptr, nullptr, -1);
+ 
+-    if (inp_out_ids) {
+-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+-    }
+-
+     cb(cur, "result_norm", -1);
+     res->t_embd = cur;
+ 
+-- 
+2.43.0
+

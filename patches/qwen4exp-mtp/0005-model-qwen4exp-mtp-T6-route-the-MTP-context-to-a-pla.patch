@@ -1,0 +1,26 @@
+From d150cbcd35f7d0609820f027c6ab055abfb4050d Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Fri, 28 Aug 2026 09:43:54 +0200
+Subject: [PATCH 5/8] model(qwen4exp-mtp): T6 route the MTP context to a plain
+ KV cache
+
+---
+ src/llama-model.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index c02cf3522..cb4e65dc0 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2081,7 +2081,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                 // attention KV cache for the MTP context instead of the hybrid wrapper.
+                 const bool mtp_on_hybrid_qwen35 =
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+-                    (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_BAILINGMOE3);
++                    (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_QWEN4EXP);
+                 const bool step35_with_mtp =
+                     arch == LLM_ARCH_STEP35 && hparams.nextn_predict_layers > 0;
+                 const bool mtp_on_step35 =
+-- 
+2.43.0
+

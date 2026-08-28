@@ -1,0 +1,27 @@
+From a9c04bfdafeb39981bf56c11b3277003b6e1ff42 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Fri, 28 Aug 2026 10:06:49 +0200
+Subject: [PATCH 7/8] model(qwen4exp-mtp): label draft model type via
+ trunk-only layer count
+
+---
+ src/models/qwen4exp.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index f97094661..e44b3fe2e 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -91,7 +91,8 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+         }
+     }
+ 
+-    switch (hparams.n_layer) {
++    // label by the trunk-only count: the draft carries one extra NextN/MTP block
++    switch (hparams.n_layer - hparams.nextn_predict_layers) {
+         case 48: type = LLM_TYPE_A3B; break;
+         default: type = LLM_TYPE_UNKNOWN;
+     }
+-- 
+2.43.0
+

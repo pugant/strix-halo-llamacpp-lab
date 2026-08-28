@@ -1,0 +1,295 @@
+From 0133b98aac533a74bb8b93d2cec6ad52a10d62f2 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Fri, 21 Aug 2026 18:41:43 +0200
+Subject: [PATCH] feat(server): concat observability + temp>0 single-drafter
+ fallback [t8 stadio 2]
+
+Spec section 4: a composed concat round mixes MTP head rows (no proposal
+distribution) with DFlash noise rows (dists), so spec-dists acceptance is
+impossible on the mixed segment - the server's size-guard silently degraded
+every temp>0 concat round to exact accept. Add the explicit fallback BEFORE
+any composition: in common_speculative_draft() a dflash-routed sequence with
+temperature > 0 skips the head publish and drafts a plain draft-dflash round
+(exactly the concat_off path), whose dists cover the whole draft so sample
+acceptance works at temp>0. WARNING once per session (harness flag), output
+unchanged.
+
+Spec section 6 observability:
+- new counter spec_route_concat_mtp_accepted_total (MTP head tokens accepted
+  in composed concat rounds), emitted unconditionally at /metrics render so
+  it is present at 0 from boot (T7 lesson 8b35a795f). The per-round value is
+  min(n_accepted, k1') - same boundary arithmetic as the MTP impl's i_h -
+  read via the new common_speculative_concat_head_size() BEFORE
+  common_speculative_accept() consumes the per-seq round attribution.
+- per-request slot counters printed by print_timings() next to the per-impl
+  statistics: 'statistics concat: k1 = N, rounds = N, mtp_accepted = A/T'.
+
+Tested by scripts/t8-concat-t1.sh (Task 6 section, 19 checks): guard once
+per session + pure DF7 rounds at temp 0.7, metric pre-registered at 0 and
+incremented with speclog corroboration, marker format and coherence, zero
+delta at k1=0; full suite 60/60 plus t8-concat-t2 20/20.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/speculative.cpp          | 64 +++++++++++++++++++++++++++----
+ common/speculative.h            | 10 +++++
+ tools/server/server-context.cpp | 67 +++++++++++++++++++++++++++++++++
+ tools/server/server-task.h      |  3 ++
+ 4 files changed, 136 insertions(+), 8 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index f6ee143f6..38c9a092d 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -3034,6 +3034,10 @@ struct common_speculative {
+ 
+     // diagnostics: number of concat rounds composed (first one logs at INFO)
+     size_t n_concat_rounds = 0;
++
++    // t8 stadio 2 (spec §4, Task 6): the temp > 0 single-drafter fallback
++    // warning is logged once per session (server lifetime), not per request
++    bool concat_temp_fallback_warned = false;
+ };
+ 
+ static common_ngram_map get_common_ngram_map(
+@@ -3643,14 +3647,32 @@ void common_speculative_draft(common_speculative * spec) {
+             if (dp.drafter == COMMON_SPECULATIVE_TYPE_NONE || dp.drafter == impl->type) {
+                 n_drafting_impl++;
+             } else if (concat_mtp_phase && dp.drafter == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+-                // concat round: the MTP arm heads it. The arm's effective n_max
+-                // already folds dp.n_max in, so clamping dp.n_max to k1 caps the
+-                // head at k1 tokens; the original per-request value is restored
+-                // right after the call, like the drafting stash below.
+-                seq_concat.push_back(seq_id);
+-                seq_concat_n_max.push_back(dp.n_max);
+-                dp.n_max = dp.n_max >= 0 ? std::min(dp.n_max, spec->concat_k1) : spec->concat_k1;
+-                n_drafting_impl++;
++                // t8 stadio 2 (spec §4, Task 6): temp > 0 single-drafter fallback,
++                // BEFORE any composition. A composed round mixes MTP head rows
++                // (which carry no proposal distribution) with DFlash noise rows
++                // (which do), so spec-dists acceptance is impossible on the mixed
++                // segment - the server's size-guard would silently degrade every
++                // such round to exact accept. Route the sequence to the class
++                // drafter instead: a plain draft-dflash round, exactly the
++                // concat_off path, whose dists cover the whole draft so sample
++                // acceptance works at temp > 0. WARNING once per session (spec §4).
++                if (dp.temperature > 0.0f) {
++                    if (!spec->concat_temp_fallback_warned) {
++                        spec->concat_temp_fallback_warned = true;
++                        SPC_WRN("concat mode fallback: temperature > 0 request (seq %d) - spec-dists acceptance is impossible on mixed MTP+DFlash segments; using single-drafter (class) rounds for every temp > 0 request - this warning is logged once per session\n",
++                                (int) seq_id);
++                    }
++                    seq_routed.push_back(seq_id);
++                } else {
++                    // concat round: the MTP arm heads it. The arm's effective n_max
++                    // already folds dp.n_max in, so clamping dp.n_max to k1 caps the
++                    // head at k1 tokens; the original per-request value is restored
++                    // right after the call, like the drafting stash below.
++                    seq_concat.push_back(seq_id);
++                    seq_concat_n_max.push_back(dp.n_max);
++                    dp.n_max = dp.n_max >= 0 ? std::min(dp.n_max, spec->concat_k1) : spec->concat_k1;
++                    n_drafting_impl++;
++                }
+             } else {
+                 seq_routed.push_back(seq_id);
+             }
+@@ -3831,6 +3853,32 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+     }
+ }
+ 
++int32_t common_speculative_concat_head_size(const common_speculative * spec, llama_seq_id seq_id) {
++    if (spec == nullptr || spec->concat_k1 <= 0) {
++        return 0;
++    }
++
++    if (seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_head.size()) {
++        return 0;
++    }
++
++    // impl_head is non-null only while this sequence's round was composed as a
++    // concat round: set when the head is published in common_speculative_draft(),
++    // consumed here by accept() and cleared wholesale at the top of the next
++    // draft() call. It intentionally survives the server's checkpoint-replay
++    // path (no draft() runs between the restore and the replayed accept), where
++    // the replayed round keeps its original composition attribution.
++    if (spec->impl_head[seq_id] == nullptr) {
++        return 0;
++    }
++
++    return (int32_t) spec->concat_head[seq_id].size();
++}
++
++int32_t common_speculative_concat_k1(const common_speculative * spec) {
++    return spec ? spec->concat_k1 : 0;
++}
++
+ // TODO: support the case of more than one speculative implementations having a state
+ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+     if (spec == nullptr) {
+diff --git a/common/speculative.h b/common/speculative.h
+index 3fc1424c7..ba28607e8 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -115,6 +115,16 @@ void common_speculative_draft(common_speculative * spec);
+ // informs the speculative context that n_accepted tokens were accepted by the target model
+ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+ 
++// t8 stadio 2 (spec §6): size of the MTP concat head of the round in flight for
++// this sequence (0 = the next common_speculative_accept() will close a plain
++// round, not a composed one). Must be read BEFORE the accept call - it consumes
++// the per-seq round attribution this readout is derived from.
++int32_t common_speculative_concat_head_size(const common_speculative * spec, llama_seq_id seq_id);
++
++// t8 stadio 2 (spec §6): the configured concat head size (--spec-concat-k1,
++// 0 = concat rounds disabled)
++int32_t common_speculative_concat_k1(const common_speculative * spec);
++
+ // (optional) get/set internal state
+ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
+ bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index f8d87e4f7..0a29c50b9 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -307,6 +307,13 @@ struct server_slot {
+     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
+     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
+ 
++    // t8 stadio 2 (spec §6, Task 6): per-request concat observability, printed
++    // by print_timings() next to the per-impl statistics (the metric keeps the
++    // server-lifetime total; these reset with the slot like n_draft_total)
++    int32_t n_concat_rounds = 0;       // composed concat rounds verified by this request
++    int32_t n_concat_head_total = 0;   // MTP head tokens composed across those rounds
++    int32_t n_concat_mtp_accepted = 0; // MTP head tokens accepted across those rounds
++
+     void reset() {
+         SLT_DBG(*this, "%s", "\n");
+ 
+@@ -343,6 +350,11 @@ struct server_slot {
+         n_draft_verif_steps = 0;
+         n_accepted_per_pos.clear();
+ 
++        // t8 concat observability (per-request, see the fields above)
++        n_concat_rounds = 0;
++        n_concat_head_total = 0;
++        n_concat_mtp_accepted = 0;
++
+         task_prev = std::move(task);
+         task.reset();
+ 
+@@ -633,6 +645,17 @@ struct server_slot {
+         }
+ 
+         common_speculative_print_stats(spec);
++
++        // t8 stadio 2 (spec §6, Task 6): concat-round observability next to the
++        // per-impl statistics above (ngram-style marker, per-request like the
++        // slot counters). Only printed when this request actually verified
++        // composed concat rounds - k1 is the configured --spec-concat-k1 and
++        // every concat code path is gated on it
++        if (n_concat_rounds > 0) {
++            SLT_INF(*this, "statistics %16s: k1 = %d, rounds = %d, mtp_accepted = %d/%d\n",
++                    "concat", common_speculative_concat_k1(spec), n_concat_rounds,
++                    n_concat_mtp_accepted, n_concat_head_total);
++        }
+     }
+ 
+     json to_json(bool only_metrics = false) const {
+@@ -727,6 +750,14 @@ struct server_metrics {
+     std::map<std::string, uint64_t> spec_route_cache_rebuilds = {};
+     uint64_t spec_route_overrides_total = 0;
+ 
++    // t8 stadio 2 (spec §6, Task 6): MTP head tokens accepted in composed
++    // concat rounds, exported as spec_route_concat_mtp_accepted_total. The
++    // unlabeled counter is emitted unconditionally at /metrics render time
++    // (like spec_route_override_total), so it is present at 0 from boot with
++    // no pre-registration needed (T7 lesson 8b35a795f: a counter that only
++    // appears on first increment stays invisible until then)
++    uint64_t spec_route_concat_mtp_accepted_total = 0;
++
+     void init() {
+         t_start = ggml_time_us();
+ 
+@@ -754,6 +785,10 @@ struct server_metrics {
+         spec_route_cache_rebuilds[kind]++;
+     }
+ 
++    void on_spec_route_concat_mtp_accepted(uint32_t n_tokens) {
++        spec_route_concat_mtp_accepted_total += n_tokens;
++    }
++
+     void on_prompt_eval(const server_slot & slot) {
+         n_prompt_tokens_processed_total += slot.n_prompt_tokens_processed;
+         n_prompt_tokens_processed       += slot.n_prompt_tokens_processed;
+@@ -2625,6 +2660,9 @@ private:
+                     res->spec_route_cache_rebuilds = metrics.spec_route_cache_rebuilds;
+                     res->spec_route_overrides_total = metrics.spec_route_overrides_total;
+ 
++                    // t8 stadio 2 (spec §6, Task 6): concat observability counter
++                    res->spec_route_concat_mtp_accepted_total = metrics.spec_route_concat_mtp_accepted_total;
++
+                     if (task.metrics_reset_bucket) {
+                         metrics.reset_bucket();
+                     }
+@@ -4215,8 +4253,29 @@ private:
+                         SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
+                     }
+ 
++                    // t8 stadio 2 (spec §6, Task 6): concat observability. Read the
++                    // head size BEFORE the accept - common_speculative_accept()
++                    // consumes the per-seq round attribution (impl_head) that marks
++                    // this round as composed. The accepted head tokens are
++                    // min(n_accepted, k1'): the head is the first k1' rows of the
++                    // round, so a partial acceptance inside the head counts its
++                    // accepted prefix and an acceptance reaching past the head
++                    // counts the whole head (same boundary arithmetic as the MTP
++                    // impl's i_h, speculative.cpp accept()).
++                    const int32_t n_concat_head = common_speculative_concat_head_size(spec.get(), slot.id);
++
+                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+ 
++                    if (n_concat_head > 0) {
++                        const int32_t n_concat_mtp = std::min<int32_t>((int32_t) (accepted.size() - 1), n_concat_head);
++
++                        metrics.on_spec_route_concat_mtp_accepted(n_concat_mtp);
++
++                        slot.n_concat_rounds++;
++                        slot.n_concat_head_total += n_concat_head;
++                        slot.n_concat_mtp_accepted += n_concat_mtp;
++                    }
++
+                     slot.spec_draft = std::move(accepted);
+                     slot.spec_dists.clear();
+                 }
+@@ -4997,6 +5056,14 @@ void server_routes::init_routes() {
+                 {"value", res_task->spec_route_overrides_total},
+             });
+ 
++            // t8 stadio 2 (spec §6, Task 6): emitted unconditionally so the
++            // counter is present at 0 from boot (see server_metrics)
++            counter_defs.push_back({
++                {"name",  "spec_route_concat_mtp_accepted_total"},
++                {"help",  "Number of MTP head tokens accepted in composed concat rounds."},
++                {"value", res_task->spec_route_concat_mtp_accepted_total},
++            });
++
+             for (const auto & [kind, count] : res_task->spec_route_cache_rebuilds) {
+                 counter_defs.push_back({
+                     {"name",   "spec_route_cache_rebuild_total"},
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 46fce7547..557f13b8f 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -549,6 +549,9 @@ struct server_task_result_metrics : server_task_result {
+     std::map<std::string, uint64_t> spec_route_cache_rebuilds = {};
+     uint64_t spec_route_overrides_total = 0;
+ 
++    // t8 stadio 2 (spec §6, Task 6): MTP head tokens accepted in concat rounds
++    uint64_t spec_route_concat_mtp_accepted_total = 0;
++
+     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
+     // therefore, we use json to temporarily store the slot.to_json() result
+     json slots_data = json::array();
+-- 
+2.43.0
+

@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "spec-concat-exclusion.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1028,6 +1029,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<std::mt19937> selector_rng;
     std::vector<bool> selector_reset;
 
+    // t8 stadio 2 (Task 5 test coverage): one-shot INFO marker the first time a
+    // draft decode is split into more than one width group (mixed plain/concat
+    // rounds of concurrent sequences) - the grouped decode path is otherwise
+    // silent, and the smoke tests assert on this marker
+    bool width_split_logged = false;
+
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
@@ -1314,67 +1321,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        common_batch_clear(batch);
-
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        std::vector<int32_t> n_dft_v    (n_seq,  0);
 
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
-                continue;
-            }
+        // t8 stadio 2 (spec §3): per-seq MTP head tokens conditioning the block
+        // (0 outside concat rounds; dspark never receives a head)
+        std::vector<int32_t> n_head     (n_seq,  0);
+        // t8: rows this sequence adds to the draft batch (head + block)
+        std::vector<int32_t> n_rows     (n_seq,  0);
 
-            common_sampler_reset(smpls[seq_id].get());
-
-            const int32_t n = (int32_t) dp.n_past;
-
-            const int32_t n_draft = common_speculative_effective_n_max(params, dp);
-
-            const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
-            i_block_beg[seq_id] = batch.n_tokens;
-            n_block    [seq_id] = n_block_tokens;
-            for (int32_t i = 0; i < n_block_tokens; ++i) {
-                // NOTE: unlike upstream, request logits on every noise position
-                // also for DFlash2: build_post_sampling() reads the full-block
-                // logits to build the selector lattice (t_logits->ne[1] must
-                // equal n_tokens).
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
-            }
-        }
-
-        if (batch.n_tokens == 0) {
-            return;
-        }
-
-        // DFlash1 needs no pre-norm output during the noise-block decode; DFlash2
-        // instead reads its selector lattice from the unmasked pre-norm rows of
-        // exactly this decode, so the flag must stay on (set in the constructor).
-        if (!is_dspark && !is_dflash2) {
-            llama_set_embeddings_pre_norm(ctx_dft, false, /*masked*/ false);
-        }
-        int ret = llama_decode(ctx_dft, batch);
-        if (!is_dspark && !is_dflash2) {
-            llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
-        }
-        if (ret != 0) {
-            LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
-            return;
-        }
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] < 0) {
-                continue;
-            }
+        // t8 stadio 2: sample one sequence from the logits/embeddings of the LAST
+        // decode (the next decode overwrites the host buffers). Extracted from
+        // the former single-pass loop so the width-grouped decode below can
+        // sample each group right after its own decode.
+        auto sample_seq = [&](llama_seq_id seq_id, int32_t beg) {
             auto & dp = dparams[seq_id];
 
-            const int32_t beg            = i_block_beg[seq_id];
             const int32_t n_block_tokens = n_block[seq_id];
 
             auto * smpl = smpls[seq_id].get();
             auto & result = *dp.result;
 
-            const int32_t n_draft = common_speculative_effective_n_max(params, dp);
+            const int32_t n_draft = n_dft_v[seq_id];
             const int32_t n_min   = common_speculative_effective_n_min(params, dp, n_draft);
             const float   p_min   = common_speculative_effective_p_min(params, dp);
 
@@ -1398,7 +1367,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
-                    const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
+                    // t8 concat: skip the head rows - the selector lattice walks
+                    // the noise block only, which starts after the head
+                    const float * row = lattice + (size_t) (beg + n_head[seq_id] + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
 
                     if (dp.temperature > 0.0f) {
@@ -1418,6 +1389,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
                         predecessor = sample(selector_rng[seq_id]);
                         result.push_back(dist.ids[predecessor]);
+                        // t8 concat: dists cover ONLY the noise-block rows - the
+                        // head tokens carry no distribution - so a composed round
+                        // with temp>0 has dists.size() < draft.size() and the
+                        // server's size-guard falls back to exact accept; the
+                        // explicit temp>0 single-drafter fallback is Task 6
                         dp.dists->push_back(std::move(dist));
                     } else {
                         predecessor = (int32_t) std::distance(scores,
@@ -1426,13 +1402,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                // t8 concat: the closing arm's n_min counts the WHOLE round, head
+                // included (result holds head + block), so a high n_min can clear
+                // also a composed head -> round lost (spec §10 "never a lost
+                // round" tension: the target still decodes one token unperturbed,
+                // but the composed round is dropped; pre-existing semantics)
                 if (result.size() < (size_t) n_min) {
                     result.clear();
                     if (dp.dists) {
                         dp.dists->clear();
                     }
                 }
-                continue;
+                return;
             }
 
             if (is_dspark) {
@@ -1441,7 +1422,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * conf = p_min > 0.0f ? llama_get_embeddings_pre_norm(ctx_dft) : nullptr;
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
-                    const int32_t idx = beg + i;
+                    // t8 concat: n_head is always 0 for dspark (never a head) -
+                    // the offset is kept for symmetry with the other layouts
+                    const int32_t idx = beg + n_head[seq_id] + i;
                     if (conf && conf[(size_t) idx * n_embd_dec] < p_min) {
                         break;
                     }
@@ -1461,7 +1444,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             } else {
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
-                    common_sampler_sample(smpl, ctx_dft, beg + i, true);
+                    // t8 concat: the noise block starts after the head rows
+                    common_sampler_sample(smpl, ctx_dft, beg + n_head[seq_id] + i, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1484,6 +1468,144 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) n_min) {
                 result.clear();
             }
+        };
+
+        // pass 1: per-seq sizing
+        std::vector<llama_seq_id> seqs;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            common_sampler_reset(smpls[seq_id].get());
+
+            const int32_t n_draft = common_speculative_effective_n_max(params, dp);
+
+            const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
+            n_block[seq_id] = n_block_tokens;
+            n_dft_v[seq_id] = n_draft;
+            n_head [seq_id] = (!is_dspark && dp.concat_head) ? (int32_t) dp.concat_head->size() : 0;
+            n_rows [seq_id] = n_head[seq_id] + n_block_tokens;
+            seqs.push_back(seq_id);
+        }
+
+        if (seqs.empty()) {
+            return;
+        }
+
+        // t8 stadio 2: the DFlash2 selector graph requires a uniform per-seq width
+        // within one decode - it derives tokens_per_block = n_tokens / n_seqs_unq
+        // and asserts the exact division, so a batch mixing a concat round
+        // (1 + k1' + n_max rows) with a plain block (1 + n_max rows) would abort.
+        // Group the sequences by width and decode one group at a time, sampling
+        // each group before the next decode overwrites the host buffers. With a
+        // single width (every pre-t8 round) this is exactly the former
+        // one-batch one-decode flow.
+        std::sort(seqs.begin(), seqs.end(), [&](llama_seq_id a, llama_seq_id b) {
+            return n_rows[a] < n_rows[b];
+        });
+
+        // t8 stadio 2 (Task 5 test coverage): count the DISTINCT round widths in
+        // this decode BEFORE the grouping loop - one group holding 2+ sequences
+        // is the same-width case (the former one-decode flow), while a real
+        // split (e.g. a composed concat round next to a plain block) shows up
+        // as multiple single-width groups. The first real split is logged once
+        // at INFO so the concurrency smoke tests can assert the grouped decode
+        // path actually ran.
+        size_t n_width_groups = 0;
+        for (size_t s = 0; s < seqs.size(); ++s) {
+            if (s == 0 || n_rows[seqs[s]] != n_rows[seqs[s - 1]]) {
+                n_width_groups++;
+            }
+        }
+
+        size_t g = 0;
+        while (g < seqs.size()) {
+            size_t h = g;
+            while (h < seqs.size() && n_rows[seqs[h]] == n_rows[seqs[g]]) {
+                ++h;
+            }
+
+            if (g == 0 && n_width_groups > 1) {
+                if (!width_split_logged) {
+                    SPC_INF("dflash decode split into %zu width groups (n_seqs=%zu)\n", n_width_groups, seqs.size());
+                    width_split_logged = true;
+                } else {
+                    SPC_DBG("dflash decode split into %zu width groups (n_seqs=%zu)\n", n_width_groups, seqs.size());
+                }
+            }
+
+            common_batch_clear(batch);
+
+            for (size_t s = g; s < h; ++s) {
+                const llama_seq_id seq_id = seqs[s];
+                auto & dp = dparams[seq_id];
+
+                const int32_t n       = (int32_t) dp.n_past;
+                const int32_t n_draft = n_dft_v[seq_id];
+
+                i_block_beg[seq_id] = batch.n_tokens;
+
+                if (n_head[seq_id] > 0) {
+                    // t8 stadio 2 (spec §3) - concat round: the drafting input
+                    // carries the MTP head tokens at positions n+1..n+k1' and the
+                    // noise block shifts to n+k1'+1..n+k1'+n_draft; the anchor
+                    // (id_last @ n) is unchanged. The head replaces the mask
+                    // placeholder at those positions and conditions the block
+                    // through this context's non-causal attention - the head
+                    // tokens are verified by the target in the SAME round, never
+                    // confirmed unverified. All rows keep logits on so
+                    // t_logits->ne[1] stays equal to n_tokens (DFlash2
+                    // build_post_sampling reads the full-block logits).
+                    // dp.result already holds the k1' head tokens: the sampling
+                    // loop APPENDS to it, giving one concatenated draft per seq.
+                    common_batch_add(batch, dp.id_last, n, { seq_id }, true);
+                    for (int32_t j = 0; j < n_head[seq_id]; ++j) {
+                        common_batch_add(batch, (*dp.concat_head)[j], n + 1 + j, { seq_id }, true);
+                    }
+                    for (int32_t i = 1; i <= n_draft; ++i) {
+                        common_batch_add(batch, mask_token_id, n + n_head[seq_id] + i, { seq_id }, true);
+                    }
+                } else {
+                    for (int32_t i = 0; i < n_block[seq_id]; ++i) {
+                        // NOTE: unlike upstream, request logits on every noise position
+                        // also for DFlash2: build_post_sampling() reads the full-block
+                        // logits to build the selector lattice (t_logits->ne[1] must
+                        // equal n_tokens).
+                        common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+                    }
+                }
+            }
+
+            GGML_ASSERT(batch.n_tokens > 0);
+
+            // DFlash1 needs no pre-norm output during the noise-block decode; DFlash2
+            // instead reads its selector lattice from the unmasked pre-norm rows of
+            // exactly this decode, so the flag must stay on (set in the constructor).
+            if (!is_dspark && !is_dflash2) {
+                llama_set_embeddings_pre_norm(ctx_dft, false, /*masked*/ false);
+            }
+            const int ret = llama_decode(ctx_dft, batch);
+            if (!is_dspark && !is_dflash2) {
+                llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
+            }
+            if (ret != 0) {
+                // t8 stadio 2 (spec §10): a failed decode never errors the request
+                // - this group's sequences keep what they already drafted (a
+                // concat head closes a SHORT round of k1' tokens; a plain block
+                // leaves them without a draft this round) and the remaining
+                // groups still run.
+                LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
+                g = h;
+                continue;
+            }
+
+            for (size_t s = g; s < h; ++s) {
+                sample_seq(seqs[s], i_block_beg[seqs[s]]);
+            }
+
+            g = h;
         }
     }
 
@@ -1559,7 +1681,42 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     // memory rollback (prompt-cache boundary salvage, see the server) can
     // rewind pending_h to any of the last RING_N positions without a full
     // cold reprocessing.
-    static constexpr uint32_t RING_N = 8;
+    //
+    // Window sizing (2026-08-21 triage, t8 stadio 2): a client resend that
+    // truncates or mutates the tail of the last assistant turn must rewind
+    // pending_h to lcp-1, and that tail is the regenerated last word: its
+    // token length follows the greedy stream, which shifts with kernel
+    // numerics (the VK mul_mat_vec_max_cols 8->16 change moved 9-16-column
+    // MUL_MAT batches from the tiled f16 kernel to the f32 vec kernel).
+    // Causal tail-chop evidence on both the base image and the VK image:
+    // trailing rollback succeeded at tail deltas (cached_tokens - lcp) of
+    // 3-5 tokens and degraded to a cold fallback from 6 tokens on, because
+    // RING_N=8 without position-dedup retained only ~5 distinct positions
+    // (every verify round pushes its rows twice: process() mirrors the
+    // batch, accept() re-pushes verify_h; a partially rejected round also
+    // re-pushes its rejected tail). The window must cover ~2x a typical
+    // word (mutated word plus its template tail) with margin, so the fix
+    // widens the ring rather than masking the symptom.
+    //
+    // Sizing arithmetic (measured on the causal sweep): with the
+    // ring_push() position-dedup below, one slot is allocated per DISTINCT
+    // decoded position, so the ring holds the last RING_N positions of the
+    // stream MINUS the phantom tail: the rejected rows of the FINAL verify
+    // round are never re-decoded and keep occupying the newest ~n_max
+    // slots beyond the stream end (measured extent 8 with n_max 7). Real
+    // distinct-position coverage is therefore RING_N - ~n_max: 8 - 8 ~ 0-5
+    // (the original bug), 16 - 8 ~ 8 (cold fallback still at delta >= 8),
+    // 32 - 8 ~ 24 (covers deltas well past 14; >= 12 required). A no-dedup
+    // ring does not help: re-pushes consume slots at ~2x the batch width
+    // per round and low-acceptance tails measured only ~8 distinct
+    // positions even at 32 slots. The same rollback is ALSO gated by the
+    // target's recurrent snapshot depth (common.h need_n_rs_seq, floored
+    // at N_RS_SEQ_FLOOR by this same triage): the effective window is the minimum of
+    // the two. The serialized ring grows accordingly,
+    // which bumps MTP_STATE_VERSION: pre-widening checkpoints (whose
+    // newest-position ring entries were stale re-pushes) fail validation
+    // and take the existing cold-recreate path.
+    static constexpr uint32_t RING_N = 32;
     std::vector<std::vector<float>> ring_h;      // [n_seq][RING_N * n_embd]
     std::vector<std::vector<llama_pos>> ring_pos; // [n_seq][RING_N]
     std::vector<uint32_t> ring_len;              // [n_seq]
@@ -1977,9 +2134,26 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
             const llama_pos pos_needed = p_next - 1;
             if (!pending_h_valid[seq_id] || pending_h_pos[seq_id] != pos_needed) {
-                LOG_WRN("%s: disabling MTP draft for seq_id=%d: boundary pos=%d/%d, needed=%d\n",
-                        __func__, (int) seq_id, (int) pending_h_pos[seq_id],
-                        (int) pending_h_valid[seq_id], (int) pos_needed);
+                // t8 stadio 2 (spec §3/§10): for a sequence routed to draft-dflash
+                // this fires on every concat round that follows a partial
+                // rejection - accept() is dispatched to the round-closing arm only
+                // (multi-impl dispatch is Task 5), so pending_h is not rewound to
+                // the accepted boundary. The head is skipped and the harness
+                // degrades the round to a plain draft-dflash block: every token is
+                // still target-verified, so demote to debug - same treatment as the
+                // neutral resync in process() for sequences routed elsewhere.
+                const bool drafts_this_seq = dparams_routing == nullptr ||
+                    (*dparams_routing)[seq_id].drafter == COMMON_SPECULATIVE_TYPE_NONE ||
+                    (*dparams_routing)[seq_id].drafter == type;
+                if (drafts_this_seq) {
+                    LOG_WRN("%s: disabling MTP draft for seq_id=%d: boundary pos=%d/%d, needed=%d\n",
+                            __func__, (int) seq_id, (int) pending_h_pos[seq_id],
+                            (int) pending_h_valid[seq_id], (int) pos_needed);
+                } else {
+                    LOG_DBG("%s: MTP boundary behind the accepted position for seq_id=%d - concat head skipped, plain dflash round (pos=%d/%d, needed=%d)\n",
+                            __func__, (int) seq_id, (int) pending_h_pos[seq_id],
+                            (int) pending_h_valid[seq_id], (int) pos_needed);
+                }
                 dp.drafting = false;
                 continue;
             }
@@ -2144,15 +2318,61 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // t8 stadio 2 (spec §3, Task 5): partial head prefix - this impl drafted
+        // a concat head (last_n_drafted = k1') and the round verified more rows
+        // than that (the closing arm's block), but fewer tokens than the head
+        // were accepted: the boundary simply stops INSIDE the head at row i_h,
+        // which pairs with the target's freshest sample, so the next draft()
+        // resyncs from there exactly like a partially accepted mono-MTP round.
+        // Debug log only (soft check): a partial acceptance is a normal
+        // rejection, not an invariant violation.
+        if (n_rows > 1 + last_n_drafted[seq_id] && n_accepted < last_n_drafted[seq_id]) {
+            SPC_DBG("concat head partially accepted: n_accepted=%d < head k1'=%d (seq %d) - boundary at row %d/%d\n",
+                    (int) n_accepted, (int) last_n_drafted[seq_id], (int) seq_id, (int) i_h, (int) n_rows);
+        }
         if (i_h != n_rows - 1) {
             std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
         }
         pending_h_valid[seq_id] = 1;
         pending_h_pos[seq_id] = verify_pos_first[seq_id] + i_h;
 
+        // t8 stadio 2 (spec §3, Task 5): reconcile this impl's draft context with
+        // the accepted boundary. A partially accepted round leaves the mirrored
+        // verify rows of the rejected tail in ctx_dft. Invariant: this never
+        // trims below pending_h_pos (the freshest valid row), so the next
+        // process()/draft() always mirrors contiguously from there. In concat
+        // rounds this is the ONLY trim of this context - the server's rollback
+        // (server-context.cpp:4254-4257) trims the closing arm's context only,
+        // and the harness's draft-phase trim of the other context is skipped by
+        // any iteration that does not draft (e.g. the plain single-token decode
+        // at n_predict exhaustion): without this trim the stale tail fails the
+        // KV position contiguity check (Y = X + 1) and derails the request into
+        // the error loop (dispatch-only image d3bdf3497f46 evidence in
+        // logs/test-t8-concat/t5-dormancy-numbers.txt). Gemma4 assistants share
+        // the draft context with the target: the server trim covers them, keep
+        // out.
+        if (!is_mem_shared) {
+            if (!llama_memory_seq_rm(llama_get_memory(params.ctx_dft), seq_id, pending_h_pos[seq_id] + 1, -1)) {
+                // t8: a silent failure here would reintroduce the KV-contiguity
+                // runaway invisibly - warn loudly instead (no abort: the
+                // aggressive common_context_seq_rm wrapper is not appropriate
+                // for this best-effort reconciliation)
+                SPC_WRN("draft-context trim to the accepted boundary failed (seq %d, pos=%d)\n",
+                        (int) seq_id, (int) (pending_h_pos[seq_id] + 1));
+            }
+        }
+
         // all verification rows are valid boundary candidates at their
-        // contiguous positions: keep them in the rollback ring
-        for (int32_t i = 0; i < n_rows; ++i) {
+        // contiguous positions: keep them in the rollback ring.
+        // verify_h mirrors only rows [0, n_rows - 1) - the last row lives
+        // in pending_h (see process()) and was already pushed by process()
+        // with the authoritative embedding. Pushing row n_rows - 1 here
+        // read past the copied region and planted a stale duplicate of the
+        // newest position that shadowed the authoritative row in ring_get
+        // (which scans newest first), so bound the loop to the mirrored
+        // rows.
+        for (int32_t i = 0; i + 1 < n_rows; ++i) {
             ring_push(seq_id, verify_pos_first[seq_id] + i, verify_h[seq_id].data() + (size_t) i * n_embd);
         }
 
@@ -2175,13 +2395,34 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     }
 
     static constexpr uint32_t MTP_STATE_MAGIC       = 0x3250544d; // "MTP2" in little-endian byte order
-    static constexpr uint16_t MTP_STATE_VERSION     = 3;
+    // v4: rollback ring widened 8 -> 32 rows with position-dedup (same
+    // per-entry layout) - old blobs fail the version check below and take
+    // the cold-recreate path
+    static constexpr uint16_t MTP_STATE_VERSION     = 4;
     static constexpr uint16_t MTP_STATE_CURRENT     = 1u << 0;
     static constexpr uint16_t MTP_STATE_PREVIOUS    = 1u << 1;
     static constexpr size_t   MTP_STATE_HEADER      = sizeof(uint32_t) + 2*sizeof(uint16_t) + sizeof(uint32_t) + 2*sizeof(llama_pos);
 
     void ring_push(llama_seq_id seq_id, llama_pos pos, const float * row) {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // position-dedup: a verify round re-pushes rows that process() already
+        // mirrored, and after a partial rejection the next round re-decodes the
+        // rejected tail at the same positions with new content. Update the
+        // existing slot in place so a re-push never consumes a slot: without
+        // dedup RING_N slots hold only ~RING_N/2 (high acceptance) down to
+        // ~RING_N/4 (low acceptance) distinct positions and the rollback
+        // window shrinks with the acceptance rate (causal evidence 2026-08-21:
+        // cold fallback at delta 8/10 with a 32-slot no-dedup ring in a
+        // low-acceptance tail). With dedup RING_N is a guaranteed count of
+        // DISTINCT positions.
+        for (uint32_t i = 0; i < ring_len[seq_id]; ++i) {
+            const uint32_t idx = (ring_head[seq_id] + RING_N - 1 - i) % RING_N;
+            if (ring_pos[seq_id][idx] == pos) {
+                std::memcpy(ring_h[seq_id].data() + (size_t) idx * n_embd, row, row_bytes);
+                return;
+            }
+        }
 
         std::memcpy(ring_h[seq_id].data() + (size_t) ring_head[seq_id] * n_embd, row, row_bytes);
         ring_pos[seq_id][ring_head[seq_id]] = pos;
@@ -2362,6 +2603,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         pending_h_prev_pos[seq_id] = pending_h_prev_valid[seq_id] ? pos_previous : -1;
 
         // v3: trailing ring of recent boundary rows, oldest first
+        // v4: ring capacity 32 with position-dedup (window widening)
         uint32_t ring_count = 0;
         std::memcpy(&ring_count, data.data() + off, sizeof(ring_count)); off += sizeof(ring_count);
 
@@ -2839,6 +3081,45 @@ struct common_speculative {
 
     // which implementaion was used for a given seq_id
     std::vector<common_speculative_impl *> impl_last;
+
+    // t8 stadio 2 (spec §3, Task 5): the implementation that drafted the head of
+    // the concat round in flight for each seq (nullptr outside concat rounds).
+    // Set when the head is published in common_speculative_draft(), consumed and
+    // cleared by common_speculative_accept() to dispatch accept() to every round
+    // contributor - and cleared wholesale at the top of the next draft() call so
+    // a round that is never verified (lost round) cannot leak its contributor.
+    std::vector<common_speculative_impl *> impl_head;
+
+    // t8 stadio 2 (spec §3): concat round configuration (--spec-concat-k1, 0 = off
+    // - every concat branch below is gated on it and k1 = 0 boots run zero new
+    // code) and the per-seq storage backing common_speculative_draft_params::
+    // concat_head during the round in flight.
+    int32_t concat_k1 = 0;
+    std::vector<llama_tokens> concat_head;
+
+    // diagnostics: number of concat rounds composed (first one logs at INFO)
+    size_t n_concat_rounds = 0;
+
+    // t8 stadio 2 (spec §4, Task 6): the temp > 0 single-drafter fallback
+    // warning is logged once per session (server lifetime), not per request
+    bool concat_temp_fallback_warned = false;
+
+    // t8 branch-2 (spec §3): pattern-window exclusion for the concat round
+    // (--spec-concat-exclusion, default enabled). Inert unless concat rounds
+    // are armed: the gate lives inside the concat branch of
+    // common_speculative_draft(), so a k1 = 0 boot runs none of it
+    // (structural inertia; the bit-identical certification is gate G0 of the
+    // branch-2 plan).
+    bool concat_exclusion = true;
+
+    // t8 branch-2 (spec §3): cumulative exclusion counters - TELEMETRY ONLY:
+    // they feed no decision and no mechanism state (zero hysteresis by
+    // design) and are read as per-request deltas like the impl counters.
+    // total counts the rounds the gate evaluated (concat-eligible windows),
+    // gated the rounds routed down the plain path; both stay zero while the
+    // exclusion flag is off (the gate does not run at all).
+    size_t n_concat_excl_total = 0;
+    size_t n_concat_excl_gated = 0;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3214,6 +3495,28 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr)
     };
 
+    // t8 stadio 2 (spec §3): wire the concat configuration into the harness. The
+    // implementations keep receiving only their own draft params (they must not
+    // observe concat state), so the head tokens travel via dparams::concat_head,
+    // backed by this per-seq storage.
+    result->concat_k1 = params.concat_k1;
+    result->concat_exclusion = params.concat_exclusion;
+    result->concat_head.assign(n_seq, {});
+    result->impl_head.assign(n_seq, nullptr);
+    if (result->concat_k1 > 0) {
+        // gate the "armed" wording on the same requested-types check as the server
+        // boot marker (common_params_speculative::concat_armed()) - with a mono or
+        // otherwise non-dual boot this branch must not claim the mode is armed
+        // while the server logs "concat mode disabled" (quality review: the two
+        // lines said the opposite of each other)
+        if (params.concat_armed()) {
+            LOG_INF("%s: concat mode armed, k1=%d (per-request routing picks the rounds)\n", __func__, result->concat_k1);
+        } else {
+            LOG_INF("%s: concat k1=%d accepted but the requested speculative types are not the dual draft-mtp,draft-dflash routing - concat stays inert\n",
+                    __func__, result->concat_k1);
+        }
+    }
+
     return result;
 }
 
@@ -3347,8 +3650,17 @@ void common_speculative_draft(common_speculative * spec) {
     {
         int n_drafting = 0;
 
+        // t8 concat (Task 5): a new round starts - drop any head contributor
+        // left over from a round that was never accepted (lost round). A
+        // replayed round between draft() and accept() also loses its head
+        // contributor this way: benign dormancy, resync at the next full
+        // acceptance.
+        std::fill(spec->impl_head.begin(), spec->impl_head.end(), nullptr);
+
         for (auto & dp : dparams) {
             GGML_ASSERT(!dp.drafting || dp.result->empty());
+            // t8 concat: never leak a head pointer across rounds
+            dp.concat_head = nullptr;
 
             if (dp.drafting) {
                 n_drafting++;
@@ -3359,6 +3671,34 @@ void common_speculative_draft(common_speculative * spec) {
             return;
         }
     }
+
+    // t8 stadio 2 (spec §3): concat round support. In a dual MTP+DFlash routing
+    // armed with concat_k1 > 0, a sequence routed to draft-dflash composes its
+    // round as an MTP head of up to k1 tokens followed by the draft-dflash block
+    // conditioned on that head (the head tokens sit at positions n_past+1..n_past+k1'
+    // of the dflash drafting input, where the mask placeholder used to be). This
+    // is the one deliberate break of the first-wins chaining below: the MTP arm
+    // runs first for those sequences but does NOT close the round - the
+    // draft-dflash arm completes and closes it, so impl_last attributes the round
+    // to draft-dflash exactly as in the T7 routing.
+    common_speculative_impl * impl_mtp = nullptr;
+    common_speculative_impl * impl_dflash = nullptr;
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            impl_mtp = impl.get();
+        }
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+            impl_dflash = impl.get();
+        }
+    }
+    // degenerate guard: with a draft-dflash arm that cannot draft at all (n_max
+    // clamped to 0 post-load) the head would close head-only rounds attributed to
+    // dflash - keep the plain T7 routing instead (concat inert).
+    // NB deliberately NOT named concat_armed(): this adds impl existence and
+    // draft_n_max() > 0 on top of common_params_speculative::concat_armed()
+    // (requested types only) - different semantics, different name
+    const bool concat_rounds_ready = spec->concat_k1 > 0 && impl_mtp != nullptr &&
+            impl_dflash != nullptr && impl_dflash->draft_n_max() > 0;
 
     for (auto & impl : spec->impls) {
         // per-seq drafter routing (see common_speculative_draft_params::drafter):
@@ -3372,6 +3712,14 @@ void common_speculative_draft(common_speculative * spec) {
         int n_drafting_impl = 0;
         std::vector<llama_seq_id> seq_routed;
 
+        // t8 concat: sequences of this MTP-arm iteration that must draft the
+        // round's head (spec §3) - kept drafting (NOT stashed away like the
+        // routed ones) with dp.n_max temporarily clamped to k1 so the MTP arm
+        // produces at most the head
+        std::vector<llama_seq_id> seq_concat;
+        std::vector<int32_t>      seq_concat_n_max;
+        const bool concat_mtp_phase = concat_rounds_ready && impl.get() == impl_mtp;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
             auto & dp = dparams[seq_id];
 
@@ -3381,6 +3729,70 @@ void common_speculative_draft(common_speculative * spec) {
 
             if (dp.drafter == COMMON_SPECULATIVE_TYPE_NONE || dp.drafter == impl->type) {
                 n_drafting_impl++;
+            } else if (concat_mtp_phase && dp.drafter == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+                // t8 stadio 2 (spec §4, Task 6): temp > 0 single-drafter fallback,
+                // BEFORE any composition. A composed round mixes MTP head rows
+                // (which carry no proposal distribution) with DFlash noise rows
+                // (which do), so spec-dists acceptance is impossible on the mixed
+                // segment - the server's size-guard would silently degrade every
+                // such round to exact accept. Route the sequence to the class
+                // drafter instead: a plain draft-dflash round, exactly the
+                // concat_off path, whose dists cover the whole draft so sample
+                // acceptance works at temp > 0. WARNING once per session (spec §4).
+                if (dp.temperature > 0.0f) {
+                    if (!spec->concat_temp_fallback_warned) {
+                        spec->concat_temp_fallback_warned = true;
+                        SPC_WRN("concat mode fallback: temperature > 0 request (seq %d) - spec-dists acceptance is impossible on mixed MTP+DFlash segments; using single-drafter (class) rounds for every temp > 0 request - this warning is logged once per session\n",
+                                (int) seq_id);
+                    }
+                    seq_routed.push_back(seq_id);
+                } else {
+                    // t8 branch-2 (spec §3): pattern-window exclusion gate - it runs
+                    // BEFORE the round becomes a concat round (the head is published,
+                    // and its injection armed, only through seq_concat below). The
+                    // detector reads the last W confirmed tokens ending at the anchor
+                    // (dp.id_last @ dp.n_past, wiring map section 4.2): the drafting
+                    // prompt tail by pointer plus the anchor token, no per-round copy
+                    // of the slot buffer. A gated (pattern-like / copy-mode) window
+                    // routes the sequence down the PLAIN path - the exact k1 = 0
+                    // behavior for this round: stashed away from this MTP arm like
+                    // any other foreign-drafter sequence (the same mechanism as the
+                    // temp > 0 fallback above), so the draft-dflash arm drafts it
+                    // from the mask placeholder (dp.concat_head stays null: no head
+                    // injection, no "concat round composed" marker, no impl_head
+                    // attribution, no n_concat_rounds bump). Ungated windows compose
+                    // the concat round unchanged. --no-spec-concat-exclusion skips
+                    // the gate entirely (A-noexclusion test arm). The counters below
+                    // are TELEMETRY ONLY (spec §3): they feed no decision and no
+                    // mechanism state.
+                    bool excl_round_gated = false;
+                    if (spec->concat_exclusion && dp.prompt != nullptr) {
+                        const auto & prompt = *dp.prompt;
+                        const auto gres = spec_concat_exclusion::gating(
+                                prompt.data(), prompt.size(), dp.id_last);
+                        spec->n_concat_excl_total++;
+                        if (gres.gated) {
+                            excl_round_gated = true;
+                            spec->n_concat_excl_gated++;
+                            SPC_INF("spec-concat: gated p=%d segnale=%s (seq %d)\n",
+                                    gres.p_best, gres.segnale, (int) seq_id);
+                        }
+                    }
+
+                    if (excl_round_gated) {
+                        // plain round for this sequence in this round (k1 = 0 path)
+                        seq_routed.push_back(seq_id);
+                    } else {
+                        // concat round: the MTP arm heads it. The arm's effective n_max
+                        // already folds dp.n_max in, so clamping dp.n_max to k1 caps the
+                        // head at k1 tokens; the original per-request value is restored
+                        // right after the call, like the drafting stash below.
+                        seq_concat.push_back(seq_id);
+                        seq_concat_n_max.push_back(dp.n_max);
+                        dp.n_max = dp.n_max >= 0 ? std::min(dp.n_max, spec->concat_k1) : spec->concat_k1;
+                        n_drafting_impl++;
+                    }
+                }
             } else {
                 seq_routed.push_back(seq_id);
             }
@@ -3405,6 +3817,39 @@ void common_speculative_draft(common_speculative * spec) {
             dparams[seq_id].drafting = true;
         }
 
+        // t8 concat: restore the per-request n_max and publish the head. With a
+        // head of k1' > 0 tokens the round stays open - the draft-dflash arm below
+        // consumes dp.concat_head and closes the round (the first-wins close is
+        // skipped for this sequence in this iteration). With no head (p_min early
+        // stop or a boundary miss) the round degrades to a plain draft-dflash
+        // round, which requires re-arming drafting here because the MTP arm
+        // disables the sequence on a boundary miss (spec §10: never a lost round).
+        for (size_t i = 0; i < seq_concat.size(); ++i) {
+            auto & dp = dparams[seq_concat[i]];
+
+            dp.n_max       = seq_concat_n_max[i];
+            dp.concat_head = nullptr;
+
+            if (!dp.result->empty()) {
+                spec->concat_head[seq_concat[i]] = *dp.result;
+                dp.concat_head = &spec->concat_head[seq_concat[i]];
+                // t8 concat (Task 5): record the head contributor - accept()
+                // will dispatch to it as well (see common_speculative_accept)
+                spec->impl_head[seq_concat[i]] = impl_mtp;
+
+                spec->n_concat_rounds++;
+                if (spec->n_concat_rounds == 1) {
+                    SPC_INF("concat round composed, k1=%d (head=%zu tokens, seq %d)\n",
+                            spec->concat_k1, dp.result->size(), (int) seq_concat[i]);
+                } else {
+                    SPC_TRC("concat round composed, k1=%d (head=%zu tokens, seq %d)\n",
+                            spec->concat_k1, dp.result->size(), (int) seq_concat[i]);
+                }
+            } else {
+                dp.drafting = true;
+            }
+        }
+
         int n_drafting = 0;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
@@ -3414,23 +3859,43 @@ void common_speculative_draft(common_speculative * spec) {
 
             // a new draft has been sampled
             if (dp.drafting && !result.empty()) {
-                dp.drafting = false;
+                // t8 concat: while a head is stashed the round stays open - it is
+                // conditioning, not a completed round - and ONLY the draft-dflash
+                // arm may close it (spec §3: impl_last attributes the round to the
+                // closing arm). Closing on "any other impl" instead would depend
+                // on the init priority list keeping MTP first: with the arms
+                // reordered (or an intermediate arm drafting the sequence), the
+                // head would be closed - and accept() dispatched - to an arm that
+                // never drafted it. With this form a reordered list simply leaves
+                // the round unclosed here and concat degrades to plain rounds.
+                if (dp.concat_head == nullptr || impl.get() == impl_dflash) {
+                    dp.drafting = false;
 
-                if (dp.n_max >= 0 && (int) result.size() > dp.n_max) {
-                    LOG_DBG("%s: truncating draft to %d tokens\n", __func__, dp.n_max);
-                    result.resize(dp.n_max);
-                }
+                    // t8 concat (spec §10): the round-level n_max is per-SEQ and
+                    // counts the whole round - the k1' head tokens drafted by the
+                    // MTP arm sit on top of the closing arm's own budget, so the
+                    // shared-result truncate extends the cap by the head size
+                    // (zero extra on every non-concat round: identical behavior)
+                    const int32_t n_max_round = dp.n_max + (dp.concat_head ? (int32_t) dp.concat_head->size() : 0);
+                    if (dp.n_max >= 0 && (int) result.size() > n_max_round) {
+                        LOG_DBG("%s: truncating draft to %d tokens\n", __func__, n_max_round);
+                        result.resize(n_max_round);
+                    }
 
-                if (!result.empty()) {
-                    LOG_DBG("%s: called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n", __func__,
-                            common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
-                            impl.get()->n_call_draft, result.size());
+                    // t8 concat: the round is closed - release the head plumbing
+                    dp.concat_head = nullptr;
 
-                    // remember which implementation was used
-                    spec->impl_last[seq_id] = impl.get();
+                    if (!result.empty()) {
+                        LOG_DBG("%s: called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n", __func__,
+                                common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
+                                impl.get()->n_call_draft, result.size());
 
-                    impl->n_gen_drafts++;
-                    impl->n_gen_tokens += result.size();
+                        // remember which implementation was used
+                        spec->impl_last[seq_id] = impl.get();
+
+                        impl->n_gen_drafts++;
+                        impl->n_gen_tokens += result.size();
+                    }
                 }
             }
 
@@ -3451,6 +3916,9 @@ void common_speculative_draft(common_speculative * spec) {
         if (dp.drafting) {
             dp.drafting = false;
         }
+
+        // t8 concat: never leak a head pointer across rounds
+        dp.concat_head = nullptr;
     }
 }
 
@@ -3459,11 +3927,21 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
     GGML_ASSERT(impl);
 
-    // TODO: currently only the implementation that generated the draft is used to accept it
-    //       however, some implementations (such as MTP) need to also "see" the accepted tokens
-    //       extend `common_speculative_impl::accept()` with an extra argument `bool is_other` to
-    //       inform the implementation if the accepted tokens are from another implementation and
-    //       pass the accepted tokens to all remaining implementations using `is_other == true`
+    // t8 stadio 2 (spec §3, Task 5 - fixes the former accept-dispatch TODO): in a
+    // concat round the draft is composed by more than one implementation, and every
+    // contributor with per-seq boundary state must also "see" the accepted
+    // tokens - without this dispatch the head drafter's deferred boundary (MTP
+    // pending_h / eagle3 pending_g_last) stays at the end of the verify batch
+    // and goes stale after every partial rejection (deferred limit / get_state /
+    // cache-checkpoint desync, R2). The closing arm keeps the whole accounting
+    // (impl_last attribution, spec §3 "Statistics per-impl"); the head
+    // contributor receives the same TOTAL n_accepted and reconciles its
+    // boundary positionally: MTP computes pending = verify_pos_first +
+    // min(n_accepted, n_rows - 1), which is correct for any acceptance value
+    // including a partial head prefix (n_accepted < k1', boundary inside the
+    // head). The dispatch is per-round (impl_head is set only while this seq's
+    // round was composed), so implementations whose accept() consumes their own
+    // draft (e.g. the ngram maps) never receive another implementation's round.
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
 
@@ -3483,6 +3961,42 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         impl->accept(seq_id, n_accepted);
         impl->n_call_accept++;
     }
+
+    common_speculative_impl * impl_contrib = spec->impl_head[seq_id];
+    spec->impl_head[seq_id] = nullptr;
+
+    if (impl_contrib != nullptr && impl_contrib != impl) {
+        common_time_meas tm(impl_contrib->t_accept_us, !impl_contrib->gen_perf);
+
+        impl_contrib->accept(seq_id, n_accepted);
+        impl_contrib->n_call_accept++;
+    }
+}
+
+int32_t common_speculative_concat_head_size(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || spec->concat_k1 <= 0) {
+        return 0;
+    }
+
+    if (seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_head.size()) {
+        return 0;
+    }
+
+    // impl_head is non-null only while this sequence's round was composed as a
+    // concat round: set when the head is published in common_speculative_draft(),
+    // consumed here by accept() and cleared wholesale at the top of the next
+    // draft() call. It intentionally survives the server's checkpoint-replay
+    // path (no draft() runs between the restore and the replayed accept), where
+    // the replayed round keeps its original composition attribution.
+    if (spec->impl_head[seq_id] == nullptr) {
+        return 0;
+    }
+
+    return (int32_t) spec->concat_head[seq_id].size();
+}
+
+int32_t common_speculative_concat_k1(const common_speculative * spec) {
+    return spec ? spec->concat_k1 : 0;
 }
 
 // TODO: support the case of more than one speculative implementations having a state
@@ -3600,5 +4114,22 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+    }
+
+    // t8 branch-2 (spec §3): cumulative concat-exclusion telemetry, printed
+    // next to the per-impl counters above. TELEMETRY ONLY - never a decision
+    // input, never mechanism state (zero hysteresis by design); read as
+    // per-request deltas like the impl counters. total = rounds the gate
+    // evaluated (concat-eligible windows), gated = rounds sent down the plain
+    // path. Double-gated on the same condition the counters accumulate under:
+    // k1 > 0 (a k1 = 0 boot never runs the gate and must not see new
+    // statistics output) AND the exclusion flag on - with the flag off the
+    // gate never runs, the counters stay zero and the line is not printed
+    // (quality review: do not report empty exclusion telemetry).
+    if (spec->concat_k1 > 0 && spec->concat_exclusion) {
+        LOG_INF("statistics %16s: #excl rounds = %6zu, #gated rounds = %5zu\n",
+                "concat-exclusion",
+                spec->n_concat_excl_total,
+                spec->n_concat_excl_gated);
     }
 }

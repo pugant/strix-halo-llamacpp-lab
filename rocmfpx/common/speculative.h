@@ -72,6 +72,16 @@ struct common_speculative_draft_params {
 
     float temperature = 0.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // t8 stadio 2 (spec §3): concat round plumbing - when non-null, the pointed
+    // tokens are the MTP head (k1' <= concat_k1) already appended to `result` by
+    // the MTP arm of this round; the draft-dflash arm conditions its noise block
+    // on them (head at n_past+1..n_past+k1', block at n_past+k1'+1..) instead of
+    // using the mask placeholder at those positions. Owned by the harness
+    // (common_speculative::concat_head): set between the MTP and DFlash arms of
+    // the same common_speculative_draft() call and cleared when the round closes.
+    // Null outside concat rounds (and on every k1 = 0 boot: zero code path).
+    const llama_tokens * concat_head = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -104,6 +114,16 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// t8 stadio 2 (spec §6): size of the MTP concat head of the round in flight for
+// this sequence (0 = the next common_speculative_accept() will close a plain
+// round, not a composed one). Must be read BEFORE the accept call - it consumes
+// the per-seq round attribution this readout is derived from.
+int32_t common_speculative_concat_head_size(const common_speculative * spec, llama_seq_id seq_id);
+
+// t8 stadio 2 (spec §6): the configured concat head size (--spec-concat-k1,
+// 0 = concat rounds disabled)
+int32_t common_speculative_concat_k1(const common_speculative * spec);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

@@ -1,35 +1,4 @@
-# ROCmFPX (lab runtime snapshot) — the buildable source included in [pugant/strix-halo-llamacpp-lab](https://github.com/pugant/strix-halo-llamacpp-lab)
-
-This directory is the **complete source of the runtime fork**: a snapshot of our
-`drafter-routing` branch (final state `34a127168`) on top of
-[charlie12345/ROCmFPX](https://github.com/charlie12345/ROCmFPX), itself a fork of
-[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). It adds:
-
-- **Per-request speculative-decoding drafter routing** — built-in MTP ⇄ external DFlash2 in one
-  server, routed per request (`tools` signal or explicit `spec_drafter` body field). In daily
-  production on Strix Halo since 2026-08-20, validated by gates T1–T5.
-- **DFlash2 block-diffusion drafter** — port of upstream llama.cpp PR #27342 adapted to this fork.
-- **Reasoning/thinking budget** with cache-friendly forced-end — `--reasoning-budget`, per-request
-  `thinking_budget_tokens` / `thinking_token_budget` (vLLM alias) / `reasoning_budget_message`.
-- **Spec-boundary cache salvage** — bounded trailing rollback + context-checkpoint rollback
-  (~91% of prefill tokens salvaged on spec-boundary cold starts, measured on our workload).
-
-**Build & usage** — the complete, verified replication guide (containers, quantization pipeline,
-dual-drafter serve flags, benchmarks, patch index) is in the lab repo's README:
-**https://github.com/pugant/strix-halo-llamacpp-lab**
-
-Quick serve (Vulkan build, both drafters — exact verified flags):
-
-```bash
-llama-server -m <target.gguf> -ngl 999 -fa on --jinja -c 16384 \
-  --spec-type draft-mtp,draft-dflash \
-  --spec-draft-model <DFlash2-draft.gguf> \
-  --spec-draft-ngl all --spec-draft-n-max 7 \
-  --spec-draft-p-min 0.75 --spec-draft-p-split 0.10
-```
-
-> Everything here is experimental and provided as-is, at your own risk. Not affiliated with
-> AMD or ggml-org. Credits in the lab repo's NOTICE. The original ROCmFPX README follows.
+# ⚠️ You are on the `drafter-routing` branch — runtime code of [pugant/strix-halo-llamacpp-lab](https://github.com/pugant/strix-halo-llamacpp-lab)
 
 This branch is a community experiment on top of [charlie12345/ROCmFPX](https://github.com/charlie12345/ROCmFPX)
 (itself a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)). It adds:

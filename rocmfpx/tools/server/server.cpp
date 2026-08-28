@@ -111,6 +111,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // t8 branch-2 (gate G1): fixture parity selftest of the C++ concat-exclusion
+    // detector - runs and exits before any backend init, HTTP setup or model
+    // load. Exit code 0 = PASS n/n, 1 = FAIL (or unreadable fixtures).
+    if (!params.speculative.concat_selftest.empty()) {
+        return server_spec_concat_selftest(params.speculative.concat_selftest);
+    }
+
     llama_backend_init();
     llama_numa_init(params.numa);
 

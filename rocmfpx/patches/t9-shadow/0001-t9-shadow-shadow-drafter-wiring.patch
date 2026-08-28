@@ -1,0 +1,2278 @@
+From 87f1746922196ec84a1a820cfb5ad9215270511d Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 19:22:05 +0200
+Subject: [PATCH 01/16] feat(server): spec-shadow flag + boot marker [t9 fase
+ A]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 70f65ff9a..8d510395b 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -888,6 +888,11 @@ private:
+     bool spec_dft_ext = false;
+     bool spec_dual    = false;
+ 
++    // spec-shadow (T9 Fase A): shadow drafter DF7 post-commit, disattivato di default.
++    // A SPEC_SHADOW_DRAFT assente nessun codice shadow nel round loop; resta solo la
++    // riga C (timer+log gated da SPEC_SHADOW_LOG, identica nei due bracci — v. Task 2/6).
++    bool spec_shadow_on = false;
++
+     // spec-route: draft types that produced a drafting context on this server.
+     // spec_active_type is the single loaded type for non-dual servers (identity
+     // policy); NONE when zero or several implementations are loaded keeps the
+@@ -943,6 +948,7 @@ private:
+         spec_active_type = COMMON_SPECULATIVE_TYPE_NONE;
+         spec_dft_ext     = false;
+         spec_dual        = false;
++        spec_shadow_on   = false;
+ 
+         llama_init.reset();
+ 
+@@ -1395,6 +1401,24 @@ private:
+             }
+         }
+ 
++        // spec-shadow (T9 Fase A): boot guard for the shadow drafter DF7 (the
++        // draft-dflash implementation run again post-commit, out of the served
++        // round, to measure same-context E_M/E_D per round). Armed only by the
++        // explicit env SPEC_SHADOW_DRAFT=1 AND the dual routing with BOTH
++        // implementations actually instantiated: the measurement needs rounds
++        // served by draft-mtp with draft-dflash shadowing them - the same
++        // loaded condition the concat marker above relies on. With the env
++        // absent the flag stays false and no shadow code runs anywhere.
++        {
++            const char * e = getenv("SPEC_SHADOW_DRAFT");
++            spec_shadow_on = (e != nullptr && std::string(e) == "1")
++                && spec_dual
++                && spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) > 0
++                && spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) > 0;
++            SRV_INF("spec-shadow: %s (env SPEC_SHADOW_DRAFT; drafter=dflash n_max=7)\n",
++                    spec_shadow_on ? "armed" : "disabled");
++        }
++
+         for (int i = 0; i < params_base.n_parallel; i++) {
+             server_slot & slot = slots[i];
+ 
+-- 
+2.43.0
+
+
+From f9cffe2fc35729ad613f4b98e3d67008487da144 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 19:45:49 +0200
+Subject: [PATCH 02/16] feat(server): spec-shadow log C (commit timer per
+ round) [t9 fase A]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 161 +++++++++++++++++++++++++++++++-
+ 1 file changed, 157 insertions(+), 4 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 8d510395b..3fe2b319c 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -19,9 +19,11 @@
+ #include "mtmd-helper.h"
+ 
+ #include <algorithm>
++#include <cstdarg>
+ #include <cstdlib>
+ #include <cstring>
+ #include <cstddef>
++#include <cerrno>
+ #include <cinttypes>
+ #include <ctime>
+ #include <exception>
+@@ -59,6 +61,29 @@ enum server_state {
+     SERVER_STATE_READY,          // Server is ready and model is loaded
+ };
+ 
++// spec-shadow log (T9 Fase A): righe C (round vero, entrambi i boot del twin-run)
++// e S (shadow). Lazy: se SPEC_SHADOW_LOG non è impostato, zero cost dopo il primo
++// check. fflush a ogni riga (pattern SPEC_VERIFY_LOG in common/sampling.cpp e T7).
++static FILE * spec_shadow_log_file = nullptr;
++static void spec_shadow_log(const char * fmt, ...) {
++    if (spec_shadow_log_file == nullptr) {
++        const char * path = getenv("SPEC_SHADOW_LOG");
++        if (!path || !path[0]) { spec_shadow_log_file = (FILE *) -1; return; } // sentinella: disabled
++        spec_shadow_log_file = fopen(path, "a");
++        if (!spec_shadow_log_file) {
++            fprintf(stderr, "spec-shadow: cannot open SPEC_SHADOW_LOG '%s': %s\n", path, strerror(errno));
++            spec_shadow_log_file = (FILE *) -1;
++            return;
++        }
++    }
++    if (spec_shadow_log_file == (FILE *) -1) return;
++    va_list ap;
++    va_start(ap, fmt);
++    vfprintf(spec_shadow_log_file, fmt, ap);
++    va_end(ap);
++    fflush(spec_shadow_log_file);
++}
++
+ struct server_slot {
+     int id;
+ 
+@@ -316,6 +341,32 @@ struct server_slot {
+     int32_t n_concat_head_total = 0;   // MTP head tokens composed across those rounds
+     int32_t n_concat_mtp_accepted = 0; // MTP head tokens accepted across those rounds
+ 
++    // T9 Fase A: contatore round per slot (allinea righe C/S) + timer commit A
++    // SEGMENTI. La riga C gira IDENTICA nei due boot del twin-run: è gated SOLO
++    // da SPEC_SHADOW_LOG, non da spec_shadow_on.
++    //
++    // REGOLA PRE-REGISTRATA (controllo B, ±2%): t_commit_acc_us ESCLUDE il
++    // segmento common_speculative_process (che con shadow ON contiene il mirror
++    // DF delle righe del round vero = costo STRUTTURALE del twin-run) in
++    // ENTRAMBI i boot - stesso codice, pairing pulito. t_mirror_us è quel tempo
++    // escluso, loggato a parte nella riga C e contabilizzato dall'ORACLE come
++    // costo per-round addizionale. Il controllo B confronta quindi il path MTP
++    // puro.
++    //
++    // SEMANTICA di t_commit_acc_us ("commit_us" della riga C): copre l'INTERO
++    // GIRO del round vero (draft MTP + verify decode + accept + commit + trim +
++    // emissione) MENO il solo segmento common_speculative_process. Per l'oracle
++    // è il costo pieno del round MTP (t_M), NON solo della fase di commit
++    // nonostante il nome.
++    int          n_spec_rounds     = 0;   // incrementato a inizio di OGNI giro di generazione (spec o plain)
++    int          e_m_round         = 0;   // token accettati dai draft del round (catturato post-accept, pre-move)
++    int64_t      t_commit_acc_us   = 0;   // accumulo a segmenti (esclude common_speculative_process)
++    int64_t      t_commit_seg_us   = 0;   // apertura segmento corrente (ggml_time_us)
++    int64_t      t_mirror_us       = 0;   // tempo del segmento common_speculative_process (costo twin)
++    std::vector<llama_token> shadow_draft_buf;   // chain DF del round shadow (usata dal Task 5)
++    std::vector<int32_t>    shadow_i_batch;      // indici batch verify shadow (Task 5)
++    struct llama_batch      shadow_batch = {};   // batch verify shadow (ALLOCARE, v. init per-slot)
++
+     void reset() {
+         SLT_DBG(*this, "%s", "\n");
+ 
+@@ -357,6 +408,19 @@ struct server_slot {
+         n_concat_head_total = 0;
+         n_concat_mtp_accepted = 0;
+ 
++        // t9 fase A: per-round observability (see the fields above). n_spec_rounds
++        // == 0 also gates the C line: a slot whose round was never opened (first
++        // token of a request, sampled in the DONE_PROMPT->GENERATING transition
++        // round) or already released (release() runs this reset before the
++        // end-of-round C) must not log with a closed/garbage timer.
++        n_spec_rounds   = 0;
++        e_m_round       = 0;
++        t_commit_acc_us = 0;
++        t_commit_seg_us = 0;
++        t_mirror_us     = 0;
++        shadow_draft_buf.clear();
++        shadow_i_batch.clear();
++
+         task_prev = std::move(task);
+         task.reset();
+ 
+@@ -958,6 +1022,13 @@ private:
+         mtmd_free(mctx);
+         mctx = nullptr;
+ 
++        // t9 fase A: per-slot shadow verify batches (allocated in the per-slot
++        // init inside load_model(); server_slot has no custom destructor, so the
++        // vector reallocations never double-free them)
++        for (auto & slot : slots) {
++            llama_batch_free(slot.shadow_batch);
++        }
++
+         llama_batch_free(batch);
+     }
+ 
+@@ -1434,6 +1505,11 @@ private:
+             slot.mctx                   = mctx;
+             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+ 
++            // t9 fase A: batch verify shadow, una tantum per slot. Una llama_batch
++            // default-costruita crasha in common_batch_add per l'assert su seq_id
++            // (common.cpp) - va allocata esplicitamente (liberata in destroy()).
++            slot.shadow_batch = llama_batch_init(1 + 7 /* n_max DF */, 0 /*embd*/, 1 /*n_seq_max*/);
++
+             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+ 
+             slot.callback_on_release = [this](int id_slot) {
+@@ -2997,6 +3073,22 @@ private:
+ 
+             generating.push_back(&slot);
+ 
++            // t9 fase A: inizio del GIRO per-slot. Contato a OGNI giro in cui lo
++            // slot entra nel batch (spec o plain: i round TOTALI sono il
++            // denominatore dell'analisi; il timer sotto copre anche i giri che
++            // finiranno nel ramo rollback-checkpoint, che non completano e non
++            // scrivono la C - l'analisi allinea per adiacenza, v. piano Fase A).
++            // Righe: REQ apre la request al primo giro, C la chiude a fine giro.
++            {
++                if (slot.n_spec_rounds == 0) {
++                    spec_shadow_log("REQ,%d,%d\n", slot.id, slot.task ? slot.task->id : -1); // apre la request
++                }
++                slot.n_spec_rounds++;
++                slot.t_commit_acc_us = 0;
++                slot.t_mirror_us     = 0;
++                slot.t_commit_seg_us = ggml_time_us();
++            }
++
+             if (spec) {
+                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+ 
+@@ -4039,11 +4131,29 @@ private:
+             //        }
+             //    }
+             //}
+-            if (!common_speculative_process(spec.get(), batch_view)) {
+-                SRV_ERR("%s", "failed to process speculative batch\n");
++            {   // t9 fase A: il segmento process (con shadow ON contiene il mirror DF
++                // delle righe del round vero) è ESCLUSO dal timer commit - regola
++                // pre-registrata del controllo B, identica nei due boot del twin-run.
++                // Il process qui è per-batch (chunk), non per-slot: la pausa vale per
++                // tutti gli slot che stanno servendo il loro round in questo giro; il
++                // numero di chiamate process dipende solo dal batch, identico nei due
++                // boot, quindi il pairing resta pulito.
++                const int64_t t_process_0 = ggml_time_us();
++                for (auto * slot_ptr : generating) {
++                    slot_ptr->t_commit_acc_us += t_process_0 - slot_ptr->t_commit_seg_us;
++                }
++                const bool processed = common_speculative_process(spec.get(), batch_view);
++                const int64_t t_process_1 = ggml_time_us();
++                for (auto * slot_ptr : generating) {
++                    slot_ptr->t_mirror_us    += t_process_1 - t_process_0;
++                    slot_ptr->t_commit_seg_us = t_process_1;
++                }
++                if (!processed) {
++                    SRV_ERR("%s", "failed to process speculative batch\n");
+ 
+-                // TODO: handle error
+-                break;
++                    // TODO: handle error
++                    break;
++                }
+             }
+ 
+             // move the head of the batch forward with the number of tokens we just processed
+@@ -4160,6 +4270,22 @@ private:
+                 }
+ 
+                 slot.print_timings_tg();
++
++                // t9 fase A: riga C (path PLAIN - e_m_round resta 0: è la riga
++                // E_M=0 del denominatore TOTALE). Guardia n_spec_rounds > 0: la C
++                // esiste SOLO per un giro il cui timer è aperto. Limite dichiarato
++                // (piano Fase A): l'ultimo giro della request può uscire con il
++                // continue di stop qui sopra (process_token -> release() -> reset()
++                // azzera il contatore) -> l'ultima C della request può mancare;
++                // perdita SIMMETRICA nei due bracci del twin-run, escludibile in
++                // analisi (una coppia S(r-1)<->C(r) per request).
++                if (slot.n_spec_rounds > 0) {
++                    slot.t_commit_acc_us += ggml_time_us() - slot.t_commit_seg_us;
++                    spec_shadow_log("C,%d,%d,%d,%d,%lld,%lld\n", slot.id,
++                                    slot.task ? slot.task->id : -1, slot.n_spec_rounds,
++                                    slot.e_m_round, (long long) slot.t_commit_acc_us, (long long) slot.t_mirror_us);
++                    slot.e_m_round = 0;
++                }
+             }
+ 
+             // speculative decoding - main model sample and accept
+@@ -4322,6 +4448,18 @@ private:
+                         slot.n_concat_mtp_accepted += n_concat_mtp;
+                     }
+ 
++                    // t9 fase A: E_M del round, letto PRIMA del move (dopo, accepted è
++                    // moved-from con size()==0; e il const auto ids = std::move(
++                    // slot.spec_draft) più sotto svuota anche slot.spec_draft prima
++                    // dei trim). Replay-adjusted come n_accepted sotto. NOTA: questo
++                    // è il move del path COMMIT - il move gemello nel ramo
++                    // restore (checkpoint replay) appartiene a un giro che NON
++                    // completa e non scrive la C.
++                    slot.e_m_round = (int) accepted.size() - 1;   // token accettati dai draft (bonus escluso)
++                    if (slot.spec_is_replay && slot.e_m_round > 0) {
++                        slot.e_m_round--;
++                    }
++
+                     slot.spec_draft = std::move(accepted);
+                     slot.spec_dists.clear();
+                 }
+@@ -4385,6 +4523,21 @@ private:
+                 slot.print_timings_tg();
+ 
+                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
++
++                // t9 fase A: riga C (path SPEC post-commit), stesso helper e stessa
++                // format del path plain per evitare divergenze. Anche qui il giro
++                // che termina la request (process_token false -> release() dentro il
++                // loop ids sopra) passa da reset() e la guardia salta la C: perdita
++                // simmetrica dichiarata. I giri rollback-checkpoint (continue nel
++                // ramo restore sopra) non completano e non scrivono C: l'analisi
++                // allinea per adiacenza.
++                if (slot.n_spec_rounds > 0) {
++                    slot.t_commit_acc_us += ggml_time_us() - slot.t_commit_seg_us;
++                    spec_shadow_log("C,%d,%d,%d,%d,%lld,%lld\n", slot.id,
++                                    slot.task ? slot.task->id : -1, slot.n_spec_rounds,
++                                    slot.e_m_round, (long long) slot.t_commit_acc_us, (long long) slot.t_mirror_us);
++                    slot.e_m_round = 0;
++                }
+             }
+         }
+ 
+-- 
+2.43.0
+
+
+From ee4b30980f3f284fe0f904a0b991a831bd0ef710 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 20:05:05 +0200
+Subject: [PATCH 03/16] feat(sampling): shadow flag to isolate SPEC_VERIFY_LOG
+ [t9 fase A]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/sampling.cpp | 9 +++++++--
+ common/sampling.h   | 6 +++++-
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 869ab8355..413cc4bd7 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -745,7 +745,7 @@ llama_token_data_array * common_sampler_sample_top_k_probs(struct common_sampler
+     return &cur_p;
+ }
+ 
+-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
++std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first, bool shadow) {
+     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+ 
+     std::vector<llama_token> result;
+@@ -777,7 +777,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
+     // to a writable file. Does NOT alter sampling in any way. One R line per
+     // round, one P line per verify-batch row (including rows past the exact
+     // stop, so the analysis can simulate relaxed acceptance on the whole chain).
+-    {
++    //
++    // [t9 fase A] shadow rounds must not log here: the shadow verify runs on a
++    // cloned sampler and its outcome is reported by the server's S line (which
++    // also carries timings); writing R/P rows would pollute the real round's
++    // verify log (consumed downstream for the #R <= #C check).
++    if (!shadow) {
+         static FILE * spec_log = (FILE *) -1;
+         if (spec_log == (FILE *) -1) {
+             const char * spec_log_path = getenv("SPEC_VERIFY_LOG");
+diff --git a/common/sampling.h b/common/sampling.h
+index c6b8f3057..26f61cde1 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -85,7 +85,11 @@ llama_token_data_array * common_sampler_sample_top_k_probs(struct common_sampler
+ //
+ // returns at least 1 token, up to idxs.size()
+ //
+-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
++// shadow=true: identical verification, but does NOT write R/P/W rows to the
++// SPEC_VERIFY_LOG stream (used by the t9 shadow round on a cloned sampler, so
++// the real round's verify log stays unpolluted; the shadow outcome is reported
++// by the server instead).
++std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false, bool shadow = false);
+ 
+ // maximal-coupling verification for stochastic speculative decoding
+ std::vector<llama_token> common_sampler_sample_and_accept_n(
+-- 
+2.43.0
+
+
+From be16a3b99e9329e5f01ecbaad50a11269c9b1b75 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 20:21:04 +0200
+Subject: [PATCH 04/16] feat(spec): shadow-aware mirror process gate [t9 fase
+ A]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/speculative.cpp          | 33 +++++++++++++++++++++++++++++++--
+ common/speculative.h            |  5 +++++
+ tools/server/server-context.cpp | 12 ++++++++++++
+ 3 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 9671f452c..a2529b500 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -33,6 +33,20 @@
+ #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
+ #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+ 
++// t9 fase A (Task 4): arma il mirror DF di process() su TUTTE le seq, incluse
++// quelle routed a draft-mtp, per il drafter shadow (Task 5 drafta DF7 sul KV DF
++// di ctx_dft: senza questo flag le righe delle seq routed MTP mancherebbero dal
++// KV e il draft partirebbe da un contesto disallineato). File-scope perché
++// struct common_speculative è definita solo in questo .cpp: il server arma e
++// disarma via common_speculative_set_shadow(). NON atomica, scelta dichiarata:
++// il gate è letto dal thread del loop server dentro update_slots e il setter è
++// chiamato da load_model()/destroy() sullo STESSO thread (server_queue::
++// start_loop esegue callback_new_task - che gestisce destroy/load_model - e
++// callback_update_slots sequenzialmente) - nessun accesso concorrente.
++// Il flag NON segue spec.reset(): arm/disarm vive interamente nel server (boot
++// + destroy), così il wake da sleeping non lo lascia desincronizzato.
++static bool g_spec_shadow_armed = false;
++
+ const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
+     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
+     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
+@@ -1225,7 +1239,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         // with per-seq drafter routing active, only the sequences routed here (or
+         // unrouted) advance in this external draft context - the others are drafted
+         // by another implementation. Without routing the mapping is the identity,
+-        // i.e. the pre-routing behavior.
++        // i.e. the pre-routing behavior. (t9 fase A: con lo shadow armato il
++        // filtro si apre a TUTTE le seq - vedi il commento al gate qui sotto.)
+         std::vector<int32_t> sel;
+ 
+         // Flatten token-wise encoder work into shared chunks while preserving each row's position and sequence.
+@@ -1243,7 +1258,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     const llama_seq_id seq_id = batch_in.seq_id[j][0];
+                     GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
+                     const common_speculative_type drafter = (*dparams_routing)[seq_id].drafter;
+-                    if (drafter == COMMON_SPECULATIVE_TYPE_NONE || drafter == type) {
++                    // t9 fase A: ora processa anche le seq MTP quando lo shadow è
++                    // armato (il drafter DF deve ingerire TUTTE le righe target per
++                    // poter draftare in shadow sullo stesso KV). Boot con shadow
++                    // OFF: flag false -> condizione IDENTICA a main (zero delta).
++                    // COSTO: è il costo strutturale del twin-run (encoder injection
++                    // per riga) - NON va eliminato, va CONTABILIZZATO: escluso dal
++                    // timer commit, misurato come t_mirror_us nella riga C (regola
++                    // pre-registrata Task 2), sommato dall'oracle come costo
++                    // per-round.
++                    if (drafter == COMMON_SPECULATIVE_TYPE_NONE || drafter == type || g_spec_shadow_armed) {
+                         sel.push_back(i);
+                     }
+                 }
+@@ -3587,6 +3611,11 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+     }
+ }
+ 
++// t9 fase A (Task 4): setter del gate mirror - vedi g_spec_shadow_armed (top of file).
++void common_speculative_set_shadow(bool armed) {
++    g_spec_shadow_armed = armed;
++}
++
+ bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
+     bool result = true;
+ 
+diff --git a/common/speculative.h b/common/speculative.h
+index ba28607e8..28bd979c4 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -103,6 +103,11 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+ // process the batch and update the internal state of the speculative context
+ bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+ 
++// T9 Fase A: arma il mirror DF su TUTTE le seq (anche routed MTP) per il drafter shadow.
++// Con armed=false (default) il gate di common_speculative_process() per le
++// implementazioni DFlash/DSpark resta identico al comportamento pre-T9.
++void common_speculative_set_shadow(bool armed);
++
+ // true if any implementation requires target post-norm embeddings to be extracted
+ bool common_speculative_need_embd(common_speculative * spec);
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 3fe2b319c..eb36c4dbc 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1014,6 +1014,11 @@ private:
+         spec_dual        = false;
+         spec_shadow_on   = false;
+ 
++        // t9 fase A (Task 4): disarm del mirror DF (speculative.cpp) - il flag
++        // file-scope NON segue questo reset; il re-boot da env lo ri-arma in
++        // load_model() accanto al marker "spec-shadow: armed/disabled".
++        common_speculative_set_shadow(false);
++
+         llama_init.reset();
+ 
+         ctx_tgt = nullptr;
+@@ -1488,6 +1493,13 @@ private:
+                 && spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) > 0;
+             SRV_INF("spec-shadow: %s (env SPEC_SHADOW_DRAFT; drafter=dflash n_max=7)\n",
+                     spec_shadow_on ? "armed" : "disabled");
++
++            // t9 fase A (Task 4): arma il mirror DF del process() gate
++            // (speculative.cpp) - il bool file-scope NON segue spec.reset(),
++            // quindi arm/disarm vive qui (boot) e in destroy() per restare
++            // sincronizzato su ogni wake da sleeping (destroy -> load_model ->
++            // re-arm da env).
++            common_speculative_set_shadow(spec_shadow_on);
+         }
+ 
+         for (int i = 0; i < params_base.n_parallel; i++) {
+-- 
+2.43.0
+
+
+From 0ee4e076e87cafd8126558cb5d685a18a8aad212 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 20:52:35 +0200
+Subject: [PATCH 05/16] feat(server): shadow_drafter_round
+ draft+verify+rollback [t9 fase A]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/speculative.cpp          | 123 +++++++++++++++++++-
+ common/speculative.h            |  32 ++++++
+ tools/server/server-context.cpp | 192 +++++++++++++++++++++++++++++---
+ 3 files changed, 331 insertions(+), 16 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index a2529b500..fe2c5c9a8 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1206,7 +1206,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             const common_speculative_type drafter = (*dparams_routing)[seq_id].drafter;
+             if (drafter != COMMON_SPECULATIVE_TYPE_NONE && drafter != type) {
+                 // this sequence is drafted by another implementation and never
+-                // advances in this context - the pos_max check below would always trip
++                // advances in this context via the real-round draft path - the
++                // pos_max check below still only guards that path. (t9 fase A:
++                // with the shadow mirror armed (g_spec_shadow_armed) process()
++                // DOES ingest this sequence here, so the context can advance -
++                // begin() keeps skipping the selector reset and the check,
++                // which only matters for sequences this impl drafts for real)
+                 return;
+             }
+         }
+@@ -3616,6 +3621,122 @@ void common_speculative_set_shadow(bool armed) {
+     g_spec_shadow_armed = armed;
+ }
+ 
++// t9 fase A (Task 5): l'impl draft-dflash, stesso criterio del concat/dispatcher
++// in common_speculative_draft() (itera spec->impls per type). Nota: DSpark non è
++// un'implementazione separata qui - condivide la struct con DFlash via il
++// parametro type del ctor - quindi il confronto sul type è quello giusto.
++// Ritorna direttamente il tipo concreto: i due helper shadow leggono
++// params.ctx_dft senza cast nei caller.
++static common_speculative_impl_draft_dflash * common_speculative_find_dflash(common_speculative * spec) {
++    for (auto & impl : spec->impls) {
++        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
++            return static_cast<common_speculative_impl_draft_dflash *>(impl.get());
++        }
++    }
++    return nullptr;
++}
++
++int common_speculative_shadow_draft_dflash(
++        common_speculative * spec,
++        llama_seq_id seq_id,
++        common_speculative_draft_params & dp,
++        llama_pos & pos_bnd_out) {
++    if (spec == nullptr) {
++        return 0;
++    }
++
++    auto * impl_df = common_speculative_find_dflash(spec);
++    if (impl_df == nullptr || impl_df->draft_n_max() <= 0) {
++        return 0;
++    }
++
++    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) spec->dparams.size());
++    GGML_ASSERT(dp.result != nullptr);
++
++    auto * ctx_dft = impl_df->params.ctx_dft;
++    auto * mem_dft = llama_get_memory(ctx_dft);
++
++    // igiene pre-draft: il mirror armato (Task 4) ingerisce nel ctx DF l'INTERO
++    // batch di verify del round vero, coda rifiutata inclusa, quindi pos_max può
++    // stare OLTRE il boundary committato C_{r+1} (= dp.n_past). Il noise block
++    // del draft shadow ancora l'ancora a dp.n_past e non deve trovare righe
++    // stantie a quelle posizioni: trim best-effort al boundary (pattern del
++    // trim di accept() MTP, qui è codice di misura - mai abort), il prefisso
++    // committato del mirror (pos < dp.n_past) resta.
++    if (!llama_memory_seq_rm(mem_dft, seq_id, dp.n_past, -1)) {
++        SPC_WRN("shadow draft: dflash-context trim to the committed boundary failed (seq %d, pos=%d)\n",
++                (int) seq_id, (int) dp.n_past);
++    }
++
++    // boundary KV DF pre-draft, dopo il trim: in condizioni normali
++    // dp.n_past - 1 (tutto il mirror committato e nulla oltre). Esce come
++    // OUT param SOLO se il round produce una chain (vedi il contratto in
++    // speculative.h) - nessuno stato nella struct.
++    const llama_pos pos_bnd = llama_memory_seq_pos_max(mem_dft, seq_id);
++
++    // vec per-seq a dimensione piena: impl->draft() indicizza dparams[seq_id]
++    // per ogni seq in [0, n_seq), quindi una vec di una sola entry andrebbe out
++    // of bounds con n_seq > 1. Le altre seq restano drafting=false (tra un round
++    // e l'altro i flag live sono tutti falsi: il dispatcher li azzera a fine
++    // draft) e i loro campi non vengono mai letti. La nostra entry è la copia
++    // del caller con gli override shadow.
++    common_speculative_draft_params_vec vec(spec->dparams.size());
++    {
++        auto & sdp = vec[seq_id];
++        sdp = dp;
++        sdp.drafting   = true;
++        sdp.drafter    = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
++        sdp.concat_head = nullptr; // mai una testa concat in un round shadow
++    }
++
++    // chiamata diretta (niente dispatcher): impl_last/impl_head, attribuzione
++    // del round e reset dei flag live restano del round vero. I contatori
++    // per-impl dell'impl DF (n_call_draft, t_draft_us, smpls, selector_rng)
++    // avanzano col round shadow: drift dichiarato, solo diagnostica (il round
++    // vero di questa seq è temp 0 e non dipende da quello stato).
++    impl_df->draft(vec);
++
++    // trim immediato del noise block (pos > pos_bnd): la chain è già estratta
++    // da draft(), quelle righe KV non servono più - e il mirror di
++    // common_speculative_process() sulle righe verify shadow deve decodificare
++    // alle STESSE posizioni senza trovarle occupate (pattern del round vero:
++    // restore/trim del ctx del drafter PRIMA del verify decode). Anche con
++    // chain vuota (n_min/p_min clear) il noise block è stato decodificato e va
++    // rimosso. Best-effort come il pre-trim: WRN, mai abort.
++    if (!llama_memory_seq_rm(mem_dft, seq_id, pos_bnd + 1, -1)) {
++        SPC_WRN("shadow draft: dflash-context noise-block trim failed (seq %d, pos=%d)\n",
++                (int) seq_id, (int) (pos_bnd + 1));
++    }
++
++    if (!dp.result->empty()) {
++        pos_bnd_out = pos_bnd;
++    }
++
++    return (int) dp.result->size();
++}
++
++void common_speculative_shadow_rollback_dflash(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_bnd) {
++    if (spec == nullptr) {
++        return;
++    }
++
++    auto * impl_df = common_speculative_find_dflash(spec);
++    if (impl_df == nullptr) {
++        return;
++    }
++
++    auto * ctx_dft = impl_df->params.ctx_dft;
++
++    // best-effort (pattern del pre-trim gemello in shadow_draft_dflash): il
++    // round vero ripristina questo contesto per conto suo al prossimo draft,
++    // ma un fallimento silenzioso qui lascerebbe le righe mirror shadow nel
++    // ctx DF - WRN, mai abort in un round di misura.
++    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos_bnd + 1, -1)) {
++        SPC_WRN("shadow rollback: dflash-context trim past the shadow boundary failed (seq %d, pos=%d)\n",
++                (int) seq_id, (int) (pos_bnd + 1));
++    }
++}
++
+ bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
+     bool result = true;
+ 
+diff --git a/common/speculative.h b/common/speculative.h
+index 28bd979c4..b99150d5a 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -108,6 +108,38 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
+ // implementazioni DFlash/DSpark resta identico al comportamento pre-T9.
+ void common_speculative_set_shadow(bool armed);
+ 
++// T9 Fase A (Task 5): draft shadow DF per UNA seq, fuori dal routing e dal
++// dispatcher: chiama direttamente draft() dell'implementazione draft-dflash
++// (impl_last/impl_head/concat della struct restano del round vero). dp è la
++// copia del caller con gli override shadow (result -> buffer del server,
++// dists = nullptr, temperature = 0, n_max = budget DF7); il contesto DF
++// dell'impl viene prima ripulito al boundary dp.n_past (il mirror armato può
++// avervi lasciato la coda rifiutata del round vero) e il noise block del
++// draft viene rimosso al ritorno, così il mirror di process() sulle righe
++// verify shadow decodifica su posizioni libere. Ritorna il numero di token
++// draftati (0 = impl assente/clampata/draft vuoto) e scrive la chain in
++// dp.result. OUT pos_bnd_out = boundary KV del ctx DF post-trim pre-draft
++// (dp.n_past - 1 in condizioni normali): è scritto SOLO quando il ritorno è
++// > 0, altrimenti resta intatto - il chiamante lo ripassa tale e quale a
++// common_speculative_shadow_rollback_dflash() per chiudere il round shadow
++// (pairing esplicito chiamante→chiamato: nessuno stato nascosto nella struct
++// e nessun accoppiamento implicito fra round diversi). Lo stato interno
++// dell'impl DF (smpls per-seq, selector_rng) avanza col round shadow: drift
++// accettato e dichiarato (solo diagnostico).
++int common_speculative_shadow_draft_dflash(struct common_speculative * spec,
++                                            llama_seq_id seq_id,
++                                            common_speculative_draft_params & dp,
++                                            llama_pos & pos_bnd_out);
++
++// T9 Fase A (Task 5): trim best-effort del KV del SOLO contesto DFlash
++// (dell'impl) oltre pos_bnd, il boundary restituito da common_speculative_
++// shadow_draft_dflash() per lo STESSO round shadow (il server non vede il
++// ctx DF). Rimuove eventuali residui del noise block e il mirror DF delle
++// righe verify shadow. Best-effort: WRN sul fallimento, mai abort.
++void common_speculative_shadow_rollback_dflash(struct common_speculative * spec,
++                                                llama_seq_id seq_id,
++                                                llama_pos pos_bnd);
++
+ // true if any implementation requires target post-norm embeddings to be extracted
+ bool common_speculative_need_embd(common_speculative * spec);
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index eb36c4dbc..486fa3cee 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -84,6 +84,11 @@ static void spec_shadow_log(const char * fmt, ...) {
+     fflush(spec_shadow_log_file);
+ }
+ 
++// t9 fase A (Task 5, fix review Task 2 Minor 3): budget DF7 del drafter shadow,
++// definito UNA volta e condiviso dall'alloc del batch verify (init per-slot) e
++// da dp.n_max della funzione shadow - elimina il drift fra i due siti.
++static constexpr int SHADOW_N_MAX_DF = 7;
++
+ struct server_slot {
+     int id;
+ 
+@@ -367,6 +372,23 @@ struct server_slot {
+     std::vector<int32_t>    shadow_i_batch;      // indici batch verify shadow (Task 5)
+     struct llama_batch      shadow_batch = {};   // batch verify shadow (ALLOCARE, v. init per-slot)
+ 
++    // t9 fase A (Task 5, fix review Task 2 Important): chiusura del round vero -
++    // riga C del log spec-shadow. Il blocco era duplicato verbatim nei due path
++    // (plain e spec post-commit): la format string vive ORA una sola volta qui,
++    // così la riga S del Task 6 può agganciarsi accanto alle C senza drift.
++    // La guardia n_spec_rounds > 0 è DENTRO l'helper: la C esiste solo per un
++    // giro il cui timer è aperto (mai aperto, o già chiuso da reset()).
++    void log_round_close() {
++        if (n_spec_rounds <= 0) {
++            return;
++        }
++        t_commit_acc_us += ggml_time_us() - t_commit_seg_us;
++        spec_shadow_log("C,%d,%d,%d,%d,%lld,%lld\n", id,
++                        task ? task->id : -1, n_spec_rounds,
++                        e_m_round, (long long) t_commit_acc_us, (long long) t_mirror_us);
++        e_m_round = 0;
++    }
++
+     void reset() {
+         SLT_DBG(*this, "%s", "\n");
+ 
+@@ -1520,7 +1542,8 @@ private:
+             // t9 fase A: batch verify shadow, una tantum per slot. Una llama_batch
+             // default-costruita crasha in common_batch_add per l'assert su seq_id
+             // (common.cpp) - va allocata esplicitamente (liberata in destroy()).
+-            slot.shadow_batch = llama_batch_init(1 + 7 /* n_max DF */, 0 /*embd*/, 1 /*n_seq_max*/);
++            // 1 + SHADOW_N_MAX_DF righe: ancora (sampled) + chain DF7.
++            slot.shadow_batch = llama_batch_init(1 + SHADOW_N_MAX_DF, 0 /*embd*/, 1 /*n_seq_max*/);
+ 
+             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+ 
+@@ -4291,13 +4314,7 @@ private:
+                 // azzera il contatore) -> l'ultima C della request può mancare;
+                 // perdita SIMMETRICA nei due bracci del twin-run, escludibile in
+                 // analisi (una coppia S(r-1)<->C(r) per request).
+-                if (slot.n_spec_rounds > 0) {
+-                    slot.t_commit_acc_us += ggml_time_us() - slot.t_commit_seg_us;
+-                    spec_shadow_log("C,%d,%d,%d,%d,%lld,%lld\n", slot.id,
+-                                    slot.task ? slot.task->id : -1, slot.n_spec_rounds,
+-                                    slot.e_m_round, (long long) slot.t_commit_acc_us, (long long) slot.t_mirror_us);
+-                    slot.e_m_round = 0;
+-                }
++                slot.log_round_close();
+             }
+ 
+             // speculative decoding - main model sample and accept
+@@ -4543,19 +4560,164 @@ private:
+                 // simmetrica dichiarata. I giri rollback-checkpoint (continue nel
+                 // ramo restore sopra) non completano e non scrivono C: l'analisi
+                 // allinea per adiacenza.
+-                if (slot.n_spec_rounds > 0) {
+-                    slot.t_commit_acc_us += ggml_time_us() - slot.t_commit_seg_us;
+-                    spec_shadow_log("C,%d,%d,%d,%d,%lld,%lld\n", slot.id,
+-                                    slot.task ? slot.task->id : -1, slot.n_spec_rounds,
+-                                    slot.e_m_round, (long long) slot.t_commit_acc_us, (long long) slot.t_mirror_us);
+-                    slot.e_m_round = 0;
+-                }
++                slot.log_round_close();
+             }
+         }
+ 
+         SRV_DBG("%s", "run slots completed\n");
+     }
+ 
++    // t9 fase A (Task 5): pre-misura del round r+1 con drafter DF7 sul contesto
++    // C_{r+1} appena committato. Precondizioni (chiamante - Task 6):
++    // spec_shadow_on && slot.is_processing() && round committato (riga C già
++    // scritta). NON passa da common_speculative_draft(): impl_last/impl_head e
++    // i flag drafting live restano del round vero -> accept() del round vero
++    // invariato.
++    //
++    // Cosa NON tocca: slot.prompt.tokens, cache prompt, impl_last/impl_head,
++    // slot.smpl (clone only), contatori metriche del round vero (n_draft_*),
++    // spec_dists. spec_ckpt viene sovrascritto da update_tgt/load_tgt SOLO su
++    // memoria FULL: il round vero lo ri-snapshotta alla prossima draft phase
++    // (dopo un commit spec_draft è vuoto -> path fresh, mai il riuso parziale),
++    // quindi il checkpoint del round reale non è mai consumato dallo shadow.
++    //
++    // Semantica di misura dichiarata: DF "sempre attivo" - lo stato interno
++    // dell'impl DF (smpls per-seq, selector_rng, contatori per-impl) avanza con
++    // gli shadow draft; ininfluente sul round vero (temp 0, e il routing di
++    // questa seq resta MTP). Limite dichiarato: non replica il cap
++    // strict_qwen_mtp_verification (padding 256 celle) sul chain DF - in quel
++    // mode la E_D misurata può sovrastimare quella di un round DF reale quando
++    // il chain attraversa un boundary di blocco.
++    //
++    // Segmenti della riga S: draft_us = helper DF (igiene trim + draft DF);
++    // prep_us = build verify batch + snapshot ckpt tgt (FULL) + snapshot stato
++    // impl; accept_us = decode tgt + process (mirror DF/MTP) + accept greedy su
++    // sampler clonato; rollback_us = restore ckpt (FULL) + trim dei TRE
++    // contesti + restore stato impl.
++    void shadow_drafter_round(server_slot & slot) {
++        // dp shadow = dp del round vero con override. Copia by-value dalla dp
++        // live: il round vero la riscrive per intero alla prossima draft phase
++        // (assegnazione posizionale in update_slots), nessun refresh serve.
++        common_speculative_draft_params dp = common_speculative_get_draft_params(spec.get(), slot.id);
++        dp.drafting    = true;
++        dp.drafter     = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
++        dp.n_max       = SHADOW_N_MAX_DF;
++        dp.pos_next    = slot.prompt.tokens.pos_next(); // = boundary C_{r+1}
++        dp.id_last     = slot.sampled;                  // bonus token del round r
++        dp.n_past      = slot.prompt.n_tokens();        // come il round vero (pos dell'ancora)
++        dp.result      = &slot.shadow_draft_buf;
++        dp.dists       = nullptr;    // accettazione greedy (no spec-dists)
++        dp.temperature = 0.0f;       // greedy: soddisfa l'assert dflash2 (temperature<=0 || dists)
++        dp.concat_head = nullptr;    // mai una testa concat in un round shadow
++        slot.shadow_draft_buf.clear();
++
++        // t0 apre il segmento draft_us DOPO il setup dp: il contratto dei
++        // segmenti (commento sopra) dichiara draft_us = solo helper DF (setup
++        // no-GPU, microsecondi, fuori misura). df_pos_bnd = boundary del ctx DF
++        // restituito dall'helper: pairing esplicito con il rollback (3).
++        const int64_t t0 = ggml_time_us();
++        llama_pos df_pos_bnd = 0;
++
++        const int n_df = common_speculative_shadow_draft_dflash(spec.get(), slot.id, dp, df_pos_bnd);
++        const int64_t t1 = ggml_time_us();
++
++        int e_d = 0;
++        if (n_df > 0) {
++            // ---- verify: 1 + n_df righe su ctx_tgt, pattern del ramo spec di
++            // update_batch() (ancora = sampled @ pos_next, poi la chain)
++            common_batch_clear(slot.shadow_batch);
++            llama_pos pos0 = slot.prompt.tokens.pos_next();
++            slot.shadow_i_batch.clear();
++            common_batch_add(slot.shadow_batch, slot.sampled, pos0++, { slot.id }, true);
++            slot.shadow_i_batch.push_back(slot.shadow_batch.n_tokens - 1);
++            for (const auto tok : slot.shadow_draft_buf) {
++                common_batch_add(slot.shadow_batch, tok, pos0++, { slot.id }, true);
++                slot.shadow_i_batch.push_back(slot.shadow_batch.n_tokens - 1);
++            }
++
++            // snapshot ckpt target PRIMA del decode, SOLO per memoria FULL
++            // (seq_rm parziale assente: il rollback passa dal restore by-value).
++            // PART/RS escono dal verify con un append-only di <= 8 righe, entro
++            // il floor RS -> il trim diretto al rollback basta. Tipo gestito da
++            // questo full_mem: SOLO FULL (NO non può capitare: senza seq_rm il
++            // server non arma la speculazione in load_model).
++            const bool full_mem = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
++            if (full_mem) {
++                slot.spec_ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++            }
++
++            // snapshot dello stato impl (boundary MTP) da ripristinare a fine
++            // shadow: il mirror MTP è UNGATED e ingerisce le righe shadow,
++            // avanzando pending_h oltre il boundary committato - senza restore
++            // il draft MTP del round vero r+1 si spegne ("boundary pos mismatch"
++            // in impl draft-mtp). Stesso meccanismo get_state/set_state del
++            // restore post-checkpoint del round vero.
++            std::vector<uint8_t> shadow_spec_state;
++            const bool need_spec_state = common_speculative_state_required(spec.get());
++            if (need_spec_state && !common_speculative_get_state(spec.get(), slot.id, shadow_spec_state)) {
++                // il restore finale salta il blob vuoto: il round vero r+1
++                // potrebbe ripartire da un boundary neutro (draft MTP degradato
++                // per un giro) - non silenzioso, scremabile dai log
++                SLT_WRN(slot, "%s", "shadow round: impl-state snapshot failed - restore skipped, next real MTP draft may resync\n");
++            }
++            const int64_t t2 = ggml_time_us();
++
++            if (llama_decode(slot.ctx_tgt, slot.shadow_batch) == 0) {
++                common_speculative_process(spec.get(), slot.shadow_batch); // mirror DF (gate Task 4) + MTP ungated
++
++                // accept greedy su sampler CLONATO (il clone prende/ritorna raw
++                // ptr): slot.smpl avanza SOLO col round vero
++                common_sampler_ptr smpl_shadow(common_sampler_clone(slot.smpl.get()));
++                const auto accepted = common_sampler_sample_and_accept_n(smpl_shadow.get(), slot.ctx_tgt,
++                                        slot.shadow_i_batch, slot.shadow_draft_buf,
++                                        /*grammar_first=*/false, /*shadow=*/true);
++                // mai abort su un round di misura; il contratto del sampler garantisce >= 1
++                e_d = std::max(0, (int) accepted.size() - 1);
++            } else {
++                // e_d=0 registrato, indistinguibile da un full reject nelle sole
++                // righe S: questo WRN permette di scremare il run dall'analisi
++                SLT_WRN(slot, "%s", "shadow round: verify decode failed - e_d=0 recorded (indistinguishable from full reject)\n");
++            }
++            const int64_t t3 = ggml_time_us();
++
++            // ---- rollback: TRE contesti al boundary C_{r+1}
++            if (full_mem) {
++                const bool restored_tgt = slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++                if (!restored_tgt) {
++                    // misura best-effort: il decode è append-only, il trim sotto
++                    // rimuove comunque tutte le righe shadow; il round vero
++                    // ri-snapshotta il ckpt alla prossima draft phase
++                    SLT_WRN(slot, "%s", "shadow round: speculative checkpoint restore failed (target) - trimming only\n");
++                }
++            }
++            // (1) target: righe verify shadow oltre il boundary
++            common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
++            // (2) head MTP (slot.ctx_dft): il mirror MTP ungated ha ingerito le
++            //     righe shadow (sotto routing mtp slot.ctx_dft È l'head MTP)
++            common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
++            // (3) contesto DFlash dell'impl: mirror DF delle righe shadow (il
++            //     noise block è già stato rimosso dentro l'helper di draft);
++            //     df_pos_bnd è il boundary restituito dallo STESSO helper
++            common_speculative_shadow_rollback_dflash(spec.get(), slot.id, df_pos_bnd);
++            // stato impl (boundary MTP) riportato al boundary committato
++            if (need_spec_state && !shadow_spec_state.empty()) {
++                common_speculative_set_state(spec.get(), slot.id, shadow_spec_state);
++            }
++            const int64_t t4 = ggml_time_us();
++
++            spec_shadow_log("S,%d,%d,%d,%d,%d,%lld,%lld,%lld,%lld\n",
++                            slot.id, slot.task ? slot.task->id : -1, slot.n_spec_rounds,
++                            n_df, e_d, (long long)(t1-t0), (long long)(t2-t1),
++                            (long long)(t3-t2), (long long)(t4-t3));
++        } else {
++            // draft DF vuoto (clamp/gating/n_min/p_min): round shadow con E_D=0 e
++            // tempi parziali - prep/accept/rollback non girano (zero righe toccate)
++            spec_shadow_log("S,%d,%d,%d,0,0,%lld,%lld,%lld,%lld\n",
++                            slot.id, slot.task ? slot.task->id : -1, slot.n_spec_rounds,
++                            (long long)(t1-t0), (long long)0, (long long)0, (long long)0);
++        }
++    }
++
+     int get_slot_n_ctx() {
+         return slots.back().n_ctx;
+     }
+-- 
+2.43.0
+
+
+From 372740de5872909fa7185ee4fb015e2e8f0b4dc9 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 21:24:15 +0200
+Subject: [PATCH 06/16] feat(server): wire shadow hook in round loop [t9 fase
+ A]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 486fa3cee..5914fda9e 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4315,6 +4315,21 @@ private:
+                 // perdita SIMMETRICA nei due bracci del twin-run, escludibile in
+                 // analisi (una coppia S(r-1)<->C(r) per request).
+                 slot.log_round_close();
++
++                // T9 Fase A (Task 6): shadow DOPO il commit - pre-misura del
++                // round r+1 (in BOTH i path: spec e plain). Posizione: DOPO
++                // log_round_close() -> l'intero costo S cade FUORI dal timer C
++                // del round chiuso e PRIMA dell'apertura del round successivo.
++                // DECISIONE guardia: include anche n_spec_rounds > 0 per
++                // specchiare la guardia della C (che è DENTRO l'helper): se
++                // n_spec_rounds==0 non c'è stato round e slot.sampled/pos_next
++                // sarebbero stato incoerente -> S esiste SODO se la C del round
++                // esiste (o è esistita: se release() è scattato,
++                // is_processing() è già false). Ordine cheap-first: flag ->
++                // stato slot -> int compare.
++                if (spec_shadow_on && slot.is_processing() && slot.n_spec_rounds > 0) {
++                    shadow_drafter_round(slot);
++                }
+             }
+ 
+             // speculative decoding - main model sample and accept
+@@ -4561,6 +4576,16 @@ private:
+                 // ramo restore sopra) non completano e non scrivono C: l'analisi
+                 // allinea per adiacenza.
+                 slot.log_round_close();
++
++                // T9 Fase A (Task 6): shadow DOPO il commit - pre-misura del
++                // round r+1 (in BOTH i path: spec e plain). Stessa identica
++                // guardia del path plain (vedi lì per la DECISIONE n_spec_rounds
++                // > 0 che specchia la C). Nota qui: il giro che termina la
++                // request esce col break/release dentro il loop ids sopra ->
++                // is_processing() false -> S saltata, coerente con la C mancante.
++                if (spec_shadow_on && slot.is_processing() && slot.n_spec_rounds > 0) {
++                    shadow_drafter_round(slot);
++                }
+             }
+         }
+ 
+-- 
+2.43.0
+
+
+From 77d9a4f2a727638b392e5082acad0289322d4bf7 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 21:36:24 +0200
+Subject: [PATCH 07/16] fix(server): bit-exact shadow rollback via checkpoint
+ on RS [t9 fase A]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 43 ++++++++++++++++++++++-----------
+ 1 file changed, 29 insertions(+), 14 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 5914fda9e..282061f30 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4601,9 +4601,12 @@ private:
+     //
+     // Cosa NON tocca: slot.prompt.tokens, cache prompt, impl_last/impl_head,
+     // slot.smpl (clone only), contatori metriche del round vero (n_draft_*),
+-    // spec_dists. spec_ckpt viene sovrascritto da update_tgt/load_tgt SOLO su
+-    // memoria FULL: il round vero lo ri-snapshotta alla prossima draft phase
+-    // (dopo un commit spec_draft è vuoto -> path fresh, mai il riuso parziale),
++    // spec_dists. spec_ckpt viene sovrascritto da update_tgt/load_tgt su
++    // memoria FULL e RS (fix 23/08: bit-exact, v. WHY nel body): il round vero
++    // lo ri-snapshotta alla prossima draft phase (dopo un commit spec_draft è
++    // vuoto -> path fresh, mai il riuso parziale), e su RS un checkpoint
++    // stantio dello shadow non è mai consumato (restore solo se
++    // n_rollback > floor -> implica draft > floor -> snapshot fresco già fatto),
+     // quindi il checkpoint del round reale non è mai consumato dallo shadow.
+     //
+     // Semantica di misura dichiarata: DF "sempre attivo" - lo stato interno
+@@ -4615,9 +4618,9 @@ private:
+     // il chain attraversa un boundary di blocco.
+     //
+     // Segmenti della riga S: draft_us = helper DF (igiene trim + draft DF);
+-    // prep_us = build verify batch + snapshot ckpt tgt (FULL) + snapshot stato
++    // prep_us = build verify batch + snapshot ckpt tgt (FULL/RS) + snapshot stato
+     // impl; accept_us = decode tgt + process (mirror DF/MTP) + accept greedy su
+-    // sampler clonato; rollback_us = restore ckpt (FULL) + trim dei TRE
++    // sampler clonato; rollback_us = restore ckpt (FULL/RS) + trim dei TRE
+     // contesti + restore stato impl.
+     void shadow_drafter_round(server_slot & slot) {
+         // dp shadow = dp del round vero con override. Copia by-value dalla dp
+@@ -4660,14 +4663,23 @@ private:
+                 slot.shadow_i_batch.push_back(slot.shadow_batch.n_tokens - 1);
+             }
+ 
+-            // snapshot ckpt target PRIMA del decode, SOLO per memoria FULL
+-            // (seq_rm parziale assente: il rollback passa dal restore by-value).
+-            // PART/RS escono dal verify con un append-only di <= 8 righe, entro
+-            // il floor RS -> il trim diretto al rollback basta. Tipo gestito da
+-            // questo full_mem: SOLO FULL (NO non può capitare: senza seq_rm il
+-            // server non arma la speculazione in load_model).
+-            const bool full_mem = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+-            if (full_mem) {
++            // snapshot ckpt target PRIMA del decode, per memoria FULL E RS.
++            // WHY RS (fix smoke 23/08): su RS il trim = bounded removal con
++            // replay -> stato ricorrente non-bit-identico -> drift asimmetrico
++            // vs braccio OFF -> controllo A FAIL (flip greedy al round-4
++            // anchor, risposta troncata a 19 tok vs 100). Il checkpoint
++            // save/restore è bit-exact per costruzione ed è il pattern che il
++            // round vero usa su RS quando le righe superano il floor
++            // (update_tgt ~:3299, load_tgt ~:4394 + trim post-load). Il costo
++            // extra (state get/set) finisce in prep_us/rollback_us, ESCLUSI da
++            // t_D per costruzione. PART resta su trim diretto (partial removal
++            // nativo senza replay = bit-exact su KV classico). NO non può
++            // capitare: senza seq_rm il server non arma la speculazione in
++            // load_model.
++            const bool use_ckpt_tgt =
++                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
++            if (use_ckpt_tgt) {
+                 slot.spec_ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+             }
+ 
+@@ -4706,7 +4718,10 @@ private:
+             const int64_t t3 = ggml_time_us();
+ 
+             // ---- rollback: TRE contesti al boundary C_{r+1}
+-            if (full_mem) {
++            // (FULL/RS: restore by-value dal checkpoint -> bit-exact; il trim
++            // sotto è il Pattern del round vero post-load_tgt, e resta il
++            // fallback se il load fallisce)
++            if (use_ckpt_tgt) {
+                 const bool restored_tgt = slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                 if (!restored_tgt) {
+                     // misura best-effort: il decode è append-only, il trim sotto
+-- 
+2.43.0
+
+
+From 1d5cbd7254e89e0b28200b98e95132f7ede89e81 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 21:41:57 +0200
+Subject: [PATCH 08/16] fix(server): bit-exact shadow rollback for draft head
+ on RS [t9 fase A]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 49 ++++++++++++++++++++++++++-------
+ 1 file changed, 39 insertions(+), 10 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 282061f30..c234e0aeb 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4601,13 +4601,15 @@ private:
+     //
+     // Cosa NON tocca: slot.prompt.tokens, cache prompt, impl_last/impl_head,
+     // slot.smpl (clone only), contatori metriche del round vero (n_draft_*),
+-    // spec_dists. spec_ckpt viene sovrascritto da update_tgt/load_tgt su
+-    // memoria FULL e RS (fix 23/08: bit-exact, v. WHY nel body): il round vero
+-    // lo ri-snapshotta alla prossima draft phase (dopo un commit spec_draft è
+-    // vuoto -> path fresh, mai il riuso parziale), e su RS un checkpoint
+-    // stantio dello shadow non è mai consumato (restore solo se
+-    // n_rollback > floor -> implica draft > floor -> snapshot fresco già fatto),
+-    // quindi il checkpoint del round reale non è mai consumato dallo shadow.
++    // spec_dists. spec_ckpt viene sovrascritto da update_tgt/update_dft e
++    // load_tgt/load_dft su memoria FULL e RS (fix 23/08: bit-exact, v. WHY nel
++    // body): il round vero lo ri-snapshotta alla prossima draft phase (dopo un
++    // commit spec_draft è vuoto -> path fresh, mai il riuso parziale), e su RS
++    // un checkpoint stantio dello shadow non è mai consumato (i restore tgt/dft
++    // del round vero scattano solo su FULL ~:3266/:4408, oppure con
++    // n_rollback > rs_seq floor ~:4365/:4394 — impossibile con n_max <= floor:
++    // implica draft > floor -> snapshot fresco già fatto), quindi il checkpoint
++    // del round reale non è mai consumato dallo shadow.
+     //
+     // Semantica di misura dichiarata: DF "sempre attivo" - lo stato interno
+     // dell'impl DF (smpls per-seq, selector_rng, contatori per-impl) avanza con
+@@ -4618,9 +4620,9 @@ private:
+     // il chain attraversa un boundary di blocco.
+     //
+     // Segmenti della riga S: draft_us = helper DF (igiene trim + draft DF);
+-    // prep_us = build verify batch + snapshot ckpt tgt (FULL/RS) + snapshot stato
++    // prep_us = build verify batch + snapshot ckpt tgt+dft (FULL/RS) + snapshot stato
+     // impl; accept_us = decode tgt + process (mirror DF/MTP) + accept greedy su
+-    // sampler clonato; rollback_us = restore ckpt (FULL/RS) + trim dei TRE
++    // sampler clonato; rollback_us = restore ckpt tgt+dft (FULL/RS) + trim dei TRE
+     // contesti + restore stato impl.
+     void shadow_drafter_round(server_slot & slot) {
+         // dp shadow = dp del round vero con override. Copia by-value dalla dp
+@@ -4683,6 +4685,22 @@ private:
+                 slot.spec_ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+             }
+ 
++            // snapshot anche dell'head attivo (slot.ctx_dft), stesso criterio
++            // FULL/RS: il mirror MTP ungated ingerisce le righe shadow nel
++            // process() del decode sotto, e il trim (2) del rollback è
++            // bounded removal con replay -> drift dello stato dell'head ->
++            // draft chain del round vero r+1 diverge (re-smoke 23/08: prima
++            // R row divergente al round 12, n_draft 2 vs 1, flip visibile nel
++            // testo ~token 57). update_dft pre-decode == pre-process per
++            // l'head (il decode tgt non lo tocca). Pattern del round vero:
++            // update_dft ~:3312, load_dft ~:4408 + trim post-load.
++            const bool use_ckpt_dft =
++                spec_route_ctx_rm_type(slot) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++                spec_route_ctx_rm_type(slot) == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
++            if (use_ckpt_dft) {
++                slot.spec_ckpt.update_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++            }
++
+             // snapshot dello stato impl (boundary MTP) da ripristinare a fine
+             // shadow: il mirror MTP è UNGATED e ingerisce le righe shadow,
+             // avanzando pending_h oltre il boundary committato - senza restore
+@@ -4733,7 +4751,18 @@ private:
+             // (1) target: righe verify shadow oltre il boundary
+             common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+             // (2) head MTP (slot.ctx_dft): il mirror MTP ungated ha ingerito le
+-            //     righe shadow (sotto routing mtp slot.ctx_dft È l'head MTP)
++            //     righe shadow (sotto routing mtp slot.ctx_dft È l'head MTP).
++            //     FULL/RS: restore by-value dal checkpoint -> bit-exact, il trim
++            //     qui sotto è bookkeeping post-load (pattern del round vero
++            //     ~:4418) e resta il fallback; PART: trim diretto (KV classico).
++            if (use_ckpt_dft) {
++                const bool restored_dft = slot.spec_ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++                if (!restored_dft) {
++                    // misura best-effort: il trim sotto rimuove comunque le
++                    // righe shadow (con replay -> possibile drift, scremabile)
++                    SLT_WRN(slot, "%s", "shadow round: speculative checkpoint restore failed (draft head) - trimming only\n");
++                }
++            }
+             common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+             // (3) contesto DFlash dell'impl: mirror DF delle righe shadow (il
+             //     noise block è già stato rimosso dentro l'helper di draft);
+-- 
+2.43.0
+
+
+From 6a8b3982afca4dee4cb108b7be778787e49a0492 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 22:00:18 +0200
+Subject: [PATCH 09/16] Revert "fix(server): bit-exact shadow rollback for
+ draft head on RS [t9 fase A]"
+
+This reverts commit 1d5cbd7254e89e0b28200b98e95132f7ede89e81.
+---
+ tools/server/server-context.cpp | 49 +++++++--------------------------
+ 1 file changed, 10 insertions(+), 39 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c234e0aeb..282061f30 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4601,15 +4601,13 @@ private:
+     //
+     // Cosa NON tocca: slot.prompt.tokens, cache prompt, impl_last/impl_head,
+     // slot.smpl (clone only), contatori metriche del round vero (n_draft_*),
+-    // spec_dists. spec_ckpt viene sovrascritto da update_tgt/update_dft e
+-    // load_tgt/load_dft su memoria FULL e RS (fix 23/08: bit-exact, v. WHY nel
+-    // body): il round vero lo ri-snapshotta alla prossima draft phase (dopo un
+-    // commit spec_draft è vuoto -> path fresh, mai il riuso parziale), e su RS
+-    // un checkpoint stantio dello shadow non è mai consumato (i restore tgt/dft
+-    // del round vero scattano solo su FULL ~:3266/:4408, oppure con
+-    // n_rollback > rs_seq floor ~:4365/:4394 — impossibile con n_max <= floor:
+-    // implica draft > floor -> snapshot fresco già fatto), quindi il checkpoint
+-    // del round reale non è mai consumato dallo shadow.
++    // spec_dists. spec_ckpt viene sovrascritto da update_tgt/load_tgt su
++    // memoria FULL e RS (fix 23/08: bit-exact, v. WHY nel body): il round vero
++    // lo ri-snapshotta alla prossima draft phase (dopo un commit spec_draft è
++    // vuoto -> path fresh, mai il riuso parziale), e su RS un checkpoint
++    // stantio dello shadow non è mai consumato (restore solo se
++    // n_rollback > floor -> implica draft > floor -> snapshot fresco già fatto),
++    // quindi il checkpoint del round reale non è mai consumato dallo shadow.
+     //
+     // Semantica di misura dichiarata: DF "sempre attivo" - lo stato interno
+     // dell'impl DF (smpls per-seq, selector_rng, contatori per-impl) avanza con
+@@ -4620,9 +4618,9 @@ private:
+     // il chain attraversa un boundary di blocco.
+     //
+     // Segmenti della riga S: draft_us = helper DF (igiene trim + draft DF);
+-    // prep_us = build verify batch + snapshot ckpt tgt+dft (FULL/RS) + snapshot stato
++    // prep_us = build verify batch + snapshot ckpt tgt (FULL/RS) + snapshot stato
+     // impl; accept_us = decode tgt + process (mirror DF/MTP) + accept greedy su
+-    // sampler clonato; rollback_us = restore ckpt tgt+dft (FULL/RS) + trim dei TRE
++    // sampler clonato; rollback_us = restore ckpt (FULL/RS) + trim dei TRE
+     // contesti + restore stato impl.
+     void shadow_drafter_round(server_slot & slot) {
+         // dp shadow = dp del round vero con override. Copia by-value dalla dp
+@@ -4685,22 +4683,6 @@ private:
+                 slot.spec_ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+             }
+ 
+-            // snapshot anche dell'head attivo (slot.ctx_dft), stesso criterio
+-            // FULL/RS: il mirror MTP ungated ingerisce le righe shadow nel
+-            // process() del decode sotto, e il trim (2) del rollback è
+-            // bounded removal con replay -> drift dello stato dell'head ->
+-            // draft chain del round vero r+1 diverge (re-smoke 23/08: prima
+-            // R row divergente al round 12, n_draft 2 vs 1, flip visibile nel
+-            // testo ~token 57). update_dft pre-decode == pre-process per
+-            // l'head (il decode tgt non lo tocca). Pattern del round vero:
+-            // update_dft ~:3312, load_dft ~:4408 + trim post-load.
+-            const bool use_ckpt_dft =
+-                spec_route_ctx_rm_type(slot) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+-                spec_route_ctx_rm_type(slot) == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+-            if (use_ckpt_dft) {
+-                slot.spec_ckpt.update_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+-            }
+-
+             // snapshot dello stato impl (boundary MTP) da ripristinare a fine
+             // shadow: il mirror MTP è UNGATED e ingerisce le righe shadow,
+             // avanzando pending_h oltre il boundary committato - senza restore
+@@ -4751,18 +4733,7 @@ private:
+             // (1) target: righe verify shadow oltre il boundary
+             common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+             // (2) head MTP (slot.ctx_dft): il mirror MTP ungated ha ingerito le
+-            //     righe shadow (sotto routing mtp slot.ctx_dft È l'head MTP).
+-            //     FULL/RS: restore by-value dal checkpoint -> bit-exact, il trim
+-            //     qui sotto è bookkeeping post-load (pattern del round vero
+-            //     ~:4418) e resta il fallback; PART: trim diretto (KV classico).
+-            if (use_ckpt_dft) {
+-                const bool restored_dft = slot.spec_ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+-                if (!restored_dft) {
+-                    // misura best-effort: il trim sotto rimuove comunque le
+-                    // righe shadow (con replay -> possibile drift, scremabile)
+-                    SLT_WRN(slot, "%s", "shadow round: speculative checkpoint restore failed (draft head) - trimming only\n");
+-                }
+-            }
++            //     righe shadow (sotto routing mtp slot.ctx_dft È l'head MTP)
+             common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+             // (3) contesto DFlash dell'impl: mirror DF delle righe shadow (il
+             //     noise block è già stato rimosso dentro l'helper di draft);
+-- 
+2.43.0
+
+
+From 5c982c44641a851ab4c6a36b5e4afb198e611507 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 22:03:48 +0200
+Subject: [PATCH 10/16] fix(server): full-state shadow checkpoint avoids stale
+ rs ring [t9 fase A]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 75 +++++++++++++++++++--------------
+ 1 file changed, 44 insertions(+), 31 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 282061f30..a6fbf6476 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4602,10 +4602,10 @@ private:
+     // Cosa NON tocca: slot.prompt.tokens, cache prompt, impl_last/impl_head,
+     // slot.smpl (clone only), contatori metriche del round vero (n_draft_*),
+     // spec_dists. spec_ckpt viene sovrascritto da update_tgt/load_tgt su
+-    // memoria FULL e RS (fix 23/08: bit-exact, v. WHY nel body): il round vero
+-    // lo ri-snapshotta alla prossima draft phase (dopo un commit spec_draft è
+-    // vuoto -> path fresh, mai il riuso parziale), e su RS un checkpoint
+-    // stantio dello shadow non è mai consumato (restore solo se
++    // memoria FULL e RS (fix 23/08, full-state: bit-exact, v. WHY nel body):
++    // il round vero lo ri-snapshotta alla prossima draft phase (dopo un commit
++    // spec_draft è vuoto -> path fresh, mai il riuso parziale), e su RS un
++    // checkpoint stantio dello shadow non è mai consumato (restore solo se
+     // n_rollback > floor -> implica draft > floor -> snapshot fresco già fatto),
+     // quindi il checkpoint del round reale non è mai consumato dallo shadow.
+     //
+@@ -4618,10 +4618,11 @@ private:
+     // il chain attraversa un boundary di blocco.
+     //
+     // Segmenti della riga S: draft_us = helper DF (igiene trim + draft DF);
+-    // prep_us = build verify batch + snapshot ckpt tgt (FULL/RS) + snapshot stato
+-    // impl; accept_us = decode tgt + process (mirror DF/MTP) + accept greedy su
+-    // sampler clonato; rollback_us = restore ckpt (FULL/RS) + trim dei TRE
+-    // contesti + restore stato impl.
++    // prep_us = build verify batch + snapshot ckpt tgt full-state (FULL/RS) +
++    // snapshot stato impl; accept_us = decode tgt + process (mirror DF/MTP) +
++    // accept greedy su sampler clonato; rollback_us = restore ckpt tgt
++    // full-state (FULL/RS, nessun trim post-load sul path di successo) + trim
++    // head MTP + rollback DF + restore stato impl.
+     void shadow_drafter_round(server_slot & slot) {
+         // dp shadow = dp del round vero con override. Copia by-value dalla dp
+         // live: il round vero la riscrive per intero alla prossima draft phase
+@@ -4663,24 +4664,31 @@ private:
+                 slot.shadow_i_batch.push_back(slot.shadow_batch.n_tokens - 1);
+             }
+ 
+-            // snapshot ckpt target PRIMA del decode, per memoria FULL E RS.
+-            // WHY RS (fix smoke 23/08): su RS il trim = bounded removal con
+-            // replay -> stato ricorrente non-bit-identico -> drift asimmetrico
+-            // vs braccio OFF -> controllo A FAIL (flip greedy al round-4
+-            // anchor, risposta troncata a 19 tok vs 100). Il checkpoint
+-            // save/restore è bit-exact per costruzione ed è il pattern che il
+-            // round vero usa su RS quando le righe superano il floor
+-            // (update_tgt ~:3299, load_tgt ~:4394 + trim post-load). Il costo
+-            // extra (state get/set) finisce in prep_us/rollback_us, ESCLUSI da
+-            // t_D per costruzione. PART resta su trim diretto (partial removal
+-            // nativo senza replay = bit-exact su KV classico). NO non può
+-            // capitare: senza seq_rm il server non arma la speculazione in
+-            // load_model.
++            // snapshot ckpt target PRIMA del decode, per memoria FULL E RS, e
++            // in forma FULL-STATE (flags = solo ON_DEVICE, senza
++            // PARTIAL_ONLY). WHY full-state (re-smoke 23/08, terza iterazione):
++            // il checkpoint PARTIAL_ONLY serializza SOLO lo stato recurrent
++            // (riga snapshot corrente, v. state_write_data/state_row in
++            // llama-memory-recurrent.cpp) e il restore lo scrive nelle righe
++            // CANONICHE forzando rs_idx=0 (state_read ~:786) - il ring
++            // 1..n_rs_seq resta STANTIO (mai serializzato). Serializzando
++            // anche il KV denso, il restore ricostruisce cells+ring dalle
++            // righe canoniche serializzate e azzera rs_idx: il round vero
++            // successivo legge contenuti identici al braccio OFF senza
++            // appoggiarsi al ring locale (che il roundtrip non serializza
++            // mai). Il KV restore sostituisce wholesale le celle della seq
++            // (state_read_meta fa seq_rm(seq,-1,-1) prima di riscrivere,
++            // llama-kv-cache.cpp ~:2166) -> le righe shadow spariscono senza
++            // trim. Il costo extra (state get/set + KV) finisce in
++            // prep_us/rollback_us, ESCLUSI da t_D per costruzione. PART resta
++            // su trim diretto (partial removal nativo = bit-exact su KV
++            // classico). NO non può capitare: senza seq_rm il server non arma
++            // la speculazione in load_model.
+             const bool use_ckpt_tgt =
+                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+             if (use_ckpt_tgt) {
+-                slot.spec_ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++                slot.spec_ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+             }
+ 
+             // snapshot dello stato impl (boundary MTP) da ripristinare a fine
+@@ -4718,20 +4726,25 @@ private:
+             const int64_t t3 = ggml_time_us();
+ 
+             // ---- rollback: TRE contesti al boundary C_{r+1}
+-            // (FULL/RS: restore by-value dal checkpoint -> bit-exact; il trim
+-            // sotto è il Pattern del round vero post-load_tgt, e resta il
+-            // fallback se il load fallisce)
++            // (FULL/RS: restore full-state by-value -> bit-exact)
+             if (use_ckpt_tgt) {
+-                const bool restored_tgt = slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++                const bool restored_tgt = slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                 if (!restored_tgt) {
+-                    // misura best-effort: il decode è append-only, il trim sotto
+-                    // rimuove comunque tutte le righe shadow; il round vero
+-                    // ri-snapshotta il ckpt alla prossima draft phase
++                    // misura best-effort: il restore non è riuscito, le righe
++                    // shadow restano nel contesto -> trim di emergenza (con
++                    // possibile drift, scremabile dal run via questo WRN); il
++                    // round vero ri-snapshotta il ckpt alla prossima draft phase
+                     SLT_WRN(slot, "%s", "shadow round: speculative checkpoint restore failed (target) - trimming only\n");
++                    common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+                 }
+             }
+-            // (1) target: righe verify shadow oltre il boundary
+-            common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
++            // (1) target: NESSUN trim post-load sul path di successo: il
++            // restore full-state ha già sostituito wholesale le celle KV
++            // della seq (righe shadow incluse, llama-kv-cache.cpp ~:2166) e
++            // azzerato rs_idx sul recurrent (~:786). Un trim qui armerebbe
++            // rs_idx su un ring mai serializzato dal roundtrip = causa del
++            // drift residuo della seconda iterazione (divergenza spostata al
++            // round ~12, md5 ON != md5 OFF).
+             // (2) head MTP (slot.ctx_dft): il mirror MTP ungated ha ingerito le
+             //     righe shadow (sotto routing mtp slot.ctx_dft È l'head MTP)
+             common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+-- 
+2.43.0
+
+
+From 9454f454cc71f629c22f95814830241f3602cf0b Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 22:07:06 +0200
+Subject: [PATCH 11/16] Revert "fix(server): full-state shadow checkpoint
+ avoids stale rs ring [t9 fase A]"
+
+This reverts commit 5c982c44641a851ab4c6a36b5e4afb198e611507.
+---
+ tools/server/server-context.cpp | 75 ++++++++++++++-------------------
+ 1 file changed, 31 insertions(+), 44 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a6fbf6476..282061f30 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4602,10 +4602,10 @@ private:
+     // Cosa NON tocca: slot.prompt.tokens, cache prompt, impl_last/impl_head,
+     // slot.smpl (clone only), contatori metriche del round vero (n_draft_*),
+     // spec_dists. spec_ckpt viene sovrascritto da update_tgt/load_tgt su
+-    // memoria FULL e RS (fix 23/08, full-state: bit-exact, v. WHY nel body):
+-    // il round vero lo ri-snapshotta alla prossima draft phase (dopo un commit
+-    // spec_draft è vuoto -> path fresh, mai il riuso parziale), e su RS un
+-    // checkpoint stantio dello shadow non è mai consumato (restore solo se
++    // memoria FULL e RS (fix 23/08: bit-exact, v. WHY nel body): il round vero
++    // lo ri-snapshotta alla prossima draft phase (dopo un commit spec_draft è
++    // vuoto -> path fresh, mai il riuso parziale), e su RS un checkpoint
++    // stantio dello shadow non è mai consumato (restore solo se
+     // n_rollback > floor -> implica draft > floor -> snapshot fresco già fatto),
+     // quindi il checkpoint del round reale non è mai consumato dallo shadow.
+     //
+@@ -4618,11 +4618,10 @@ private:
+     // il chain attraversa un boundary di blocco.
+     //
+     // Segmenti della riga S: draft_us = helper DF (igiene trim + draft DF);
+-    // prep_us = build verify batch + snapshot ckpt tgt full-state (FULL/RS) +
+-    // snapshot stato impl; accept_us = decode tgt + process (mirror DF/MTP) +
+-    // accept greedy su sampler clonato; rollback_us = restore ckpt tgt
+-    // full-state (FULL/RS, nessun trim post-load sul path di successo) + trim
+-    // head MTP + rollback DF + restore stato impl.
++    // prep_us = build verify batch + snapshot ckpt tgt (FULL/RS) + snapshot stato
++    // impl; accept_us = decode tgt + process (mirror DF/MTP) + accept greedy su
++    // sampler clonato; rollback_us = restore ckpt (FULL/RS) + trim dei TRE
++    // contesti + restore stato impl.
+     void shadow_drafter_round(server_slot & slot) {
+         // dp shadow = dp del round vero con override. Copia by-value dalla dp
+         // live: il round vero la riscrive per intero alla prossima draft phase
+@@ -4664,31 +4663,24 @@ private:
+                 slot.shadow_i_batch.push_back(slot.shadow_batch.n_tokens - 1);
+             }
+ 
+-            // snapshot ckpt target PRIMA del decode, per memoria FULL E RS, e
+-            // in forma FULL-STATE (flags = solo ON_DEVICE, senza
+-            // PARTIAL_ONLY). WHY full-state (re-smoke 23/08, terza iterazione):
+-            // il checkpoint PARTIAL_ONLY serializza SOLO lo stato recurrent
+-            // (riga snapshot corrente, v. state_write_data/state_row in
+-            // llama-memory-recurrent.cpp) e il restore lo scrive nelle righe
+-            // CANONICHE forzando rs_idx=0 (state_read ~:786) - il ring
+-            // 1..n_rs_seq resta STANTIO (mai serializzato). Serializzando
+-            // anche il KV denso, il restore ricostruisce cells+ring dalle
+-            // righe canoniche serializzate e azzera rs_idx: il round vero
+-            // successivo legge contenuti identici al braccio OFF senza
+-            // appoggiarsi al ring locale (che il roundtrip non serializza
+-            // mai). Il KV restore sostituisce wholesale le celle della seq
+-            // (state_read_meta fa seq_rm(seq,-1,-1) prima di riscrivere,
+-            // llama-kv-cache.cpp ~:2166) -> le righe shadow spariscono senza
+-            // trim. Il costo extra (state get/set + KV) finisce in
+-            // prep_us/rollback_us, ESCLUSI da t_D per costruzione. PART resta
+-            // su trim diretto (partial removal nativo = bit-exact su KV
+-            // classico). NO non può capitare: senza seq_rm il server non arma
+-            // la speculazione in load_model.
++            // snapshot ckpt target PRIMA del decode, per memoria FULL E RS.
++            // WHY RS (fix smoke 23/08): su RS il trim = bounded removal con
++            // replay -> stato ricorrente non-bit-identico -> drift asimmetrico
++            // vs braccio OFF -> controllo A FAIL (flip greedy al round-4
++            // anchor, risposta troncata a 19 tok vs 100). Il checkpoint
++            // save/restore è bit-exact per costruzione ed è il pattern che il
++            // round vero usa su RS quando le righe superano il floor
++            // (update_tgt ~:3299, load_tgt ~:4394 + trim post-load). Il costo
++            // extra (state get/set) finisce in prep_us/rollback_us, ESCLUSI da
++            // t_D per costruzione. PART resta su trim diretto (partial removal
++            // nativo senza replay = bit-exact su KV classico). NO non può
++            // capitare: senza seq_rm il server non arma la speculazione in
++            // load_model.
+             const bool use_ckpt_tgt =
+                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+             if (use_ckpt_tgt) {
+-                slot.spec_ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++                slot.spec_ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+             }
+ 
+             // snapshot dello stato impl (boundary MTP) da ripristinare a fine
+@@ -4726,25 +4718,20 @@ private:
+             const int64_t t3 = ggml_time_us();
+ 
+             // ---- rollback: TRE contesti al boundary C_{r+1}
+-            // (FULL/RS: restore full-state by-value -> bit-exact)
++            // (FULL/RS: restore by-value dal checkpoint -> bit-exact; il trim
++            // sotto è il Pattern del round vero post-load_tgt, e resta il
++            // fallback se il load fallisce)
+             if (use_ckpt_tgt) {
+-                const bool restored_tgt = slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++                const bool restored_tgt = slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                 if (!restored_tgt) {
+-                    // misura best-effort: il restore non è riuscito, le righe
+-                    // shadow restano nel contesto -> trim di emergenza (con
+-                    // possibile drift, scremabile dal run via questo WRN); il
+-                    // round vero ri-snapshotta il ckpt alla prossima draft phase
++                    // misura best-effort: il decode è append-only, il trim sotto
++                    // rimuove comunque tutte le righe shadow; il round vero
++                    // ri-snapshotta il ckpt alla prossima draft phase
+                     SLT_WRN(slot, "%s", "shadow round: speculative checkpoint restore failed (target) - trimming only\n");
+-                    common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+                 }
+             }
+-            // (1) target: NESSUN trim post-load sul path di successo: il
+-            // restore full-state ha già sostituito wholesale le celle KV
+-            // della seq (righe shadow incluse, llama-kv-cache.cpp ~:2166) e
+-            // azzerato rs_idx sul recurrent (~:786). Un trim qui armerebbe
+-            // rs_idx su un ring mai serializzato dal roundtrip = causa del
+-            // drift residuo della seconda iterazione (divergenza spostata al
+-            // round ~12, md5 ON != md5 OFF).
++            // (1) target: righe verify shadow oltre il boundary
++            common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+             // (2) head MTP (slot.ctx_dft): il mirror MTP ungated ha ingerito le
+             //     righe shadow (sotto routing mtp slot.ctx_dft È l'head MTP)
+             common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+-- 
+2.43.0
+
+
+From 70b2a2da411a67ad118cd84921337c3c1d28e5c7 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 22:11:55 +0200
+Subject: [PATCH 12/16] feat(server): SPEC_T9_FULL_MEM diag env forces
+ full-memory target [t9 fase A diag]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 282061f30..f04564f1d 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1082,8 +1082,30 @@ private:
+ 
+         params_base = params;
+ 
++        // t9 fase A diag (v. docs/superpowers/plans/2026-08-23-t9-fasea-diag-full-memory.md):
++        // WHY: il controllo char-identico dello shadow fallisce su memoria RS
++        // dopo 3 meccanismi di rollback diversi -> test che discrimina se su
++        // memoria FULL (n_rs_seq=0, checkpoint path) il twin-run regge.
++        // SPEC_T9_FULL_MEM=1 vale per ENTRAMBI i bracci del confronto (NON è
++        // legato a SPEC_SHADOW_DRAFT): agisce sul solo input di
++        // need_n_rs_seq() (draft.n_max) nella finestra dell'init e lo
++        // ripristina subito dopo -> l'unico effetto durevole è il target
++        // context senza ring RS (common_context_can_seq_rm -> FULL, log
++        // "will use checkpoints"). I draft contexts restano invariati
++        // (loro n_rs_seq è già sempre 0, ~:1246/:1271). Inerte a env assente.
++        // Nota: incompatibile con --spec-mtp-strict-qwen (che richiede RS,
++        // gate ~:1137/:1367) - l'abort SRV_ERR esplicito è intenzionale.
++        const char * t9_diag_full_mem = getenv("SPEC_T9_FULL_MEM");
++        const int32_t t9_diag_n_max_save = params_base.speculative.draft.n_max;
++        if (t9_diag_full_mem != nullptr && std::string(t9_diag_full_mem) == "1") {
++            params_base.speculative.draft.n_max = 0; // -> need_n_rs_seq() == 0
++            SRV_INF("%s", "spec-t9-diag: full-mem forced (env SPEC_T9_FULL_MEM)\n");
++        }
++
+         llama_init = common_init_from_params(params_base);
+ 
++        params_base.speculative.draft.n_max = t9_diag_n_max_save;
++
+         model_tgt = llama_init->model();
+         ctx_tgt   = llama_init->context();
+ 
+-- 
+2.43.0
+
+
+From 74505ea70e79bdbef4ca2e563e964ad8bcceeef3 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 22:15:23 +0200
+Subject: [PATCH 13/16] fix(server): diag full-mem via spec-types window, not
+ n_max [t9 fase A diag]
+
+need_n_rs_seq() floors n_max to N_RS_SEQ_FLOOR=16 -> n_max=0 was a no-op
+(first FULL boot still came up RS, 'bounded partial' in log). Emptying
+speculative.types inside the init window makes need_n_rs_seq()==0
+directly; types restored right after init.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index f04564f1d..1518c4cda 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1096,15 +1096,25 @@ private:
+         // Nota: incompatibile con --spec-mtp-strict-qwen (che richiede RS,
+         // gate ~:1137/:1367) - l'abort SRV_ERR esplicito è intenzionale.
+         const char * t9_diag_full_mem = getenv("SPEC_T9_FULL_MEM");
+-        const int32_t t9_diag_n_max_save = params_base.speculative.draft.n_max;
++        std::vector<common_speculative_type> t9_diag_types_save;
+         if (t9_diag_full_mem != nullptr && std::string(t9_diag_full_mem) == "1") {
+-            params_base.speculative.draft.n_max = 0; // -> need_n_rs_seq() == 0
++            // NOTA leva: NON draft.n_max — need_n_rs_seq() lo fonda a
++            // N_RS_SEQ_FLOOR=16 (common.h ~:448), n_max=0 non azzera il ring.
++            // Si svuota speculative.types nella finestra dell'init ->
++            // need_n_rs_seq()==0 e dflash_concat_k1()==0 (già 0 nelle config
++            // senza concat). Effetto durevole: SOLO il target context senza
++            // ring RS; tipi ripristinati subito dopo l'init (tutto il resto
++            // del boot li legge identici).
++            t9_diag_types_save = params_base.speculative.types;
++            params_base.speculative.types.clear();
+             SRV_INF("%s", "spec-t9-diag: full-mem forced (env SPEC_T9_FULL_MEM)\n");
+         }
+ 
+         llama_init = common_init_from_params(params_base);
+ 
+-        params_base.speculative.draft.n_max = t9_diag_n_max_save;
++        if (!t9_diag_types_save.empty()) {
++            params_base.speculative.types = std::move(t9_diag_types_save);
++        }
+ 
+         model_tgt = llama_init->model();
+         ctx_tgt   = llama_init->context();
+-- 
+2.43.0
+
+
+From 03ab68271a638b3f2a155ff6d8e5f1db1cdfecae Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 23 Aug 2026 22:23:44 +0200
+Subject: [PATCH 14/16] fix(spec): gate MTP mirror on shadow rows (draft-chain
+ divergence) [t9 fase A]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/speculative.cpp          | 28 ++++++++++++++++++++++++++++
+ common/speculative.h            |  6 ++++++
+ tools/server/server-context.cpp | 33 ++++++++++++++++++++++++---------
+ 3 files changed, 58 insertions(+), 9 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index fe2c5c9a8..fa6bf0698 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -47,6 +47,19 @@
+ // + destroy), così il wake da sleeping non lo lascia desincronizzato.
+ static bool g_spec_shadow_armed = false;
+ 
++// t9 fase A (iter. 4, 23/08): TRUE solo mentre process() gira sul batch del
++// verify SHADOW (il server lo setta attorno all'unica chiamata in
++// shadow_drafter_round, stesso thread del loop server - v. nota threading
++// sopra, identico argomento single-thread del Task 4). Serve al gate d'ingresso
++// di common_speculative_state_draft_mtp::process(): le righe del verify shadow
++// NON appartengono all'head MTP (la misura E_D usa solo ctx DF e ctx_tgt);
++// l'ingest+trim per round faceva divergere la draft chain del round vero
++// (diagnosi 23/08: prima divergenza nelle R rows, invariante al meccanismo di
++// rollback del target RS/FULL - trim, ckpt parziale, ckpt full-state).
++// Ortogonale a g_spec_shadow_armed: il mirror DF (che le righe shadow le DEVE
++// ingerire per il proprio KV) non è toccato da questo flag.
++static bool g_spec_shadow_processing = false;
++
+ const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
+     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
+     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
+@@ -1897,6 +1910,16 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+     }
+ 
+     bool process(const llama_batch & batch_in) override {
++        // t9 fase A (iter. 4): le righe del verify shadow NON appartengono
++        // all'head MTP (la misura E_D usa solo ctx DF e ctx_tgt); l'ingest+trim
++        // per round faceva divergere la draft chain del round vero (diagnosi
++        // 23/08: prima divergenza nelle R rows, invariante al meccanismo di
++        // rollback del target). Skip totale, stesso valore di ritorno degli
++        // early-exit sotto (true = "nulla da fare", non un errore). Il mirror
++        // DF è ortogonale (g_spec_shadow_armed) e continua a ingerire.
++        if (g_spec_shadow_processing) {
++            return true;
++        }
+         if (batch_in.n_tokens <= 0) {
+             return true;
+         }
+@@ -3621,6 +3644,11 @@ void common_speculative_set_shadow(bool armed) {
+     g_spec_shadow_armed = armed;
+ }
+ 
++// t9 fase A (iter. 4): setter del gate MTP-mirror - vedi g_spec_shadow_processing (top of file).
++void common_speculative_set_shadow_processing(bool processing) {
++    g_spec_shadow_processing = processing;
++}
++
+ // t9 fase A (Task 5): l'impl draft-dflash, stesso criterio del concat/dispatcher
+ // in common_speculative_draft() (itera spec->impls per type). Nota: DSpark non è
+ // un'implementazione separata qui - condivide la struct con DFlash via il
+diff --git a/common/speculative.h b/common/speculative.h
+index b99150d5a..354339c8c 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -108,6 +108,12 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
+ // implementazioni DFlash/DSpark resta identico al comportamento pre-T9.
+ void common_speculative_set_shadow(bool armed);
+ 
++// T9 Fase A (iter. 4): TRUE solo durante process() sul batch verify shadow -
++// gate d'ingresso di process() MTP (le righe shadow non appartengono
++// all'head MTP; l'ingest faceva divergere la draft chain del round vero).
++// Il mirror DF è ortogonale (common_speculative_set_shadow) e prosegue.
++void common_speculative_set_shadow_processing(bool processing);
++
+ // T9 Fase A (Task 5): draft shadow DF per UNA seq, fuori dal routing e dal
+ // dispatcher: chiama direttamente draft() dell'implementazione draft-dflash
+ // (impl_last/impl_head/concat della struct restano del round vero). dp è la
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 1518c4cda..7208577a4 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4651,7 +4651,8 @@ private:
+     //
+     // Segmenti della riga S: draft_us = helper DF (igiene trim + draft DF);
+     // prep_us = build verify batch + snapshot ckpt tgt (FULL/RS) + snapshot stato
+-    // impl; accept_us = decode tgt + process (mirror DF/MTP) + accept greedy su
++    // impl; accept_us = decode tgt + process (mirror DF gated Task 4; MTP
++    // NEGATO dall'iter. 4: g_spec_shadow_processing) + accept greedy su
+     // sampler clonato; rollback_us = restore ckpt (FULL/RS) + trim dei TRE
+     // contesti + restore stato impl.
+     void shadow_drafter_round(server_slot & slot) {
+@@ -4716,11 +4717,12 @@ private:
+             }
+ 
+             // snapshot dello stato impl (boundary MTP) da ripristinare a fine
+-            // shadow: il mirror MTP è UNGATED e ingerisce le righe shadow,
+-            // avanzando pending_h oltre il boundary committato - senza restore
+-            // il draft MTP del round vero r+1 si spegne ("boundary pos mismatch"
+-            // in impl draft-mtp). Stesso meccanismo get_state/set_state del
+-            // restore post-checkpoint del round vero.
++            // shadow: DIFENSIVO/REDUNDANTE dall'iter. 4 (il gate
++            // g_spec_shadow_processing nega l'ingest MTP delle righe shadow ->
++            // pending_h NON avanza durante lo shadow). Lasciato: costo nullo su
++            // stato già-allineato (get/set di blob identico) e protegge se il
++            // gate fosse rimosso (senza restore il draft MTP del round vero
++            // r+1 si spegne, "boundary pos mismatch" in impl draft-mtp).
+             std::vector<uint8_t> shadow_spec_state;
+             const bool need_spec_state = common_speculative_state_required(spec.get());
+             if (need_spec_state && !common_speculative_get_state(spec.get(), slot.id, shadow_spec_state)) {
+@@ -4732,7 +4734,17 @@ private:
+             const int64_t t2 = ggml_time_us();
+ 
+             if (llama_decode(slot.ctx_tgt, slot.shadow_batch) == 0) {
+-                common_speculative_process(spec.get(), slot.shadow_batch); // mirror DF (gate Task 4) + MTP ungated
++                // t9 fase A (iter. 4): scope-guard del flag che nega l'ingest
++                // delle righe shadow all'head MTP (v. g_spec_shadow_processing
++                // in speculative.cpp) - il mirror DF le ingerisce comunque.
++                // RAII: qualunque early-exit/exception tra qui e la fine dello
++                // scope riporta il flag a false (stesso thread del loop server).
++                struct shadow_processing_guard {
++                    ~shadow_processing_guard() { common_speculative_set_shadow_processing(false); }
++                } shadow_guard;
++                common_speculative_set_shadow_processing(true);
++
++                common_speculative_process(spec.get(), slot.shadow_batch); // mirror DF (gate Task 4) + MTP ungated->gated
+ 
+                 // accept greedy su sampler CLONATO (il clone prende/ritorna raw
+                 // ptr): slot.smpl avanza SOLO col round vero
+@@ -4764,8 +4776,11 @@ private:
+             }
+             // (1) target: righe verify shadow oltre il boundary
+             common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+-            // (2) head MTP (slot.ctx_dft): il mirror MTP ungated ha ingerito le
+-            //     righe shadow (sotto routing mtp slot.ctx_dft È l'head MTP)
++            // (2) head MTP (slot.ctx_dft): DIFENSIVO/IDEMPOTENTE dall'iter. 4
++            //     (il gate g_spec_shadow_processing nega l'ingest delle righe
++            //     shadow all'head MTP - l'ingest+trim per round faceva
++            //     divergere la draft chain del round vero). Trim lasciato: se
++            //     il gate fosse rimosso o bypassato, ripulisce comunque.
+             common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+             // (3) contesto DFlash dell'impl: mirror DF delle righe shadow (il
+             //     noise block è già stato rimosso dentro l'helper di draft);
+-- 
+2.43.0
+
+
+From fdb4a97356600f17c40238af4bac52a61bef3ad1 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 24 Aug 2026 10:02:29 +0200
+Subject: [PATCH 15/16] feat(server): spec-t9ci noise/draftonly diag modes [t9
+ charidentity]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 241 ++++++++++++++++++++++++++++++--
+ 1 file changed, 232 insertions(+), 9 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 7208577a4..d79575417 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -89,6 +89,14 @@ static void spec_shadow_log(const char * fmt, ...) {
+ // da dp.n_max della funzione shadow - elimina il drift fra i due siti.
+ static constexpr int SHADOW_N_MAX_DF = 7;
+ 
++// t9 charidentity: modalità attiva all'hook post-commit (mutuamente esclusive:
++// il boot fa FAIL-STOP sul conflitto fra i tre env). off = nessun env attivo,
++// inerzia bit-identica certificata (l'hook guarda solo questo campo, primo
++// check cheap); shadow = SPEC_SHADOW_DRAFT (T9 Fase A, righe S); noise = E1
++// SPEC_T9_NOISE_DECODE (decode tgt 8 righe dummy + rollback completo, righe N);
++// draftonly = E2 SPEC_T9_DRAFT_ONLY (solo draft DF shadow + rollback, righe D).
++enum class spec_t9ci_mode { off, noise, draftonly, shadow };
++
+ struct server_slot {
+     int id;
+ 
+@@ -979,6 +987,10 @@ private:
+     // riga C (timer+log gated da SPEC_SHADOW_LOG, identica nei due bracci — v. Task 2/6).
+     bool spec_shadow_on = false;
+ 
++    // t9 charidentity: modalità diag dell'hook post-commit (v. enum spec_t9ci_mode).
++    // off di default: con nessun env attivo il round loop è il path identico a oggi.
++    spec_t9ci_mode t9ci_mode = spec_t9ci_mode::off;
++
+     // spec-route: draft types that produced a drafting context on this server.
+     // spec_active_type is the single loaded type for non-dual servers (identity
+     // policy); NONE when zero or several implementations are loaded keeps the
+@@ -1035,6 +1047,7 @@ private:
+         spec_dft_ext     = false;
+         spec_dual        = false;
+         spec_shadow_on   = false;
++        t9ci_mode        = spec_t9ci_mode::off;
+ 
+         // t9 fase A (Task 4): disarm del mirror DF (speculative.cpp) - il flag
+         // file-scope NON segue questo reset; il re-boot da env lo ri-arma in
+@@ -1541,19 +1554,62 @@ private:
+         // absent the flag stays false and no shadow code runs anywhere.
+         {
+             const char * e = getenv("SPEC_SHADOW_DRAFT");
+-            spec_shadow_on = (e != nullptr && std::string(e) == "1")
++            const bool env_shadow = (e != nullptr && std::string(e) == "1");
++            spec_shadow_on = env_shadow
+                 && spec_dual
+                 && spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) > 0
+                 && spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) > 0;
+             SRV_INF("spec-shadow: %s (env SPEC_SHADOW_DRAFT; drafter=dflash n_max=7)\n",
+                     spec_shadow_on ? "armed" : "disabled");
+ 
+-            // t9 fase A (Task 4): arma il mirror DF del process() gate
+-            // (speculative.cpp) - il bool file-scope NON segue spec.reset(),
+-            // quindi arm/disarm vive qui (boot) e in destroy() per restare
++            // t9 charidentity (E1/E2): due modalità diag alternative all'hook
++            // shadow, mutuamente esclusive con SPEC_SHADOW_DRAFT. Semantica
++            // "attivo" = env presente e == "1" (come SPEC_SHADOW_DRAFT=0 sopra).
++            const char * e_t9_noise = getenv("SPEC_T9_NOISE_DECODE");
++            const char * e_t9_donly = getenv("SPEC_T9_DRAFT_ONLY");
++            const bool env_noise = (e_t9_noise != nullptr && std::string(e_t9_noise) == "1");
++            const bool env_donly = (e_t9_donly != nullptr && std::string(e_t9_donly) == "1");
++
++            // FAIL-STOP pre-registrato: più di una modalità attiva per boot.
++            if ((int) env_shadow + (int) env_noise + (int) env_donly > 1) {
++                SRV_ERR("%s", "spec-t9ci: CONFLICT — only one of SPEC_SHADOW_DRAFT/SPEC_T9_NOISE_DECODE/SPEC_T9_DRAFT_ONLY per boot\n");
++                return false;
++            }
++
++            t9ci_mode = env_shadow ? spec_t9ci_mode::shadow
++                      : env_noise  ? spec_t9ci_mode::noise
++                      : env_donly  ? spec_t9ci_mode::draftonly
++                                   : spec_t9ci_mode::off;
++
++            // validità (R3, per OGNI modalità attiva, shadow compreso): serve il
++            // dual routing con l'impl DF caricata - un E2 senza impl DF farebbe
++            // nulla in silenzio e un md5 OFF verrebbe letto male.
++            if (t9ci_mode != spec_t9ci_mode::off &&
++                    (!spec_dual || spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) == 0)) {
++                SRV_ERR("spec-t9ci: mode requires dual routing with the draft-dflash implementation loaded (spec_dual=%d dflash=%d) - aborting\n",
++                        (int) spec_dual,
++                        (int) (spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) > 0));
++                return false;
++            }
++
++            // marker uno-per-boot (il controller grep-a 'spec-t9ci: mode=' == 1)
++            SRV_INF("spec-t9ci: mode=%s (env %s)\n",
++                    t9ci_mode == spec_t9ci_mode::noise     ? "noise"     :
++                    t9ci_mode == spec_t9ci_mode::draftonly ? "draftonly" :
++                    t9ci_mode == spec_t9ci_mode::shadow    ? "shadow"    : "off",
++                    t9ci_mode == spec_t9ci_mode::noise     ? "SPEC_T9_NOISE_DECODE=1" :
++                    t9ci_mode == spec_t9ci_mode::draftonly ? "SPEC_T9_DRAFT_ONLY=1"  :
++                    t9ci_mode == spec_t9ci_mode::shadow    ? "SPEC_SHADOW_DRAFT=1"   : "none");
++
++            // t9 fase A (Task 4) + t9 charidentity (B2): arma il mirror DF del
++            // process() gate (speculative.cpp) per OGNI modalità attiva, E1/E2
++            // compresi - senza mirror armato il ctx DF della seq MTP-routed è
++            // vuoto e il draft E2 partirebbe da uno stato mai visto in
++            // produzione. Il bool file-scope NON segue spec.reset(), quindi
++            // arm/disarm vive qui (boot) e in destroy() per restare
+             // sincronizzato su ogni wake da sleeping (destroy -> load_model ->
+             // re-arm da env).
+-            common_speculative_set_shadow(spec_shadow_on);
++            common_speculative_set_shadow(t9ci_mode != spec_t9ci_mode::off);
+         }
+ 
+         for (int i = 0; i < params_base.n_parallel; i++) {
+@@ -4359,8 +4415,18 @@ private:
+                 // esiste (o è esistita: se release() è scattato,
+                 // is_processing() è già false). Ordine cheap-first: flag ->
+                 // stato slot -> int compare.
+-                if (spec_shadow_on && slot.is_processing() && slot.n_spec_rounds > 0) {
+-                    shadow_drafter_round(slot);
++                // t9 charidentity: dispatch per modalità (R4: ENTRAMBI i siti;
++                // precedenza noise > draftonly > shadow - mutuamente esclusive
++                // per costruzione, il boot fa fail-stop sul conflitto). Primo
++                // check cheap: mode off = nessuna chiamata, path identico a oggi.
++                if (t9ci_mode != spec_t9ci_mode::off && slot.is_processing() && slot.n_spec_rounds > 0) {
++                    if (t9ci_mode == spec_t9ci_mode::noise) {
++                        noise_decode_round(slot);
++                    } else if (t9ci_mode == spec_t9ci_mode::draftonly) {
++                        draft_only_round(slot);
++                    } else if (spec_shadow_on) {
++                        shadow_drafter_round(slot);
++                    }
+                 }
+             }
+ 
+@@ -4615,8 +4681,18 @@ private:
+                 // > 0 che specchia la C). Nota qui: il giro che termina la
+                 // request esce col break/release dentro il loop ids sopra ->
+                 // is_processing() false -> S saltata, coerente con la C mancante.
+-                if (spec_shadow_on && slot.is_processing() && slot.n_spec_rounds > 0) {
+-                    shadow_drafter_round(slot);
++                // t9 charidentity: dispatch per modalità (R4: ENTRAMBI i siti;
++                // precedenza noise > draftonly > shadow - mutuamente esclusive
++                // per costruzione, il boot fa fail-stop sul conflitto). Primo
++                // check cheap: mode off = nessuna chiamata, path identico a oggi.
++                if (t9ci_mode != spec_t9ci_mode::off && slot.is_processing() && slot.n_spec_rounds > 0) {
++                    if (t9ci_mode == spec_t9ci_mode::noise) {
++                        noise_decode_round(slot);
++                    } else if (t9ci_mode == spec_t9ci_mode::draftonly) {
++                        draft_only_round(slot);
++                    } else if (spec_shadow_on) {
++                        shadow_drafter_round(slot);
++                    }
+                 }
+             }
+         }
+@@ -4805,6 +4881,153 @@ private:
+         }
+     }
+ 
++    // t9 charidentity (E1, SPEC_T9_NOISE_DECODE): braccio di isolamento H1 - un
++    // decode extra interleaved su ctx_tgt con contenuto DUMMY fisso (ancora +
++    // 7 copie di slot.sampled) e rollback COMPLETO al boundary C_{r+1}.
++    // Semantica dichiarata: E1 = ON (shadow_drafter_round) meno {draft DF,
++    // accept, righe variabili} - batch fisso a 8 righe (la capacità allocata
++    // del batch verify), NESSuna chiamata al draft DF, NESSun token accettato.
++    // Cosa NON tocca (parità con lo shadow): slot.prompt.tokens, cache prompt,
++    // impl_last/impl_head, slot.smpl (mai campionato), contatori del round vero,
++    // spec_dists. Il mirror DF resta ARMATO (boot, B2): il process() sotto guard
++    // ingerisce le righe noise nel ctx DF e il rollback le ripulisce.
++    //
++    // Segmenti della riga N: decode_us copre il round E1 per intero (igiene DF +
++    // build batch + snapshot ckpt/stato + decode + process); il rollback finale
++    // resta FUORI misura (contratto della riga: solo decode_us).
++    void noise_decode_round(server_slot & slot) {
++        const int64_t t0 = ggml_time_us();
++
++        const llama_pos pos_next = slot.prompt.tokens.pos_next(); // = boundary C_{r+1}
++
++        // igiene PRE-decode del ctx DF: il mirror armato ha ingerito nel ctx DF
++        // anche la coda RIFIUTATA del round vero, che siede a pos >= pos_next -
++        // senza questo trim il mirror decodificherebbe le righe noise su
++        // posizioni occupate (KV duplicato), cosa che ON non fa (laggiù il
++        // pre-trim vive dentro shadow_draft_dflash, prima del noise block). Il
++        // ctx DF è opaco per il server: si riusa l'helper esposto, che trima da
++        // pos_bnd+1 - pos_next-1 = trim da pos_next.
++        common_speculative_shadow_rollback_dflash(spec.get(), slot.id, pos_next - 1);
++
++        // batch fisso 8 righe dummy: ancora (sampled) + 7 copie, pos consecutive
++        // da pos_next. shadow_i_batch resta VUOTO: niente accept, gli indici non
++        // servono. Capacità allocata = 1 + SHADOW_N_MAX_DF = 8 righe esatte.
++        common_batch_clear(slot.shadow_batch);
++        llama_pos pos0 = pos_next;
++        for (int i = 0; i < 1 + SHADOW_N_MAX_DF; ++i) {
++            common_batch_add(slot.shadow_batch, slot.sampled, pos0++, { slot.id }, true);
++        }
++
++        // snapshot ckpt target PRIMA del decode, per memoria FULL E RS - pattern
++        // esatto dello shadow (bit-exact su RS, v. WHY laggiù).
++        const bool use_ckpt_tgt =
++            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
++        if (use_ckpt_tgt) {
++            slot.spec_ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
++        }
++
++        // snapshot difensivo dello stato impl (boundary MTP), pattern dello
++        // shadow: il gate g_spec_shadow_processing nega l'ingest MTP delle righe
++        // noise, il restore protegge se il gate fosse rimosso.
++        std::vector<uint8_t> noise_spec_state;
++        const bool need_spec_state = common_speculative_state_required(spec.get());
++        if (need_spec_state && !common_speculative_get_state(spec.get(), slot.id, noise_spec_state)) {
++            // il restore finale salta il blob vuoto - non silenzioso, scremabile
++            SLT_WRN(slot, "%s", "spec-t9ci noise: impl-state snapshot failed - restore skipped, next real MTP draft may resync\n");
++        }
++
++        if (llama_decode(slot.ctx_tgt, slot.shadow_batch) == 0) {
++            // stessa scope-guard RAII dello shadow: l'head MTP NON ingerisce le
++            // righe noise (early-exit in process MTP), il mirror DF sì
++            struct shadow_processing_guard {
++                ~shadow_processing_guard() { common_speculative_set_shadow_processing(false); }
++            } noise_guard;
++            common_speculative_set_shadow_processing(true);
++
++            common_speculative_process(spec.get(), slot.shadow_batch); // mirror DF delle righe noise
++        } else {
++            // nessun logit da rollbackare (mai campionato): la memoria sotto
++            // viene comunque ripulita - la riga N resta scremabile dai log
++            SLT_WRN(slot, "%s", "spec-t9ci noise: verify decode failed - memory still rolled back\n");
++        }
++        const int64_t t1 = ggml_time_us();
++
++        // ---- rollback COMPLETO al boundary C_{r+1}, pattern dello shadow:
++        // ckpt (FULL/RS) + trim dei TRE contesti + restore stato impl.
++        if (use_ckpt_tgt) {
++            if (!slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
++                // best-effort: il decode è append-only, il trim sotto rimuove
++                // comunque tutte le righe noise; il round vero ri-snapshotta il
++                // ckpt alla prossima draft phase
++                SLT_WRN(slot, "%s", "spec-t9ci noise: speculative checkpoint restore failed (target) - trimming only\n");
++            }
++        }
++        // (1) target: righe noise oltre il boundary
++        common_context_seq_rm(slot.ctx_tgt, slot.id, pos_next, -1);
++        // (2) head MTP: difensivo/idempotente (il gate nega l'ingest - v. shadow)
++        common_context_seq_rm(slot.ctx_dft, slot.id, pos_next, -1);
++        // (3) ctx DF: il mirror ha ingerito le 8 righe noise a pos_next.. -
++        //     pos_bnd = pos_next-1 trima da pos_next, lo STESSO confine
++        //     effettivo del rollback_df dello shadow: laggiù pos_bnd è il
++        //     pos_max del ctx DF dopo il pre-trim da dp.n_past (= pos_next), cioè
++        //     pos_next-1 in condizioni normali (contratto speculative.h +
++        //     igiene pre-decode sopra che replica quel pre-trim). Qui non c'è
++        //     draft che lo catturi: il valore è derivato, non indovinato.
++        common_speculative_shadow_rollback_dflash(spec.get(), slot.id, pos_next - 1);
++        // stato impl (boundary MTP) riportato al boundary committato
++        if (need_spec_state && !noise_spec_state.empty()) {
++            common_speculative_set_state(spec.get(), slot.id, noise_spec_state);
++        }
++
++        spec_shadow_log("N,%d,%d,%d,%lld\n",
++                        slot.id, slot.task ? slot.task->id : -1, slot.n_spec_rounds,
++                        (long long)(t1 - t0));
++    }
++
++    // t9 charidentity (E2, SPEC_T9_DRAFT_ONLY): braccio di isolamento H2 - solo
++    // il draft DF shadow (stesso helper, stessi override dp dello shadow) con il
++    // suo rollback condizionale, NULL'ALTRO. Semantica dichiarata: E2 = ON meno
++    // {decode tgt, process, accept, trim target/head}. Lo stato interno dell'impl
++    // DF (smpls per-seq, selector_rng, contatori) avanza col round E2 - è
++    // ESATTAMENTE l'oggetto dell'ipotesi H2, non va ripristinato. Il ctx DF resta
++    // allineato dai round veri (mirror armato al boot, B2) come in ON.
++    void draft_only_round(server_slot & slot) {
++        // dp E2 = dp del round vero con override, identico allo shadow (copia
++        // by-value: il round vero la riscrive per intero alla prossima draft)
++        common_speculative_draft_params dp = common_speculative_get_draft_params(spec.get(), slot.id);
++        dp.drafting    = true;
++        dp.drafter     = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
++        dp.n_max       = SHADOW_N_MAX_DF;
++        dp.pos_next    = slot.prompt.tokens.pos_next(); // = boundary C_{r+1}
++        dp.id_last     = slot.sampled;                  // bonus token del round r
++        dp.n_past      = slot.prompt.n_tokens();        // come il round vero (pos dell'ancora)
++        dp.result      = &slot.shadow_draft_buf;
++        dp.dists       = nullptr;    // accettazione greedy (no spec-dists)
++        dp.temperature = 0.0f;       // greedy: soddisfa l'assert dflash2 (temperature<=0 || dists)
++        dp.concat_head = nullptr;    // mai una testa concat in un round shadow
++        slot.shadow_draft_buf.clear();
++
++        const int64_t t0 = ggml_time_us();
++        llama_pos df_pos_bnd = 0;
++
++        const int n_df = common_speculative_shadow_draft_dflash(spec.get(), slot.id, dp, df_pos_bnd);
++        const int64_t t1 = ggml_time_us();
++
++        // SOLO se n_df > 0 (pattern condizionale esatto dello shadow): con
++        // df_pos_bnd=0 una chiamata incondizionata trimerebbe da pos 1 e
++        // cancellerebbe il prefisso specchiato (contaminazione catastrofica).
++        // L'helper ha GIÀ rimosso il noise block al ritorno: questo trim è il
++        // pairing difensivo del contratto (nessuna riga oltre pos_bnd attesa).
++        if (n_df > 0) {
++            common_speculative_shadow_rollback_dflash(spec.get(), slot.id, df_pos_bnd);
++        }
++
++        spec_shadow_log("D,%d,%d,%d,%d,%lld\n",
++                        slot.id, slot.task ? slot.task->id : -1, slot.n_spec_rounds,
++                        n_df, (long long)(t1 - t0));
++    }
++
+     int get_slot_n_ctx() {
+         return slots.back().n_ctx;
+     }
+-- 
+2.43.0
+
+
+From 5e2744459a965601c7060b37ee044829f658b5a3 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 24 Aug 2026 10:28:32 +0200
+Subject: [PATCH 16/16] feat(server): spec-t9ci noise rows parameter (E3a) [t9
+ charidentity]
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 71 ++++++++++++++++++++++++++-------
+ 1 file changed, 56 insertions(+), 15 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index d79575417..a24c5fb1a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -93,8 +93,9 @@ static constexpr int SHADOW_N_MAX_DF = 7;
+ // il boot fa FAIL-STOP sul conflitto fra i tre env). off = nessun env attivo,
+ // inerzia bit-identica certificata (l'hook guarda solo questo campo, primo
+ // check cheap); shadow = SPEC_SHADOW_DRAFT (T9 Fase A, righe S); noise = E1
+-// SPEC_T9_NOISE_DECODE (decode tgt 8 righe dummy + rollback completo, righe N);
+-// draftonly = E2 SPEC_T9_DRAFT_ONLY (solo draft DF shadow + rollback, righe D).
++// SPEC_T9_NOISE_DECODE (decode tgt N righe dummy, 8 default o SPEC_T9_NOISE_ROWS
++// E3a, + rollback completo, righe N); draftonly = E2 SPEC_T9_DRAFT_ONLY (solo
++// draft DF shadow + rollback, righe D).
+ enum class spec_t9ci_mode { off, noise, draftonly, shadow };
+ 
+ struct server_slot {
+@@ -991,6 +992,11 @@ private:
+     // off di default: con nessun env attivo il round loop è il path identico a oggi.
+     spec_t9ci_mode t9ci_mode = spec_t9ci_mode::off;
+ 
++    // t9 charidentity E3a: righe del noise decode (mode noise), clampate al boot
++    // in [1, 1+SHADOW_N_MAX_DF] (mai oltre la capacità allocata del batch verify).
++    // Default 8 = il comportamento E1 originale; ignorato fuori da mode noise.
++    int t9ci_noise_rows = 1 + SHADOW_N_MAX_DF;
++
+     // spec-route: draft types that produced a drafting context on this server.
+     // spec_active_type is the single loaded type for non-dual servers (identity
+     // policy); NONE when zero or several implementations are loaded keeps the
+@@ -1048,6 +1054,7 @@ private:
+         spec_dual        = false;
+         spec_shadow_on   = false;
+         t9ci_mode        = spec_t9ci_mode::off;
++        t9ci_noise_rows  = 1 + SHADOW_N_MAX_DF;
+ 
+         // t9 fase A (Task 4): disarm del mirror DF (speculative.cpp) - il flag
+         // file-scope NON segue questo reset; il re-boot da env lo ri-arma in
+@@ -1592,14 +1599,41 @@ private:
+                 return false;
+             }
+ 
+-            // marker uno-per-boot (il controller grep-a 'spec-t9ci: mode=' == 1)
+-            SRV_INF("spec-t9ci: mode=%s (env %s)\n",
++            // E3a: SPEC_T9_NOISE_ROWS è un PARAMETRO (non una modalità: nessun
++            // conflitto coi tre env di sopra) - ha senso SOLO in mode noise,
++            // altrove è ignorato (inerzia dei boot non-noise). Valore numerico
++            // clampato in [1, 1+SHADOW_N_MAX_DF]; non-numerico = FAIL-STOP
++            // (un typo silenzioso falsificherebbe il confronto E3a).
++            bool t9ci_rows_env = false;
++            if (t9ci_mode == spec_t9ci_mode::noise) {
++                t9ci_noise_rows = 1 + SHADOW_N_MAX_DF; // default 8 = E1 originale
++                const char * e_rows = getenv("SPEC_T9_NOISE_ROWS");
++                if (e_rows != nullptr) {
++                    char * rows_end = nullptr;
++                    const long rows_v = strtol(e_rows, &rows_end, 10);
++                    if (rows_end == e_rows || *rows_end != '\0') {
++                        SRV_ERR("spec-t9ci: SPEC_T9_NOISE_ROWS non numerico '%s' - aborting\n", e_rows);
++                        return false;
++                    }
++                    t9ci_noise_rows = std::max(1, std::min((int) rows_v, 1 + SHADOW_N_MAX_DF));
++                    t9ci_rows_env = true;
++                }
++            }
++
++            // marker uno-per-boot (il controller grep-a 'spec-t9ci: mode=' == 1);
++            // E3a: con SPEC_T9_NOISE_ROWS esplicito il marker porta anche rows=N
++            const char * t9ci_name =
+                     t9ci_mode == spec_t9ci_mode::noise     ? "noise"     :
+                     t9ci_mode == spec_t9ci_mode::draftonly ? "draftonly" :
+-                    t9ci_mode == spec_t9ci_mode::shadow    ? "shadow"    : "off",
++                    t9ci_mode == spec_t9ci_mode::shadow    ? "shadow"    : "off";
++            std::string t9ci_env =
+                     t9ci_mode == spec_t9ci_mode::noise     ? "SPEC_T9_NOISE_DECODE=1" :
+                     t9ci_mode == spec_t9ci_mode::draftonly ? "SPEC_T9_DRAFT_ONLY=1"  :
+-                    t9ci_mode == spec_t9ci_mode::shadow    ? "SPEC_SHADOW_DRAFT=1"   : "none");
++                    t9ci_mode == spec_t9ci_mode::shadow    ? "SPEC_SHADOW_DRAFT=1"   : "none";
++            if (t9ci_mode == spec_t9ci_mode::noise && t9ci_rows_env) {
++                t9ci_env += ", rows=" + std::to_string(t9ci_noise_rows);
++            }
++            SRV_INF("spec-t9ci: mode=%s (env %s)\n", t9ci_name, t9ci_env.c_str());
+ 
+             // t9 fase A (Task 4) + t9 charidentity (B2): arma il mirror DF del
+             // process() gate (speculative.cpp) per OGNI modalità attiva, E1/E2
+@@ -4883,10 +4917,11 @@ private:
+ 
+     // t9 charidentity (E1, SPEC_T9_NOISE_DECODE): braccio di isolamento H1 - un
+     // decode extra interleaved su ctx_tgt con contenuto DUMMY fisso (ancora +
+-    // 7 copie di slot.sampled) e rollback COMPLETO al boundary C_{r+1}.
++    // copie di slot.sampled) e rollback COMPLETO al boundary C_{r+1}.
+     // Semantica dichiarata: E1 = ON (shadow_drafter_round) meno {draft DF,
+-    // accept, righe variabili} - batch fisso a 8 righe (la capacità allocata
+-    // del batch verify), NESSuna chiamata al draft DF, NESSun token accettato.
++    // accept, righe variabili} - batch fisso a t9ci_noise_rows righe (8 default;
++    // E3a: SPEC_T9_NOISE_ROWS), NESSuna chiamata al draft DF, NESSun token
++    // accettato.
+     // Cosa NON tocca (parità con lo shadow): slot.prompt.tokens, cache prompt,
+     // impl_last/impl_head, slot.smpl (mai campionato), contatori del round vero,
+     // spec_dists. Il mirror DF resta ARMATO (boot, B2): il process() sotto guard
+@@ -4909,12 +4944,14 @@ private:
+         // pos_bnd+1 - pos_next-1 = trim da pos_next.
+         common_speculative_shadow_rollback_dflash(spec.get(), slot.id, pos_next - 1);
+ 
+-        // batch fisso 8 righe dummy: ancora (sampled) + 7 copie, pos consecutive
+-        // da pos_next. shadow_i_batch resta VUOTO: niente accept, gli indici non
+-        // servono. Capacità allocata = 1 + SHADOW_N_MAX_DF = 8 righe esatte.
++        // batch dummy a t9ci_noise_rows righe (E3a: SPEC_T9_NOISE_ROWS, default 8
++        // = E1 originale): ancora (sampled) + (rows-1) copie, pos consecutive da
++        // pos_next. shadow_i_batch resta VUOTO: niente accept, gli indici non
++        // servono. Il clamp al boot [1, 1+SHADOW_N_MAX_DF] garantisce di non
++        // superare MAI la capacità allocata del batch verify (8 righe).
+         common_batch_clear(slot.shadow_batch);
+         llama_pos pos0 = pos_next;
+-        for (int i = 0; i < 1 + SHADOW_N_MAX_DF; ++i) {
++        for (int i = 0; i < t9ci_noise_rows; ++i) {
+             common_batch_add(slot.shadow_batch, slot.sampled, pos0++, { slot.id }, true);
+         }
+ 
+@@ -4967,13 +5004,17 @@ private:
+         common_context_seq_rm(slot.ctx_tgt, slot.id, pos_next, -1);
+         // (2) head MTP: difensivo/idempotente (il gate nega l'ingest - v. shadow)
+         common_context_seq_rm(slot.ctx_dft, slot.id, pos_next, -1);
+-        // (3) ctx DF: il mirror ha ingerito le 8 righe noise a pos_next.. -
++        // (3) ctx DF: il mirror ha ingerito le righe noise (1..8) a pos_next.. -
+         //     pos_bnd = pos_next-1 trima da pos_next, lo STESSO confine
+         //     effettivo del rollback_df dello shadow: laggiù pos_bnd è il
+         //     pos_max del ctx DF dopo il pre-trim da dp.n_past (= pos_next), cioè
+         //     pos_next-1 in condizioni normali (contratto speculative.h +
+         //     igiene pre-decode sopra che replica quel pre-trim). Qui non c'è
+-        //     draft che lo catturi: il valore è derivato, non indovinato.
++        //     draft che lo catturi: il valore è derivato, non indovinato. I trim
++        //     sono tutti PER-POSIZIONE (da pos_next), NON per taglia batch: con
++        //     E3a rows=1 il decode scrive solo pos_next e il trim da pos_next
++        //     rimuove esattamente quella riga - il boundary ripristinato è lo
++        //     STESSO per qualunque rows.
+         common_speculative_shadow_rollback_dflash(spec.get(), slot.id, pos_next - 1);
+         // stato impl (boundary MTP) riportato al boundary committato
+         if (need_spec_state && !noise_spec_state.empty()) {
+-- 
+2.43.0
+

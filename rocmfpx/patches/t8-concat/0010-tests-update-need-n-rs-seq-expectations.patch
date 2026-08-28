@@ -1,0 +1,56 @@
+From 9c84c32b5296178ac165058686c18e951b99fd64 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Fri, 21 Aug 2026 21:30:54 +0200
+Subject: [PATCH] tests: update need_n_rs_seq expectations for the RS floor [t8
+ stadio 2]
+
+The trailing-rollback RS floor introduced with the ring-window fix
+(59982de3f) clamps need_n_rs_seq() up to 16 whenever a stateful spec
+type is drafted, so the four assertions in test-arg-parser that
+expected the raw round-width sizing (6, and 0 for n_max = -1) now
+observe 16. The n_max = -1 case is unreachable from the CLI (the
+--spec-draft-n-max parser callback throws on negative values); noted
+in a comment rather than changing the floor semantics.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tests/test-arg-parser.cpp | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/tests/test-arg-parser.cpp b/tests/test-arg-parser.cpp
+index c514edc65..877abfc37 100644
+--- a/tests/test-arg-parser.cpp
++++ b/tests/test-arg-parser.cpp
+@@ -158,20 +158,25 @@ int main(void) {
+         assert(strict_params.speculative.mtp_strict_qwen == false);
+         strict_params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+         strict_params.speculative.draft.n_max = 6;
+-        assert(strict_params.speculative.need_n_rs_seq() == 6);
++        // the trailing-rollback RS floor (see need_n_rs_seq in common.h) clamps
++        // the round-width sizing up to 16
++        assert(strict_params.speculative.need_n_rs_seq() == 16);
+         strict_params.speculative.draft.n_max = -1;
+-        assert(strict_params.speculative.need_n_rs_seq() == 0);
++        // n_max = -1 is unreachable from the CLI (the --spec-draft-n-max
++        // parser callback throws on negative values); the floor still yields
++        // 16 because a stateful spec type is set
++        assert(strict_params.speculative.need_n_rs_seq() == 16);
+         strict_params.speculative.draft.n_max = 6;
+ 
+         argv = {"binary_name", "--spec-mtp-strict-qwen"};
+         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), strict_params, LLAMA_EXAMPLE_SERVER));
+         assert(strict_params.speculative.mtp_strict_qwen == true);
+-        assert(strict_params.speculative.need_n_rs_seq() == 6);
++        assert(strict_params.speculative.need_n_rs_seq() == 16);
+ 
+         argv = {"binary_name", "--no-spec-mtp-strict-qwen"};
+         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), strict_params, LLAMA_EXAMPLE_SERVER));
+         assert(strict_params.speculative.mtp_strict_qwen == false);
+-        assert(strict_params.speculative.need_n_rs_seq() == 6);
++        assert(strict_params.speculative.need_n_rs_seq() == 16);
+ 
+         common_params cli_strict_params;
+         argv = {"binary_name", "-m", "model_file.gguf", "--spec-mtp-strict-qwen"};
+-- 
+2.43.0
+

@@ -355,6 +355,14 @@ extern "C" {
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+
+        // t8 stadio 2 (spec §3): concat-round head tokens presented to a
+        // draft-dflash context ahead of its noise block (0 = none). Raises the
+        // selector-lattice block cap of the dflash graph from the trained
+        // dflash.block_size to dflash.block_size + k1 so a concat round's
+        // wider drafting batch (1 anchor + k1 head + n_max noise rows) fits.
+        // Inert on every other architecture and when 0.
+        int32_t  dflash_concat_k1;
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 

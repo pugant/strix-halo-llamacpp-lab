@@ -14,6 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "spec-concat-exclusion.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -24,6 +25,7 @@
 #include <cinttypes>
 #include <ctime>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <filesystem>
 #include <mutex>
@@ -307,6 +309,13 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // t8 stadio 2 (spec §6, Task 6): per-request concat observability, printed
+    // by print_timings() next to the per-impl statistics (the metric keeps the
+    // server-lifetime total; these reset with the slot like n_draft_total)
+    int32_t n_concat_rounds = 0;       // composed concat rounds verified by this request
+    int32_t n_concat_head_total = 0;   // MTP head tokens composed across those rounds
+    int32_t n_concat_mtp_accepted = 0; // MTP head tokens accepted across those rounds
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -342,6 +351,11 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+
+        // t8 concat observability (per-request, see the fields above)
+        n_concat_rounds = 0;
+        n_concat_head_total = 0;
+        n_concat_mtp_accepted = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -633,6 +647,17 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        // t8 stadio 2 (spec §6, Task 6): concat-round observability next to the
+        // per-impl statistics above (ngram-style marker, per-request like the
+        // slot counters). Only printed when this request actually verified
+        // composed concat rounds - k1 is the configured --spec-concat-k1 and
+        // every concat code path is gated on it
+        if (n_concat_rounds > 0) {
+            SLT_INF(*this, "statistics %16s: k1 = %d, rounds = %d, mtp_accepted = %d/%d\n",
+                    "concat", common_speculative_concat_k1(spec), n_concat_rounds,
+                    n_concat_mtp_accepted, n_concat_head_total);
+        }
     }
 
     json to_json(bool only_metrics = false) const {
@@ -727,6 +752,14 @@ struct server_metrics {
     std::map<std::string, uint64_t> spec_route_cache_rebuilds = {};
     uint64_t spec_route_overrides_total = 0;
 
+    // t8 stadio 2 (spec §6, Task 6): MTP head tokens accepted in composed
+    // concat rounds, exported as spec_route_concat_mtp_accepted_total. The
+    // unlabeled counter is emitted unconditionally at /metrics render time
+    // (like spec_route_override_total), so it is present at 0 from boot with
+    // no pre-registration needed (T7 lesson 8b35a795f: a counter that only
+    // appears on first increment stays invisible until then)
+    uint64_t spec_route_concat_mtp_accepted_total = 0;
+
     void init() {
         t_start = ggml_time_us();
 
@@ -752,6 +785,10 @@ struct server_metrics {
 
     void on_spec_route_cache_rebuild(const std::string & kind) {
         spec_route_cache_rebuilds[kind]++;
+    }
+
+    void on_spec_route_concat_mtp_accepted(uint32_t n_tokens) {
+        spec_route_concat_mtp_accepted_total += n_tokens;
     }
 
     void on_prompt_eval(const server_slot & slot) {
@@ -1314,6 +1351,47 @@ private:
                         default_drafter != COMMON_SPECULATIVE_TYPE_NONE
                             ? server_slot::spec_route_short_name(default_drafter).c_str()
                             : "none (no routing)");
+            }
+        }
+
+        // t8 stadio 2 (spec §3 'Boot'): --spec-concat-k1 > 0 arms the concat
+        // round mode (MTP k1 tokens + the draft-dflash block in one verify).
+        // Config surface only for now - no round mechanics: the marker just
+        // confirms the boot guard. concat requires dual routing with BOTH
+        // draft-mtp and draft-dflash actually instantiated (a dual config that
+        // degraded to mono at boot counts as not ready, and so does any
+        // single-type server): anything else keeps the T7 routing with a
+        // WARNING, never a boot error (spec §10).
+        if (params_base.speculative.concat_k1 > 0) {
+            const bool concat_ready = spec_dual
+                && spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) > 0
+                && spec_types_loaded.count(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) > 0;
+
+            if (concat_ready) {
+                SRV_INF("spec-route: concat mode k1=%d\n", params_base.speculative.concat_k1);
+
+                // t8 branch-2: pattern-window exclusion for the concat round
+                // (--spec-concat-exclusion, default enabled). The per-round gate
+                // runs inside the concat branch of common_speculative_draft():
+                // a pattern-like (copy-mode) confirmed window takes that round
+                // down the plain draft-dflash path instead of the MTP->DFlash
+                // concat round. The marker is nested inside the concat_ready
+                // guard (Task 5 review): a degraded dual boot never reaches
+                // here, so "concat mode disabled" can no longer be read next to
+                // an exclusion state line. Detector constants are printed from
+                // the header, not re-typed - a registered amendment keeps the
+                // marker truthful. An explicitly disabled exclusion on a
+                // configured concat mode re-exposes the copy-mode collapse the
+                // detector prevents, so that combination logs a WARNING.
+                if (params_base.speculative.concat_exclusion) {
+                    SRV_INF("spec-route: concat exclusion active (theta_ac=%.2f m=%d w=%d)\n",
+                            spec_concat_exclusion::THETA_AC, spec_concat_exclusion::M, spec_concat_exclusion::W);
+                } else {
+                    SRV_WRN("%s", "spec-route: concat exclusion disabled by --no-spec-concat-exclusion - pattern-like (copy-mode) windows keep the concat round\n");
+                }
+            } else {
+                SRV_WRN("spec-route: concat mode disabled: --spec-concat-k1 %d requires dual routing (draft-mtp,draft-dflash) with both drafters loaded - keeping the T7 routing\n",
+                        params_base.speculative.concat_k1);
             }
         }
 
@@ -2603,6 +2681,9 @@ private:
                     res->spec_route_requests       = metrics.spec_route_requests;
                     res->spec_route_cache_rebuilds = metrics.spec_route_cache_rebuilds;
                     res->spec_route_overrides_total = metrics.spec_route_overrides_total;
+
+                    // t8 stadio 2 (spec §6, Task 6): concat observability counter
+                    res->spec_route_concat_mtp_accepted_total = metrics.spec_route_concat_mtp_accepted_total;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -4194,7 +4275,28 @@ private:
                         SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                     }
 
+                    // t8 stadio 2 (spec §6, Task 6): concat observability. Read the
+                    // head size BEFORE the accept - common_speculative_accept()
+                    // consumes the per-seq round attribution (impl_head) that marks
+                    // this round as composed. The accepted head tokens are
+                    // min(n_accepted, k1'): the head is the first k1' rows of the
+                    // round, so a partial acceptance inside the head counts its
+                    // accepted prefix and an acceptance reaching past the head
+                    // counts the whole head (same boundary arithmetic as the MTP
+                    // impl's i_h, speculative.cpp accept()).
+                    const int32_t n_concat_head = common_speculative_concat_head_size(spec.get(), slot.id);
+
                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+
+                    if (n_concat_head > 0) {
+                        const int32_t n_concat_mtp = std::min<int32_t>((int32_t) (accepted.size() - 1), n_concat_head);
+
+                        metrics.on_spec_route_concat_mtp_accepted(n_concat_mtp);
+
+                        slot.n_concat_rounds++;
+                        slot.n_concat_head_total += n_concat_head;
+                        slot.n_concat_mtp_accepted += n_concat_mtp;
+                    }
 
                     slot.spec_draft = std::move(accepted);
                     slot.spec_dists.clear();
@@ -4511,6 +4613,97 @@ private:
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
     }
 };
+
+//
+// t8 branch-2 (gate G1): fixture parity selftest of the C++ concat-exclusion
+// detector against the certified Python reference. The fixtures file is the
+// contract (scripts/t8-b2-detector.py --dump-fixtures): every window carries
+// the expected (gated, segnale) produced by the reference, and this routine
+// must reproduce ALL of them with spec_concat_exclusion::gating(). Pure I/O -
+// called pre-load from main() (no backend init, no model, no inference).
+// Returns 0 on PASS (n/n), 1 on FAIL or unreadable/incompatible fixtures.
+//
+int server_spec_concat_selftest(const std::string & fixtures_path) {
+    std::ifstream f(fixtures_path);
+    if (!f) {
+        fprintf(stderr, "spec-concat-selftest: FAIL cannot open fixtures file '%s'\n", fixtures_path.c_str());
+        return 1;
+    }
+
+    json data;
+    try {
+        data = json::parse(f);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "spec-concat-selftest: FAIL JSON parse error in '%s': %s\n", fixtures_path.c_str(), e.what());
+        return 1;
+    }
+
+    // everything below dereferences the parsed schema (at()/conversions throw
+    // on incomplete or malformed fixtures): a bad fixtures file must FAIL
+    // cleanly, never crash the server with an uncaught exception
+    try {
+        // constants contract: refuse to certify parity against fixtures generated
+        // with different pre-registered constants (they are a different contract)
+        const auto want_const = [&](const char * key, auto value, const char * name) {
+            const auto & j = data.at("constants").at(key);
+            if (j != json(value)) {
+                fprintf(stderr, "spec-concat-selftest: FAIL constants mismatch: %s in '%s' differs from the C++ pre-registered value\n",
+                        name, fixtures_path.c_str());
+                return false;
+            }
+            return true;
+        };
+        if (!want_const("w",         spec_concat_exclusion::W,        "w") ||
+            !want_const("p_min",     spec_concat_exclusion::P_MIN,    "p_min") ||
+            !want_const("p_max",     spec_concat_exclusion::P_MAX,    "p_max") ||
+            !want_const("theta_ac",  spec_concat_exclusion::THETA_AC, "theta_ac") ||
+            !want_const("m",         spec_concat_exclusion::M,        "m")) {
+            return 1;
+        }
+
+        int n_pass = 0;
+        int n_total = 0;
+        for (const auto & fx : data.at("fixtures")) {
+            const std::string id = fx.at("id");
+            const std::vector<llama_token> tokens = fx.at("tokens");
+            const bool want_gated = fx.at("gated");
+            std::string want_segnale; // "" == None in the reference
+            if (!fx.at("segnale").is_null()) {
+                want_segnale = fx.at("segnale");
+            }
+
+            const auto res = spec_concat_exclusion::gating(tokens);
+            const std::string got_segnale(res.segnale ? res.segnale : "");
+
+            n_total++;
+            if (res.gated == want_gated && got_segnale == want_segnale) {
+                n_pass++;
+            } else {
+                fprintf(stderr, "spec-concat-selftest: FAIL fixture '%s': got (%s, \"%s\"), want (%s, \"%s\")\n",
+                        id.c_str(),
+                        res.gated ? "true" : "false", got_segnale.c_str(),
+                        want_gated ? "true" : "false", want_segnale.c_str());
+            }
+        }
+
+        if (n_total == 0) {
+            fprintf(stderr, "spec-concat-selftest: FAIL no fixtures found in '%s'\n", fixtures_path.c_str());
+            return 1;
+        }
+
+        if (n_pass == n_total) {
+            fprintf(stderr, "spec-concat-selftest: PASS %d/%d\n", n_pass, n_total);
+            return 0;
+        }
+        // the summary line is what the lab gating greps: a failed run must say
+        // FAIL here, PASS only on a full pass
+        fprintf(stderr, "spec-concat-selftest: FAIL %d/%d\n", n_pass, n_total);
+        return 1;
+    } catch (const std::exception & e) {
+        fprintf(stderr, "spec-concat-selftest: FAIL malformed fixtures in '%s': %s\n", fixtures_path.c_str(), e.what());
+        return 1;
+    }
+}
 
 //
 // server_context (public API)
@@ -4974,6 +5167,14 @@ void server_routes::init_routes() {
                 {"name",  "spec_route_override_total"},
                 {"help",  "Number of tasks launched with an explicit spec_drafter override."},
                 {"value", res_task->spec_route_overrides_total},
+            });
+
+            // t8 stadio 2 (spec §6, Task 6): emitted unconditionally so the
+            // counter is present at 0 from boot (see server_metrics)
+            counter_defs.push_back({
+                {"name",  "spec_route_concat_mtp_accepted_total"},
+                {"help",  "Number of MTP head tokens accepted in composed concat rounds."},
+                {"value", res_task->spec_route_concat_mtp_accepted_total},
             });
 
             for (const auto & [kind, count] : res_task->spec_route_cache_rebuilds) {

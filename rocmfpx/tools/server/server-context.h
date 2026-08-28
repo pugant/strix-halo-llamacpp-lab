@@ -12,6 +12,13 @@
 
 struct server_context_impl; // private implementation
 
+// t8 branch-2 (gate G1): fixture parity selftest of the C++ concat-exclusion
+// detector against the fixtures of the certified Python reference. Returns 0
+// on PASS (all fixtures reproduced), 1 on FAIL or unreadable/incompatible
+// fixtures. Pure I/O - no backend, no model, no inference; safe (and meant)
+// to be called pre-load from main().
+int server_spec_concat_selftest(const std::string & fixtures_path);
+
 struct server_context_meta {
     std::string build_info;
     std::string model_name;

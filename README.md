@@ -2,14 +2,15 @@
 
 ## TL;DR
 
-- **What** — llama.cpp server experiments focused on one machine class: per-request speculative-decoding **routing** (built-in MTP ⇄ external DFlash2 block-diffusion drafter), a **reasoning ("thinking") budget** with cache-friendly truncation, **spec-boundary cache salvage**, and a complete **ROCmFP4-STRIX_LEAN quantization pipeline** (imatrix → quantize → sanitize → publish).
+- **What** — llama.cpp server experiments focused on one machine class: per-request speculative-decoding **routing** (built-in MTP ⇄ external DFlash2 block-diffusion drafter), a **reasoning ("thinking") budget** with cache-friendly truncation, **spec-boundary cache salvage**, a complete **ROCmFP4-STRIX_LEAN quantization pipeline** (imatrix → quantize → sanitize → publish), and the **qwen4exp architecture** (Qwen3.8-Flash-Next: gated-deltanet + QSA + PLE + hyper-connections) with **external MTP draft-head support** — 2× deterministic decode from a 98 GiB target in unified memory.
 - **Where it runs** — AMD Strix Halo: Ryzen AI MAX+ 395, Radeon 8060S iGPU (gfx1151, RDNA 3.5), 128 GB unified LPDDR5X, inside ROCm 7.2.4 containers built from [kyuz0](https://github.com/kyuz0)'s [amd-strix-halo-toolboxes](https://github.com/kyuz0/amd-strix-halo-toolboxes).
 - **Status** — the dual-drafter routing server is live in daily production since the morning of **2026-08-20** (published the same day), on the author's machine. Every performance claim in this README was measured on our hardware; nothing is projected or taken from vendor material.
-- **Code** — the **full buildable source of the runtime fork is included in this repo under [`rocmfpx/`](rocmfpx/)** (snapshot of our `drafter-routing` branch, a fork of [charlie12345/ROCmFPX](https://github.com/charlie12345/ROCmFPX), itself a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)). The same work is also carried as `git am`-clean patches, plus the scripts and the raw benchmark notes.
+- **Code** — the **full buildable source of the runtime fork is included in this repo under [`rocmfpx/`](rocmfpx/)** (snapshot of our `qwen4exp-mtp` branch — the routing stack plus qwen4exp and the MTP draft head; a fork of [charlie12345/ROCmFPX](https://github.com/charlie12345/ROCmFPX), itself a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)). The same branches are also pushed here as git refs (`main`, `qwen4exp-rt`, `qwen4exp-mtp`), the work is carried as `git am`-clean patches, and [`docker/`](docker/) has the Dockerfiles to build the inference engine for both backends (HIP/ROCm 7.2.4 and Vulkan/RADV).
 - **Models** (Hugging Face, weights under their own licenses):
 
 | Repo | What it is |
 |---|---|
+| [`pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF`](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF) | **qwen4exp 180B (6B active + 51B PLE), 98.5 GiB** — the lab's largest model; pairs with an external MTP drafter for 2× deterministic decode |
 | [`pugant/Qwen3.8-27B-MTP-Q4_0_ROCMFP4_STRIX_LEAN`](https://huggingface.co/pugant/Qwen3.8-27B-MTP-Q4_0_ROCMFP4_STRIX_LEAN) | Dense 27B, 13.8 GiB — the canonical model of this lab |
 | [`pugant/Qwen3.8-27B-imatrix`](https://huggingface.co/pugant/Qwen3.8-27B-imatrix) | The importance matrix used by the preset above |
 | [`pugant/grug-35b-v2-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/grug-35b-v2-ROCmFP4-STRIX_LEAN) | MoE 35B-A3B, reasoning/tool-call finetune |
@@ -18,7 +19,7 @@
 | [`pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN) | Mamba-hybrid MoE |
 | [`pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX`](https://huggingface.co/pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX) | MoE 35B-A3B at Q6_0 |
 
-**Repository layout** — `rocmfpx/` (**full runtime fork source, buildable — clone this repo and compile**) · `patches/` (all features, `git am`-able) · `scripts/` (download / imatrix / quantize / sanitize / test / bench) · `docker/` (convert container) · `docs/` (raw experiment notes) · [LICENSE](LICENSE) · [NOTICE](NOTICE).
+**Repository layout** — `rocmfpx/` (**full runtime fork source, buildable — clone this repo and compile**) · `patches/` (all features, `git am`-able) · `scripts/` (download / imatrix / quantize / sanitize / test / bench) · `docker/` (**runtime engine Dockerfiles — HIP and Vulkan — plus the convert container**) · `docs/` (raw experiment notes) · [LICENSE](LICENSE) · [NOTICE](NOTICE).
 
 ---
 
@@ -136,6 +137,24 @@ If we forgot anyone: it is an omission, not an intent — open an issue and we w
 **What.** Optional per-position acceptance logging of the MTP verify batch — [`patches/spec-verify-log/0001-spec-verify-log.patch`](patches/spec-verify-log/0001-spec-verify-log.patch).
 
 **Why it matters.** It made the acceptance analysis possible: the verify batch is strongly **bimodal** — on positions where the draft matched, acceptance ≈ 1.0; where it mismatched, ≈ `p_draft`. Every workload characterization in this README rests on that instrumentation.
+
+### qwen4exp (Qwen3.8-Flash-Next) + external MTP drafter
+
+**What.** The full `qwen4exp` architecture on the fork — gated-deltanet linear attention, QSA indexer attention with a third KV stream, the 51B-parameter PLE n-gram table, 4-stream low-rank hyper-connections — plus the **MTP/NextN draft head driven by an external drafter GGUF** (`-md`), ported from upstream [PR #27836](https://github.com/ggml-org/llama.cpp/pull/27836) and adapted to the fork (converter and quantizer side from [PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742)). Runs unchanged on HIP and Vulkan builds.
+
+**Outcome (dedicated GPU, 98.5 GiB target + 3.85 GiB Q8_0 drafter, ctx 8192, median of 3):**
+
+| workload | plain | +MTP n=3 | +MTP n=5 |
+|---|---|---|---|
+| deterministic (counting) | 22.1 | 46.0 (**+108%**) | **50.2 (+127%)** |
+| deterministic (alphabet) | 20.9 | 32.0 (+53%) | 32.6 (+56%) |
+| open prose | 22.6 | 22.8–25.4 (+1..12%) | — |
+
+Draft acceptance 95.7% of tokens (mean accepted length 3.24 at n=3; still 5.20/6 at n=5 on deterministic text). Perplexity sanity identical to the pre-MTP build. The mechanical read: the round bottleneck is the **batched verify over the hybrid trunk** (KV + GDN + QSA index + PLE), not the drafter — deterministic work converts acceptance into speed almost 1:1, open prose decays after position 1. Model card with the full numbers: [Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF).
+
+**Patch.** [`patches/qwen4exp-mtp/`](patches/qwen4exp-mtp/) — 8 commits, `git am`-clean (also included in [`rocmfpx/`](rocmfpx/) and on branch `qwen4exp-mtp`). Includes two silent-bug fixes worth knowing about if you port this yourself: the wide pre-norm width (`n_hc * n_embd`) for the drafter input, and the PLE conv-state block missing from the checkpoint writer.
+
+**Build the engine.** [`docker/Dockerfile.rocm-7.2.4-rocmfpx`](docker/Dockerfile.rocm-7.2.4-rocmfpx) (HIP, gfx1151) or [`docker/Dockerfile.vulkan-rocmfpx`](docker/Dockerfile.vulkan-rocmfpx) (Vulkan/RADV), both `--build-arg REPO=<this-repo>.git --build-arg BRANCH=qwen4exp-mtp`. Remember: HIP containers need `/dev/kfd` **and** `/dev/dri` — without `/dev/kfd` ROCm init fails *silently* and the server falls back to CPU.
 
 ### Documented NO-GO experiments
 

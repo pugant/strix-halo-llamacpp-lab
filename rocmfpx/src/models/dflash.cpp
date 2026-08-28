@@ -729,11 +729,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     if (model.dspark_markov_w1) {
         build_dspark_markov_head(*this, model, inp_tokens);
     }
-
-    // DFlash2: build the selector lattice on top of the block logits. No-op for
-    // DFlash1/DSpark (no selector tensors), and skipped for embd (KV-injection)
-    // batches, which return above before reaching here.
-    build_post_sampling();
 }
 
 template <bool is_enc>
@@ -757,7 +752,21 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
     }
 
     const int64_t tokens_per_block = n_tokens / n_blocks;
-    const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
+    // t8 stadio 2 (spec §3): a concat round presents anchor + k1 MTP head tokens
+    // + the full noise block to this context (1 + k1 + n_max rows), wider than
+    // the trained block size declared by the GGUF. Widen the cap by exactly the
+    // declared head width (llama_context_params::dflash_concat_k1) instead of
+    // removing it: the lattice walk is position-agnostic (same weights per step:
+    // candidates -> predecessor -> successor), but an uncapped walk explodes on
+    // the wide KV-injection mirror batches (tokens_per_block in the hundreds)
+    // and the reserve-sized graph pool with it. A cap below tokens_per_block
+    // would make t_h_pre_norm smaller than the batch and the host extraction
+    // (n_rows = ubatch.n_tokens) aborts with tensor-read-out-of-bounds. The
+    // off-distribution quality of the rows past the trained width is the
+    // declared spec section 9 risk, measured by the stage-A gate.
+    const int64_t block_cap  = (int64_t) hparams.dflash_block_size +
+        std::max<int64_t>(0, (int64_t) cparams.dflash_concat_k1);
+    const int64_t block_size = std::min<int64_t>(tokens_per_block, block_cap);
     ggml_tensor * candidates = ggml_top_k(ctx0, res->t_logits, top_k);
     ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
     ggml_tensor * unary = ggml_reshape_2d(ctx0,

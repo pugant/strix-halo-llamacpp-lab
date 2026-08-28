@@ -11,8 +11,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <unordered_map>
@@ -768,6 +770,62 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+    }
+
+    // [spec-verify-log] typical-acceptance feasibility study (passo 0): pure
+    // observation of the verify batch, enabled only when SPEC_VERIFY_LOG points
+    // to a writable file. Does NOT alter sampling in any way. One R line per
+    // round, one P line per verify-batch row (including rows past the exact
+    // stop, so the analysis can simulate relaxed acceptance on the whole chain).
+    {
+        static FILE * spec_log = (FILE *) -1;
+        if (spec_log == (FILE *) -1) {
+            const char * spec_log_path = getenv("SPEC_VERIFY_LOG");
+            spec_log = (spec_log_path && spec_log_path[0]) ? fopen(spec_log_path, "a") : nullptr;
+            if (spec_log_path && spec_log_path[0] && !spec_log) {
+                fprintf(stderr, "[spec-verify-log] cannot open '%s': %s\n", spec_log_path, strerror(errno));
+            }
+        }
+        if (spec_log) {
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+            const int n_vocab = llama_vocab_n_tokens(vocab);
+            fprintf(spec_log, "R,%zu,%zu\n", draft.size(), result.size() - 1);
+            for (size_t k = 0; k < idxs.size(); k++) {
+                const llama_token tok_dft = (k < draft.size()) ? draft[k] : LLAMA_TOKEN_NULL;
+                const llama_token tok_smp = (k < result.size()) ? result[k] : LLAMA_TOKEN_NULL;
+                if (llama_get_sampled_logits_ith(ctx, idxs[k])) {
+                    fprintf(spec_log, "W,%zu,backend-sampling-row\n", k);
+                }
+                const float * logits = llama_get_logits_ith(ctx, idxs[k]);
+                GGML_ASSERT(logits != nullptr);
+                float mx = logits[0];
+                llama_token tok_amx = 0;
+                for (int v = 0; v < n_vocab; v++) {
+                    if (logits[v] > mx) {
+                        mx = logits[v];
+                        tok_amx = v;
+                    }
+                }
+                // softmax in two passes; entropy via H = log(Z) - S1/Z with
+                // S0 = sum e_i, S1 = sum e_i * (l_i - mx)  (exact algebra)
+                double S0 = 0.0, S1 = 0.0, e_dft = 0.0;
+                for (int v = 0; v < n_vocab; v++) {
+                    const double e = std::exp(logits[v] - mx);
+                    S0 += e;
+                    if (e > 0.0) {
+                        S1 += e * (logits[v] - mx);
+                    }
+                    if (v == tok_dft) {
+                        e_dft = e;
+                    }
+                }
+                const double p_dft = e_dft / S0;
+                const double H = std::log(S0) - S1 / S0;
+                fprintf(spec_log, "P,%zu,%d,%d,%d,%.8g,%.8g\n",
+                        k, (int) tok_dft, (int) tok_amx, (int) tok_smp, p_dft, H);
+            }
+            fflush(spec_log);
+        }
     }
 
     return result;

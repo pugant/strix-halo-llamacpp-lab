@@ -549,6 +549,9 @@ struct server_task_result_metrics : server_task_result {
     std::map<std::string, uint64_t> spec_route_cache_rebuilds = {};
     uint64_t spec_route_overrides_total = 0;
 
+    // t8 stadio 2 (spec §6, Task 6): MTP head tokens accepted in concat rounds
+    uint64_t spec_route_concat_mtp_accepted_total = 0;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();

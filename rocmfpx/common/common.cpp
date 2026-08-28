@@ -1594,6 +1594,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    // t8 stadio 2 (spec §3): widen the dflash selector-lattice block cap by the
+    // concat head width, armed with the same dual MTP+DFlash condition as
+    // need_n_rs_seq() - inert (0) on every other configuration, so the trained
+    // block size remains the cap exactly as before.
+    cparams.dflash_concat_k1  = params.speculative.concat_k1 > 0 &&
+            params.speculative.concat_armed() ? params.speculative.concat_k1 : 0;
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

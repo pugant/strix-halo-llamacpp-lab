@@ -1,0 +1,26 @@
+From 4f2480f1d0fef5a8e8c69388a871613a50962367 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Fri, 28 Aug 2026 10:06:30 +0200
+Subject: [PATCH 6/8] model(qwen4exp-mtp): wide pre-norm width for the qwen4exp
+ drafter
+
+---
+ src/llama-model.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index cb4e65dc0..f216518ed 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1648,7 +1648,7 @@ const float * llama_model::tensor_split() const {
+ }
+ 
+ uint32_t llama_model::n_embd_pre_norm() const {
+-    return arch == LLM_ARCH_DEEPSEEK4 ? hparams.n_embd * hparams.n_hc : hparams.n_embd;
++    return (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_QWEN4EXP) ? hparams.n_embd * hparams.n_hc : hparams.n_embd;
+ }
+ 
+ uint32_t llama_model::n_gpu_layers() const {
+-- 
+2.43.0
+

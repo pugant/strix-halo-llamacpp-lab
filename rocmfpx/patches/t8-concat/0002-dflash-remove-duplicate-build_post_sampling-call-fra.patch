@@ -1,0 +1,58 @@
+From 3256534a58234ef692d3036958f8227f6b33b71b Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Fri, 21 Aug 2026 13:34:46 +0200
+Subject: [PATCH] dflash: remove duplicate build_post_sampling call (framework
+ hook suffices) [t8 stadio 2]
+
+Phase-0 static review (independently confirmed) found that on DFlash2
+graphs with a selector, build_post_sampling() ran TWICE per graph: the
+direct call at the end of the graph<false> constructor (introduced by
+ebf1cc855, whose message claimed the framework hook 'does not exist
+here' even though it had landed the day before in ba2485545) plus the
+framework-level hook in llama_model::build_graph (src/llama-model.cpp),
+which reaches the same code via the virtual override. With no
+idempotency guard the selector lattice was built 2x in the same graph:
+output stays correct, but the duplicate wastes compute, doubles the
+lattice nodes, and adds avoidable pressure on graph_max_nodes (DFLASH
+sizing in llama-context.cpp).
+
+Remove the direct call: the hook alone reaches
+llama_model_dflash::graph<is_enc>::build_post_sampling() through the
+virtual dispatch (build_arch_graph has a single caller, the framework
+build_graph). The override's own guards keep the hook-only path safe
+for every non-lattice case: is_enc graphs, embd/KV-injection batches
+(early return leaves res->t_logits null), DFlash1/DSpark without
+selector tensors, and dsv4 graphs (no override).
+
+Verification (Vulkan gfx1151, Qwen3.8-27B STRIX_LEAN + DFlash2
+drafter, T7 dual boot, D1 det prompt, temp 0, p_min 0.75, c 16384):
+T1 smoke 14/14 on the rebuilt image; tg D1 3+3 runs mean 54.3 -> 54.1
+tok/s (-0.5%, parity within noise, identical per-run draft counts).
+
+Reference: phase-0 report, section 'Finding per lo Stadio 2'
+(docs/research/2026-08-21-t8-fase0-session-report.md, lab workspace).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/models/dflash.cpp | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index 104a1d339..5136c551a 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -729,11 +729,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+     if (model.dspark_markov_w1) {
+         build_dspark_markov_head(*this, model, inp_tokens);
+     }
+-
+-    // DFlash2: build the selector lattice on top of the block logits. No-op for
+-    // DFlash1/DSpark (no selector tensors), and skipped for embd (KV-injection)
+-    // batches, which return above before reaching here.
+-    build_post_sampling();
+ }
+ 
+ template <bool is_enc>
+-- 
+2.43.0
+

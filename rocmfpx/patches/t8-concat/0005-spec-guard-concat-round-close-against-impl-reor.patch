@@ -1,0 +1,113 @@
+From 3488da1dad0940b628869cdea9b74b4094093d86 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@local>
+Date: Fri, 21 Aug 2026 16:11:44 +0200
+Subject: [PATCH] spec: guard concat round-close against impl reordering [t8
+ stadio 2]
+
+Code quality review of Task 4 ("with fixes"): zero critical, two important
+findings to close now plus two cheap minors in the same file.
+
+Fix 1 (important - implicit ordering invariant): the concat round-close
+condition `!(impl == impl_mtp && concat_head != nullptr)` only kept the round
+open during the MTP arm's iteration, so its correctness silently depended on
+common_speculative_init()'s priority list iterating MTP before DFlash. With
+the arms reordered - or with an intermediate arm drafting the sequence - the
+stashed head would be closed (and accept() dispatched) to an arm that never
+drafted it: impl_last mis-attributed, n_gen_drafts credited wrong. The round
+now closes only when the sequence carries no head OR the closing arm IS the
+draft-dflash arm, documented in-place: a reordered priority list degrades
+concat to plain rounds instead of mis-attributing the close.
+
+Fix 2 (minor): renamed the harness-local `concat_armed` to
+`concat_rounds_ready` - it shadows common_params_speculative::concat_armed()
+with different semantics (adds impl existence and draft_n_max() > 0 on top
+of the requested-types check).
+
+Fix 3 (minor): the `concat mode armed` LOG_INF fired on k1 > 0 alone, so a
+mono boot logged it next to the server's "concat mode disabled" WARNING -
+two lines saying the opposite. The "armed" wording is now gated on
+params.concat_armed() (same requested-types check as the server boot marker);
+non-dual boots get an explicit "accepted but inert" line instead.
+
+Out of scope here by review assignment (other tasks): mixed-width
+multi-group test (Task 5), the n_min/dists and continue-after-failure
+comments, the block_cap helper.
+
+Rebuilt and re-verified with scripts/t8-concat-t1.sh: 41/41 PASS
+(logs/test-t8-concat/t4-mech-pass-fix.log), image f31c28c134fb.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/speculative.cpp | 35 +++++++++++++++++++++++++++--------
+ 1 file changed, 27 insertions(+), 8 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 28d62a60e..4d6a0c48b 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -3330,7 +3330,17 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+     result->concat_k1 = params.concat_k1;
+     result->concat_head.assign(n_seq, {});
+     if (result->concat_k1 > 0) {
+-        LOG_INF("%s: concat mode armed, k1=%d (per-request routing picks the rounds)\n", __func__, result->concat_k1);
++        // gate the "armed" wording on the same requested-types check as the server
++        // boot marker (common_params_speculative::concat_armed()) - with a mono or
++        // otherwise non-dual boot this branch must not claim the mode is armed
++        // while the server logs "concat mode disabled" (quality review: the two
++        // lines said the opposite of each other)
++        if (params.concat_armed()) {
++            LOG_INF("%s: concat mode armed, k1=%d (per-request routing picks the rounds)\n", __func__, result->concat_k1);
++        } else {
++            LOG_INF("%s: concat k1=%d accepted but the requested speculative types are not the dual draft-mtp,draft-dflash routing - concat stays inert\n",
++                    __func__, result->concat_k1);
++        }
+     }
+ 
+     return result;
+@@ -3502,8 +3512,11 @@ void common_speculative_draft(common_speculative * spec) {
+     }
+     // degenerate guard: with a draft-dflash arm that cannot draft at all (n_max
+     // clamped to 0 post-load) the head would close head-only rounds attributed to
+-    // dflash - keep the plain T7 routing instead (concat inert)
+-    const bool concat_armed = spec->concat_k1 > 0 && impl_mtp != nullptr &&
++    // dflash - keep the plain T7 routing instead (concat inert).
++    // NB deliberately NOT named concat_armed(): this adds impl existence and
++    // draft_n_max() > 0 on top of common_params_speculative::concat_armed()
++    // (requested types only) - different semantics, different name
++    const bool concat_rounds_ready = spec->concat_k1 > 0 && impl_mtp != nullptr &&
+             impl_dflash != nullptr && impl_dflash->draft_n_max() > 0;
+ 
+     for (auto & impl : spec->impls) {
+@@ -3524,7 +3537,7 @@ void common_speculative_draft(common_speculative * spec) {
+         // produces at most the head
+         std::vector<llama_seq_id> seq_concat;
+         std::vector<int32_t>      seq_concat_n_max;
+-        const bool concat_mtp_phase = concat_armed && impl.get() == impl_mtp;
++        const bool concat_mtp_phase = concat_rounds_ready && impl.get() == impl_mtp;
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+             auto & dp = dparams[seq_id];
+@@ -3607,10 +3620,16 @@ void common_speculative_draft(common_speculative * spec) {
+ 
+             // a new draft has been sampled
+             if (dp.drafting && !result.empty()) {
+-                // t8 concat: during the MTP arm's iteration a stashed head is
+-                // conditioning, not a completed round - the draft-dflash arm below
+-                // closes it (spec §3)
+-                if (!(impl.get() == impl_mtp && dp.concat_head != nullptr)) {
++                // t8 concat: while a head is stashed the round stays open - it is
++                // conditioning, not a completed round - and ONLY the draft-dflash
++                // arm may close it (spec §3: impl_last attributes the round to the
++                // closing arm). Closing on "any other impl" instead would depend
++                // on the init priority list keeping MTP first: with the arms
++                // reordered (or an intermediate arm drafting the sequence), the
++                // head would be closed - and accept() dispatched - to an arm that
++                // never drafted it. With this form a reordered list simply leaves
++                // the round unclosed here and concat degrades to plain rounds.
++                if (dp.concat_head == nullptr || impl.get() == impl_dflash) {
+                     dp.drafting = false;
+ 
+                     // t8 concat (spec §10): the round-level n_max is per-SEQ and
+-- 
+2.43.0
+

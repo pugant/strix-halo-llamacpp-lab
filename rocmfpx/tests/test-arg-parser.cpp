@@ -158,20 +158,38 @@ int main(void) {
         assert(strict_params.speculative.mtp_strict_qwen == false);
         strict_params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
         strict_params.speculative.draft.n_max = 6;
-        assert(strict_params.speculative.need_n_rs_seq() == 6);
+        // the trailing-rollback RS floor (see need_n_rs_seq in common.h) clamps
+        // the round-width sizing up to 16
+        assert(strict_params.speculative.need_n_rs_seq() == 16);
         strict_params.speculative.draft.n_max = -1;
-        assert(strict_params.speculative.need_n_rs_seq() == 0);
+        // n_max = -1 is unreachable from the CLI (the --spec-draft-n-max
+        // parser callback throws on negative values); the floor still yields
+        // 16 because a stateful spec type is set
+        assert(strict_params.speculative.need_n_rs_seq() == 16);
         strict_params.speculative.draft.n_max = 6;
 
         argv = {"binary_name", "--spec-mtp-strict-qwen"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), strict_params, LLAMA_EXAMPLE_SERVER));
         assert(strict_params.speculative.mtp_strict_qwen == true);
-        assert(strict_params.speculative.need_n_rs_seq() == 6);
+        assert(strict_params.speculative.need_n_rs_seq() == 16);
 
         argv = {"binary_name", "--no-spec-mtp-strict-qwen"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), strict_params, LLAMA_EXAMPLE_SERVER));
         assert(strict_params.speculative.mtp_strict_qwen == false);
-        assert(strict_params.speculative.need_n_rs_seq() == 6);
+        assert(strict_params.speculative.need_n_rs_seq() == 16);
+
+        // pin the pass-through branch of the RS floor (N_RS_SEQ_FLOOR): a round
+        // width wider than the floor must survive the clamp unchanged
+        strict_params.speculative.draft.n_max = 20;
+        assert(strict_params.speculative.need_n_rs_seq() == 20);
+        // and the max() between the floor operands: with concat armed the
+        // round width n_max + k1 (23) wins over the floor (16)
+        strict_params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        strict_params.speculative.concat_k1 = 3;
+        assert(strict_params.speculative.need_n_rs_seq() == 23);
+        strict_params.speculative.concat_k1 = 0;
+        strict_params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        strict_params.speculative.draft.n_max = 6;
 
         common_params cli_strict_params;
         argv = {"binary_name", "-m", "model_file.gguf", "--spec-mtp-strict-qwen"};
