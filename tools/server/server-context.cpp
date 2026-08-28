@@ -3713,9 +3713,18 @@ private:
                             //       for now, we skip this for simplicity
                             //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
                             // spec-route: the image chunk becomes rows of the ACTIVE drafter's context
-                            res = input_tokens.process_chunk(slot.ctx_dft, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
-                            if (res != 0) {
-                                GGML_ABORT("failed to process multi-modal data on draft context\n");
+                            // spec-route (mmproj x MTP): the MTP draft graph requires token input
+                            //       (qwen4exp graph_mtp asserts on ubatch.token) and an image chunk is
+                            //       embd-only. Skip the replay on the MTP drafter: the head stays
+                            //       informed of the image via the trunk hidden state at draft time,
+                            //       and the target verify keeps the output correct either way.
+                            if (slot.spec_drafter_active == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                                SLT_WRN(slot, "skipping image chunk on MTP draft context (embd input not supported)\n");
+                            } else {
+                                res = input_tokens.process_chunk(slot.ctx_dft, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                                if (res != 0) {
+                                    GGML_ABORT("failed to process multi-modal data on draft context\n");
+                                }
                             }
                         }
 
