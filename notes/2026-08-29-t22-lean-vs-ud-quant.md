@@ -60,3 +60,19 @@ If it loads, the engine comparison reopens.
   `docs/benchmarks/results-2026-08-29-t22-lean-vs-ud.md` in the source workspace
 - Bench logs: `logs/bench-qwen4exp-mtp/bench-FRKUD.log`
 - HF card updated with the quant table: commit `28aee5d5`
+
+## Follow-up (2026-08-30): clean rebuild isolates the failure to the speculative path
+
+A clean rebuild from master (`c841aeeb8`, 2026-08-29, build-commit coherence recorded at
+clone time) resolves point 5 above: the unsloth GGUF **loads fine** — sharded and merged,
+with and without `-fa`/`--no-mmap` (five differential probes, `-ngl 0`, load-only).
+The stale local build was the whole story for the plain-load failure.
+
+What remains broken on official is the **speculative path**: adding
+`-md <MTP head> --spec-type draft-mtp` makes the *target* itself fail to load with the
+same `blk.0.hc_attn_norm.weight not found` in ~6 ms. Likely culprit: the
+`mtp_on_hybrid_qwen` handling in the loader (tensor-list reconstruction for hybrid+MTP).
+Reproduction matrix is in the report; an upstream issue is pending a human account.
+
+Practical summary: plain serving of Flash-Next quants works on official master today;
+the external-drafter setup requires our fork.
