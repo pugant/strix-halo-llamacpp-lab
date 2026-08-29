@@ -1,0 +1,202 @@
+From eeb4e54d1db059973023b47a0f6538dd9ee7218c Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Fri, 28 Aug 2026 20:50:49 +0200
+Subject: [PATCH] feat(hip): enable hipCUB paths for top_k/argsort/cumsum on
+ HIP
+
+Porting da PR ggml-org/llama.cpp#27874 (chiusa non-merged, riuso del codice).
+
+Attivazione: option GGML_CUDA_USE_CUB (default OFF) + -DGGML_CUDA_USE_CUB=ON
+al cmake (via 2 del piano T20/F1) - il gate common.cuh CUDART>=11070 resta
+intatto: su HIP il define arriva da add_compile_definitions.
+
+Adattamenti al fork: hunk common.cuh (macro alias stream-capture) applicato
+in coda al file (fork 1645 righe vs upstream 1676); hunk top-k.cu include
+adattato alla struttura del fork (senza cuda/iterator nel ramo CCCL).
+Hunk argsort is_capturing applicato con offset -14.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ ggml/src/ggml-cuda/argsort.cu    | 24 +++++++++++++++++-------
+ ggml/src/ggml-cuda/common.cuh    | 14 ++++++++++++++
+ ggml/src/ggml-cuda/cumsum.cu     |  7 ++++++-
+ ggml/src/ggml-cuda/mean.cu       |  9 +++++++--
+ ggml/src/ggml-cuda/sum.cu        |  9 +++++++--
+ ggml/src/ggml-cuda/top-k.cu      | 15 ++++++++++-----
+ ggml/src/ggml-hip/CMakeLists.txt |  5 +++++
+ 7 files changed, 66 insertions(+), 17 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
+index c4f08091e..e32899ea0 100644
+--- a/ggml/src/ggml-cuda/argsort.cu
++++ b/ggml/src/ggml-cuda/argsort.cu
+@@ -1,12 +1,17 @@
+ #include "argsort.cuh"
+ 
+ #ifdef GGML_CUDA_USE_CUB
+-#    include <cub/cub.cuh>
+-#    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
+-#        define STRIDED_ITERATOR_AVAILABLE
+-#        include <cuda/iterator>
++#    if defined(GGML_USE_HIP)
++#        include <hipcub/hipcub.hpp>
++         using namespace hipcub;
++#    else
++#        include <cub/cub.cuh>
++#        if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
++#            define STRIDED_ITERATOR_AVAILABLE
++#            include <cuda/iterator>
++#        endif
++         using namespace cub;
+ #    endif
+-using namespace cub;
+ #endif  // GGML_CUDA_USE_CUB
+ 
+ static __global__ void init_indices(int * indices, const int ncols, const int nrows) {
+@@ -60,14 +65,19 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
+     size_t temp_storage_bytes = 0;
+ 
+     bool is_capturing = false;
+-#ifdef USE_CUDA_GRAPH
++#if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP)
+     // Currently (confirmed for CCCL <= 3.2) DeviceSegmentedSort does not support stream capture, while DeviceSegmentedRadixSort does.
+     // See https://github.com/NVIDIA/cccl/issues/5661#issuecomment-3229037149
+     // TODO: constrain this to the CCCL versions that have this issue once it's resolved in a future CCCL release.
+     cudaStreamCaptureStatus capture_status;
+     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+     is_capturing = (capture_status != cudaStreamCaptureStatusNone);
+-#endif  // USE_CUDA_GRAPH
++#endif  // USE_CUDA_GRAPH && !GGML_USE_HIP
++#ifdef GGML_USE_HIP
++    // hipCUB (rocPRIM) has no DeviceSegmentedSort; use DeviceSegmentedRadixSort
++    // unconditionally (works inside and outside stream capture).
++    is_capturing = true;
++#endif
+ 
+     if (order == GGML_SORT_ORDER_ASC) {
+         if (nrows == 1) {
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 59c38c8f7..c7acac220 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1643,3 +1643,17 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
+     CUDA_CHECK(cudaGetLastError());
+ }
++
++
++// HIP compat: the CUDA capture-status API is not aliased by the HIP runtime;
++// map it for GGML_CUDA_USE_CUB code paths (argsort/top-k/mean/sum/...).
++#if defined(GGML_USE_HIP) && defined(GGML_CUDA_USE_CUB)
++#ifndef cudaStreamCaptureStatus
++#define cudaStreamCaptureStatus hipStreamCaptureStatus
++#define cudaStreamIsCapturing hipStreamIsCapturing
++#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
++#define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
++#define cudaStreamCaptureStatusGlobal hipStreamCaptureStatusGlobal
++#define cudaStreamCaptureStatusRelaxed hipStreamCaptureStatusRelaxed
++#endif
++#endif
+diff --git a/ggml/src/ggml-cuda/cumsum.cu b/ggml/src/ggml-cuda/cumsum.cu
+index def9c3295..fa2c1b0a6 100644
+--- a/ggml/src/ggml-cuda/cumsum.cu
++++ b/ggml/src/ggml-cuda/cumsum.cu
+@@ -5,7 +5,12 @@
+ #include "ggml.h"
+ 
+ #ifdef GGML_CUDA_USE_CUB
+-#   include <cub/cub.cuh>
++#   if defined(GGML_USE_HIP)
++#       include <hipcub/hipcub.hpp>
++        namespace cub = hipcub;
++#   else
++#       include <cub/cub.cuh>
++#   endif
+ #endif // GGML_CUDA_USE_CUB
+ 
+ template<typename T, int BLOCK_SIZE>
+diff --git a/ggml/src/ggml-cuda/mean.cu b/ggml/src/ggml-cuda/mean.cu
+index 49af53899..fd596dfe2 100644
+--- a/ggml/src/ggml-cuda/mean.cu
++++ b/ggml/src/ggml-cuda/mean.cu
+@@ -2,8 +2,13 @@
+ #include "reduce_rows.cuh"
+ 
+ #ifdef GGML_CUDA_USE_CUB
+-#include <cub/cub.cuh>
+-using namespace cub;
++#   if defined(GGML_USE_HIP)
++#       include <hipcub/hipcub.hpp>
++        using namespace hipcub;
++#   else
++#       include <cub/cub.cuh>
++        using namespace cub;
++#   endif
+ #endif  // GGML_CUDA_USE_CUB
+ 
+ template <typename T> __global__ void divide_by_count(T * result, size_t count) {
+diff --git a/ggml/src/ggml-cuda/sum.cu b/ggml/src/ggml-cuda/sum.cu
+index c56257b44..2f6c3cd4d 100644
+--- a/ggml/src/ggml-cuda/sum.cu
++++ b/ggml/src/ggml-cuda/sum.cu
+@@ -2,8 +2,13 @@
+ #include "sumrows.cuh"
+ 
+ #ifdef GGML_CUDA_USE_CUB
+-#include <cub/cub.cuh>
+-using namespace cub;
++#   if defined(GGML_USE_HIP)
++#       include <hipcub/hipcub.hpp>
++        using namespace hipcub;
++#   else
++#       include <cub/cub.cuh>
++        using namespace cub;
++#   endif
+ #endif  // GGML_CUDA_USE_CUB
+ 
+ #include <cstdint>
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index 59ce36fb1..15fc9cd90 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -2,11 +2,16 @@
+ #include "top-k.cuh"
+ 
+ #ifdef GGML_CUDA_USE_CUB
+-#    include <cub/cub.cuh>
+-#    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
+-#        define CUB_TOP_K_AVAILABLE
+-using namespace cub;
+-#    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
++#    if defined(GGML_USE_HIP)
++#        include <hipcub/hipcub.hpp>
++         using namespace hipcub;
++#    else
++#        include <cub/cub.cuh>
++#        if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
++#            define CUB_TOP_K_AVAILABLE
++             using namespace cub;
++#        endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
++#    endif
+ #endif      // GGML_CUDA_USE_CUB
+ 
+ #ifdef CUB_TOP_K_AVAILABLE
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index 743ace519..04bfb4b2c 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -47,6 +47,11 @@ find_package(hip     REQUIRED)
+ find_package(hipblas REQUIRED)
+ find_package(rocblas REQUIRED)
+ 
++option(GGML_CUDA_USE_CUB "Use hipCUB-based CUB code paths on HIP (argsort/top-k/mean/sum/cumsum)" OFF)
++if (GGML_CUDA_USE_CUB)
++    add_compile_definitions(GGML_CUDA_USE_CUB)
++endif()
++
+ if (GGML_HIP_RCCL)
+     find_package(rccl REQUIRED)
+ endif()
+-- 
+2.43.0
+
