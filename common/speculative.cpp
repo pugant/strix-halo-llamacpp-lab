@@ -1986,7 +1986,12 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
                     (*dparams_routing)[seq_id].drafter == type;
 
                 if (drafts_this_seq) {
-                    LOG_WRN("%s: MTP boundary missing for seq_id=%d pos=%d (current=%d/%d previous=%d/%d); "
+                    // PI F4 follow-up (29/08): with the partial-reject state reset
+                    // (server-side, f4 2d9ca97e1) this fires on the round that follows
+                    // every partial rejection - ~20% of draft rounds, routine by
+                    // design. Demoted to debug; the /metrics counter
+                    // spec_state_resets_total carries the frequency in production.
+                    LOG_DBG("%s: MTP boundary missing for seq_id=%d pos=%d (current=%d/%d previous=%d/%d); "
                             "resyncing after a non-token batch (e.g. vision chunk)\n",
                             __func__, (int) seq_id, (int) pos_needed,
                             (int) pending_h_pos[seq_id], (int) pending_h_valid[seq_id],
@@ -2146,7 +2151,11 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
                     (*dparams_routing)[seq_id].drafter == COMMON_SPECULATIVE_TYPE_NONE ||
                     (*dparams_routing)[seq_id].drafter == type;
                 if (drafts_this_seq) {
-                    LOG_WRN("%s: disabling MTP draft for seq_id=%d: boundary pos=%d/%d, needed=%d\n",
+                    // PI F4 follow-up (29/08): companion of the process() "MTP boundary
+                    // missing" demotion above - fires on the round after every partial
+                    // rejection while the reset state is re-synced. Debug level; the
+                    // spec_state_resets_total counter observes it in production.
+                    LOG_DBG("%s: disabling MTP draft for seq_id=%d: boundary pos=%d/%d, needed=%d\n",
                             __func__, (int) seq_id, (int) pending_h_pos[seq_id],
                             (int) pending_h_valid[seq_id], (int) pos_needed);
                 } else {
