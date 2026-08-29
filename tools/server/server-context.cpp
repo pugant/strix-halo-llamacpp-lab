@@ -4388,6 +4388,16 @@ private:
                     common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
                 }
 
+                // PI F4 fix (T20/F4, ipotesi H1 confermata dal banco 29/08): al partial-reject il
+                // rollback di memoria non ripulisce lo stato della head MTP e il round successivo
+                // parte con token fantasma (P(p0-reject|prec-reject) 0,272 vs 0,099 base; con reset
+                // head 0,161, acc-len condizionato 1,51->1,73). Il reset del solo drafter (blob
+                // vuoto, stesso primitivo dei cold-fallback) riallinea il round successivo tramite
+                // la neutral resync di process().
+                if (ids.size() < n_draft + 1) {
+                    common_speculative_set_state(spec.get(), slot.id, {});
+                }
+
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
 
