@@ -76,3 +76,18 @@ Reproduction matrix is in the report; an upstream issue is pending a human accou
 
 Practical summary: plain serving of Flash-Next quants works on official master today;
 the external-drafter setup requires our fork.
+
+## Post-scriptum (2026-08-30): quality verdict from real agent sessions — production switched
+
+Back-to-back pi-agent sessions (~40 min each, coding tasks, thinking mode) gave the
+quality dimension the throughput table could not: the STRIX_LEAN arm (with our MTP
+drafter enabled) produced repeated output-integrity incidents — reasoning breaking
+mid-sentence, one decoding degeneration (repeated zeros), occasional malformed tool
+calls — while the UD-IQ4_XS arm running plain on the same engine completed the same
+workloads incident-free, at ~16 t/s real-session decode. User decision: **production
+switched to UD-IQ4_XS plain**; the LEAN card now carries a quality note recommending
+the unsloth quants for agent deployments.
+
+Honest caveat (unchanged from the follow-up above): the arms differ in quant AND in
+speculation. Isolating the two — LEAN-plain control, verify/rollback quality
+instrumentation — is the open thread on our side.
