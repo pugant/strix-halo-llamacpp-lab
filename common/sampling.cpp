@@ -309,6 +309,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             params.reasoning_budget_end,
             params.reasoning_budget_forced,
             params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens,
+            REASONING_BUDGET_IDLE,
             params.reasoning_budget_warn,
             params.reasoning_budget_warn_ratio);
 
