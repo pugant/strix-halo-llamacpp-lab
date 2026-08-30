@@ -121,6 +121,13 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // the per-seq round attribution this readout is derived from.
 int32_t common_speculative_concat_head_size(const common_speculative * spec, llama_seq_id seq_id);
 
+// t20 f3 (pi-stack): type of the implementation that closed the last draft
+// round for this sequence (COMMON_SPECULATIVE_TYPE_NONE = no round attributed
+// yet for this seq). Unlike the concat-head readout above, the impl_last
+// attribution is per-round state that survives common_speculative_accept(),
+// so this can be read on either side of the accept call closing the round.
+enum common_speculative_type common_speculative_round_drafter_type(const common_speculative * spec, llama_seq_id seq_id);
+
 // t8 stadio 2 (spec §6): the configured concat head size (--spec-concat-k1,
 // 0 = concat rounds disabled)
 int32_t common_speculative_concat_k1(const common_speculative * spec);

@@ -552,6 +552,16 @@ struct server_task_result_metrics : server_task_result {
     // t8 stadio 2 (spec §6, Task 6): MTP head tokens accepted in concat rounds
     uint64_t spec_route_concat_mtp_accepted_total = 0;
 
+    // t20 f3 (pi-stack): draft rounds attributed per drafter family - the
+    // ngram drafter (pure prompt lookup, no model) vs the model drafter (MTP
+    // or DFlash per the per-request routing)
+    uint64_t spec_route_ngram_drafts_total  = 0;
+    uint64_t spec_route_model_drafts_total = 0;
+
+    // PI F4 follow-up (29/08): speculative drafter state resets (the partial-reject
+    // reset window), exported as spec_state_resets_total
+    uint64_t spec_state_resets_total = 0;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();

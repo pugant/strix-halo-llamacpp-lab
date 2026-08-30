@@ -760,6 +760,26 @@ struct server_metrics {
     // appears on first increment stays invisible until then)
     uint64_t spec_route_concat_mtp_accepted_total = 0;
 
+    // t20 f3 (pi-stack): draft rounds attributed per drafter family, exported
+    // as spec_route_ngram_drafts_total (ngram-*, pure prompt lookup with no
+    // model call) and spec_route_model_drafts_total (draft-mtp / draft-dflash
+    // per the routing). Unlabeled scalars emitted unconditionally at render
+    // time like spec_route_concat_mtp_accepted_total above, so both are
+    // present at 0 from boot: the F3 engagement smoke must distinguish
+    // "drafter never engaged" (absent from boot would be ambiguous) from
+    // "engaged with zero delta".
+    uint64_t spec_route_ngram_drafts_total  = 0;
+    uint64_t spec_route_model_drafts_total = 0;
+
+    // PI F4 follow-up (pi-stack 29/08): speculative drafter state resets. The
+    // partial-reject reset (F4 fix, 2d9ca97e1) invalidates the MTP boundary for
+    // ~1 round after every partial rejection (~20% of draft rounds); the two
+    // LOG_WRN sites that used to expose it are demoted to debug, so this counter
+    // is the production observability for that path. Cumulative like the other
+    // spec counters (reset_bucket does not touch it), emitted unconditionally
+    // at render time.
+    uint64_t spec_state_resets_total = 0;
+
     void init() {
         t_start = ggml_time_us();
 
@@ -789,6 +809,29 @@ struct server_metrics {
 
     void on_spec_route_concat_mtp_accepted(uint32_t n_tokens) {
         spec_route_concat_mtp_accepted_total += n_tokens;
+    }
+
+    // PI F4 follow-up (29/08): one per partial-reject state reset (see the
+    // spec_state_resets_total field above)
+    void on_spec_state_reset() {
+        spec_state_resets_total++;
+    }
+
+    // t20 f3 (pi-stack): count one draft round by drafter family. The if/else
+    // makes a round land on exactly one counter: every ngram-* impl drafts
+    // from the prompt alone, every other drafting impl is a model drafter
+    // (draft-mtp / draft-dflash on this server; the name prefixes are the
+    // stable common_speculative_type_to_str convention, same one
+    // spec_route_short_name() strips). NONE - no round attributed for the
+    // seq - is not a round and stays uncounted.
+    void on_spec_route_round_drafter(common_speculative_type type) {
+        const std::string name = common_speculative_type_to_str(type);
+
+        if (name.rfind("ngram-", 0) == 0) {
+            spec_route_ngram_drafts_total++;
+        } else if (name.rfind("draft-", 0) == 0) {
+            spec_route_model_drafts_total++;
+        }
     }
 
     void on_prompt_eval(const server_slot & slot) {
@@ -2504,6 +2547,24 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        // PI F4 follow-up (29/08, production task 11226): get_state() fails while
+        // the MTP boundary is invalidated by the partial-reject reset (F4) - a
+        // checkpoint created in that window carries an empty data_spec, and the
+        // cache salvage later refuses to restore it ("spec_state=0"), forcing a
+        // full cold re-prefill (44k tokens observed, twice in ~40 min at high
+        // ctx). Defer instead: the distance conditions that gate do_checkpoint
+        // are recomputed every iteration and stay true, so the next round
+        // retries and captures a valid spec blob. Probe before touching the
+        // checkpoint ring so a deferred creation does not evict old entries.
+        std::vector<uint8_t> data_spec;
+        if (spec && common_speculative_state_required(spec.get())) {
+            common_speculative_get_state(spec.get(), slot.id, data_spec);
+            if (data_spec.empty()) {
+                SLT_WRN(slot, "%s", "deferring context checkpoint creation: speculative state unavailable (partial-reject reset window)\n");
+                return;
+            }
+        }
+
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
@@ -2532,9 +2593,9 @@ private:
 
         // snapshot the speculative-impl state (MTP boundary rows) at the same
         // position, so a checkpoint restore can also rewind the draft bookkeeping
+        // (probed at entry - same instant, known non-empty there)
         if (spec && common_speculative_state_required(spec.get())) {
-            cur.data_spec.clear();
-            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+            cur.data_spec = std::move(data_spec);
         }
 
         SLT_INF(slot,
@@ -2684,6 +2745,13 @@ private:
 
                     // t8 stadio 2 (spec §6, Task 6): concat observability counter
                     res->spec_route_concat_mtp_accepted_total = metrics.spec_route_concat_mtp_accepted_total;
+
+                    // t20 f3 (pi-stack): per-drafter draft-round counters
+                    res->spec_route_ngram_drafts_total  = metrics.spec_route_ngram_drafts_total;
+                    res->spec_route_model_drafts_total = metrics.spec_route_model_drafts_total;
+
+                    // PI F4 follow-up (29/08): speculative state reset counter
+                    res->spec_state_resets_total = metrics.spec_state_resets_total;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -4295,7 +4363,17 @@ private:
                     // impl's i_h, speculative.cpp accept()).
                     const int32_t n_concat_head = common_speculative_concat_head_size(spec.get(), slot.id);
 
+                    // t20 f3 (pi-stack): drafter of the round being closed. Read next
+                    // to the concat-head readout for symmetry, but unlike impl_head
+                    // the impl_last attribution survives the accept call below.
+                    const common_speculative_type round_drafter = common_speculative_round_drafter_type(spec.get(), slot.id);
+
                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+
+                    // t20 f3 (pi-stack): per-round and OUTSIDE the concat if below -
+                    // an ngram round never satisfies n_concat_head > 0, so counting
+                    // inside it would leave spec_route_ngram_drafts_total stuck at 0.
+                    metrics.on_spec_route_round_drafter(round_drafter);
 
                     if (n_concat_head > 0) {
                         const int32_t n_concat_mtp = std::min<int32_t>((int32_t) (accepted.size() - 1), n_concat_head);
@@ -4344,6 +4422,17 @@ private:
                 common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
                 if (slot.ctx_dft) {
                     common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+                }
+
+                // PI F4 fix (T20/F4, ipotesi H1 confermata dal banco 29/08): al partial-reject il
+                // rollback di memoria non ripulisce lo stato della head MTP e il round successivo
+                // parte con token fantasma (P(p0-reject|prec-reject) 0,272 vs 0,099 base; con reset
+                // head 0,161, acc-len condizionato 1,51->1,73). Il reset del solo drafter (blob
+                // vuoto, stesso primitivo dei cold-fallback) riallinea il round successivo tramite
+                // la neutral resync di process().
+                if (ids.size() < n_draft + 1) {
+                    common_speculative_set_state(spec.get(), slot.id, {});
+                    metrics.on_spec_state_reset();
                 }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
@@ -5184,6 +5273,29 @@ void server_routes::init_routes() {
                 {"name",  "spec_route_concat_mtp_accepted_total"},
                 {"help",  "Number of MTP head tokens accepted in composed concat rounds."},
                 {"value", res_task->spec_route_concat_mtp_accepted_total},
+            });
+
+            // t20 f3 (pi-stack): emitted unconditionally so both counters are
+            // present at 0 from boot (see server_metrics) - the engagement
+            // smoke reads their delta across the F3 replay
+            counter_defs.push_back({
+                {"name",  "spec_route_ngram_drafts_total"},
+                {"help",  "Number of draft rounds attributed to the ngram drafter."},
+                {"value", res_task->spec_route_ngram_drafts_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "spec_route_model_drafts_total"},
+                {"help",  "Number of draft rounds attributed to a model drafter (MTP or DFlash)."},
+                {"value", res_task->spec_route_model_drafts_total},
+            });
+
+            // PI F4 follow-up (pi-stack 29/08): emitted unconditionally so the
+            // counter is present at 0 from boot (see server_metrics)
+            counter_defs.push_back({
+                {"name",  "spec_state_resets_total"},
+                {"help",  "Number of speculative drafter state resets on partial-reject (F4 fix)."},
+                {"value", res_task->spec_state_resets_total},
             });
 
             for (const auto & [kind, count] : res_task->spec_route_cache_rebuilds) {
