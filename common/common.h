@@ -279,6 +279,8 @@ struct common_params_sampling {
     std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
     std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
     std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
+    std::vector<llama_token> reasoning_budget_warn;            // warn message tokens, forced once at warn_ratio (empty = warn off)
+    float                    reasoning_budget_warn_ratio = 0.75f; // consumed share of the budget before the warn fires
 
     bool backend_sampling = false;
 

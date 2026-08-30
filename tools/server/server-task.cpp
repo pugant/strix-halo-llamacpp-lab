@@ -571,13 +571,29 @@ task_params server_task::params_from_json_cmpl(
             // li emette da se' il resend diverge di 1-2 token (osservato Δ=2 su T3 S1-a:
             // lcp=cached-2). La sequenza forzata include il '\n\n' finale cosi' il round-
             // trip e' esatto a prescindere dal contenuto che il modello produce dopo.
-            params.sampling.reasoning_budget_forced = common_tokenize(
-                vocab, "\n" + message + (message.empty() ? "" : "\n") + end_tag + "\n\n", false, true);
+            // warn window (s1-style mid-budget convergence): when the warn is on,
+            // the message is forced once at warn_ratio with the same round-trip
+            // encoding used by the forced message, and the exhausted-forced
+            // sequence carries only the closing — the message has already been
+            // delivered inside the reasoning stream.
+            const float warn_ratio = json_value(data, "reasoning_budget_warn_ratio", params.sampling.reasoning_budget_warn_ratio);
+            params.sampling.reasoning_budget_warn_ratio = warn_ratio;
+            if (!message.empty() && budget > 0 && warn_ratio > 0.0f && warn_ratio < 1.0f) {
+                params.sampling.reasoning_budget_warn = common_tokenize(
+                    vocab, "\n" + message + "\n", false, true);
+                params.sampling.reasoning_budget_forced = common_tokenize(
+                    vocab, "\n" + end_tag + "\n\n", false, true);
+            } else {
+                params.sampling.reasoning_budget_warn.clear();
+                params.sampling.reasoning_budget_forced = common_tokenize(
+                    vocab, "\n" + message + (message.empty() ? "" : "\n") + end_tag + "\n\n", false, true);
+            }
 
-            SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
-                budget, params.sampling.generation_prompt.c_str(),
+            SRV_DBG("reasoning budget: tokens=%d, warn_ratio=%.2f, generation_prompt='%s', start=%zu toks, end=%zu toks, warn=%zu toks, forced=%zu toks\n",
+                budget, warn_ratio, params.sampling.generation_prompt.c_str(),
                 params.sampling.reasoning_budget_start.size(),
                 params.sampling.reasoning_budget_end.size(),
+                params.sampling.reasoning_budget_warn.size(),
                 params.sampling.reasoning_budget_forced.size());
         }
     }
