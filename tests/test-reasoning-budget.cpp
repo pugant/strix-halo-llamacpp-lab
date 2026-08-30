@@ -178,11 +178,12 @@ static void test_warn_never_fire_band() {
     auto * s = common_reasoning_budget_init(nullptr, start, end, forced, 3,
                                             REASONING_BUDGET_IDLE, warn, 0.75f);
     llama_sampler_accept(s, 10);
-    for (auto t : {1, 2, 3}) {
+    for (auto t : {1, 2}) {
         llama_sampler_accept(s, t);
         GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING); // no WARN_FORCING ever
     }
-    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_FORCING); // straight to forced close
+    llama_sampler_accept(s, 3); // remaining hits 0 here
+    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_FORCING); // straight to forced close, no warn
     llama_sampler_free(s);
     fprintf(stderr, "  Test 'warn never-fire band' passed\n");
 }
