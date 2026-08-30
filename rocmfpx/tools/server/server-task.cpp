@@ -571,13 +571,37 @@ task_params server_task::params_from_json_cmpl(
             // li emette da se' il resend diverge di 1-2 token (osservato Δ=2 su T3 S1-a:
             // lcp=cached-2). La sequenza forzata include il '\n\n' finale cosi' il round-
             // trip e' esatto a prescindere dal contenuto che il modello produce dopo.
-            params.sampling.reasoning_budget_forced = common_tokenize(
-                vocab, "\n" + message + (message.empty() ? "" : "\n") + end_tag + "\n\n", false, true);
+            // warn window (s1-style mid-budget convergence): when the warn is on,
+            // the message is forced once at warn_ratio with the same round-trip
+            // encoding used by the forced message, and the exhausted-forced
+            // sequence carries only the closing — the message has already been
+            // delivered inside the reasoning stream.
+            const float warn_ratio = json_value(data, "reasoning_budget_warn_ratio", params.sampling.reasoning_budget_warn_ratio);
+            params.sampling.reasoning_budget_warn_ratio = warn_ratio;
+            // review 30/08 MAJOR-3: keep the warn and the forced tail CONSISTENT —
+            // the sampler fires only when warn_at >= 1 (and the UTF-8 guard can
+            // defer by one more token), so require a minimal usable window
+            // (warn_at >= 2, same formula as the sampler). Below that the warn
+            // could never fire while the tail would be close-only: the message
+            // would be silently lost. Fall back to the pre-patch tail (message
+            // + closing) so the message is always delivered.
+            const int32_t warn_at = (int32_t) ((float) budget * (1.0f - warn_ratio));
+            if (!message.empty() && budget > 0 && warn_ratio > 0.0f && warn_ratio < 1.0f && warn_at >= 2) {
+                params.sampling.reasoning_budget_warn = common_tokenize(
+                    vocab, "\n" + message + "\n", false, true);
+                params.sampling.reasoning_budget_forced = common_tokenize(
+                    vocab, "\n" + end_tag + "\n\n", false, true);
+            } else {
+                params.sampling.reasoning_budget_warn.clear();
+                params.sampling.reasoning_budget_forced = common_tokenize(
+                    vocab, "\n" + message + (message.empty() ? "" : "\n") + end_tag + "\n\n", false, true);
+            }
 
-            SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
-                budget, params.sampling.generation_prompt.c_str(),
+            SRV_DBG("reasoning budget: tokens=%d, warn_ratio=%.2f, generation_prompt='%s', start=%zu toks, end=%zu toks, warn=%zu toks, forced=%zu toks\n",
+                budget, warn_ratio, params.sampling.generation_prompt.c_str(),
                 params.sampling.reasoning_budget_start.size(),
                 params.sampling.reasoning_budget_end.size(),
+                params.sampling.reasoning_budget_warn.size(),
                 params.sampling.reasoning_budget_forced.size());
         }
     }

@@ -296,6 +296,7 @@ struct server_chat_params {
     bool enable_thinking = true;
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;
+    float reasoning_budget_warn_ratio = 0.75f; // consumed share before the warn message (0 = warn off)
     std::string media_path;
     bool force_pure_content = false;
 };

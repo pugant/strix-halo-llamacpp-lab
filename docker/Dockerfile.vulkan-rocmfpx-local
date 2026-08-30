@@ -1,0 +1,80 @@
+# Variante locale di Dockerfile.vulkan-rocmfpx: sorgente dal contesto (git archive
+# del branch del clone ROCmFPX) invece del clone GitHub — il fork vive su gitea
+# privato (git clone nella build fallisce: niente terminale per le credenziali).
+# Recipe: cd staging-strix-halo-llamacpp-lab/docker && \
+#   mkdir -p /tmp/vkctx/src && git -C <clone ROCmFPX> archive <branch> | tar -x -C /tmp/vkctx/src && \
+#   cp llama-grammar.patch gguf-vram-estimator.py /tmp/vkctx/ && cp Dockerfile.vulkan-rocmfpx-local /tmp/vkctx/Dockerfile && \
+#   docker build -t docker-llm-service:<tag> /tmp/vkctx
+
+# build stage
+FROM registry.fedoraproject.org/fedora:43 AS builder
+
+# deps
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+  git vim \
+  make gcc cmake ninja-build lld clang clang-devel compiler-rt libcurl-devel rdma-core-devel \
+  vulkan-loader-devel vulkaninfo mesa-vulkan-drivers \
+  spirv-headers-devel radeontop glslc patch \
+  && dnf clean all && rm -rf /var/cache/dnf/*
+
+# ROCmFPX fork — sorgente dal build context (src/ = git archive del branch)
+WORKDIR /opt/llama.cpp
+COPY src/ .
+
+COPY llama-grammar.patch /tmp/llama-grammar.patch
+
+# build — Vulkan only
+# (git clean tollerante: il contesto git-archive non porta .git, è già pulito)
+RUN (git clean -xdf 2>/dev/null || true) \
+  && patch -p1 < /tmp/llama-grammar.patch \
+  && cmake -S . -B build -G Ninja \
+  -DGGML_VULKAN=ON \
+  -DGGML_HIP=OFF \
+  -DGGML_CUDA=OFF \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_RPC=ON \
+  -DCMAKE_INSTALL_PREFIX=/usr \
+  -DLLAMA_BUILD_SERVER=ON \
+  -DLLAMA_BUILD_EXAMPLES=ON \
+  -DLLAMA_BUILD_WEBUI=OFF \
+  -DLLAMA_USE_PREBUILT_WEBUI=OFF \
+  -DLLAMA_BUILD_TESTS=OFF \
+  && cmake --build build --config Release \
+  && cmake --install build --config Release
+
+# libs
+RUN find /opt/llama.cpp/build -type f -name 'lib*.so*' -exec cp {} /usr/lib64/ \; \
+  && ldconfig
+
+# helper
+COPY gguf-vram-estimator.py /usr/local/bin/gguf-vram-estimator.py
+RUN chmod +x /usr/local/bin/gguf-vram-estimator.py
+
+
+# runtime stage
+FROM registry.fedoraproject.org/fedora-minimal:43
+
+# runtime deps
+RUN microdnf -y --nodocs --setopt=install_weak_deps=0 install \
+  bash ca-certificates libatomic libstdc++ libgcc libibverbs \
+  vulkan-loader vulkan-loader-devel vulkaninfo mesa-vulkan-drivers radeontop procps-ng \
+  && microdnf clean all && rm -rf /var/cache/dnf/*
+
+# copy
+COPY --from=builder /usr/ /usr/
+COPY --from=builder /usr/local/ /usr/local/
+COPY --from=builder /opt/llama.cpp/build/bin/ggml-rpc-* /usr/local/bin/
+
+# ld
+RUN echo "/usr/local/lib"  > /etc/ld.so.conf.d/local.conf \
+  && echo "/usr/local/lib64" >> /etc/ld.so.conf.d/local.conf \
+  && ldconfig \
+  && cp -n /usr/local/lib/libllama*.so* /usr/lib64/ 2>/dev/null || true \
+  && ldconfig
+
+# helper
+COPY gguf-vram-estimator.py /usr/local/bin/gguf-vram-estimator.py
+RUN chmod +x /usr/local/bin/gguf-vram-estimator.py
+
+# shell
+CMD ["/bin/bash"]

@@ -1,0 +1,180 @@
+From 762a954f5b65b6fd434f4457d37938768c99abf9 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Fri, 28 Aug 2026 21:01:25 +0200
+Subject: [PATCH] feat(server): per-drafter draft counters for spec-decoding
+ engagement
+
+Precondizione F3 (spec pi-stack): prova di ingaggio entrambi i drafter (issue upstream #24507).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/speculative.cpp          | 17 ++++++++++
+ common/speculative.h            |  7 ++++
+ tools/server/server-context.cpp | 57 +++++++++++++++++++++++++++++++++
+ tools/server/server-task.h      |  6 ++++
+ 4 files changed, 87 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 9671f452c..bb4f12631 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -3995,6 +3995,23 @@ int32_t common_speculative_concat_head_size(const common_speculative * spec, lla
+     return (int32_t) spec->concat_head[seq_id].size();
+ }
+ 
++// t20 f3 (pi-stack): impl_last[seq_id] is set when a round closes in
++// common_speculative_draft() (first non-empty draft of the closing arm) and is
++// NOT cleared by common_speculative_accept() - only the in-flight impl_head
++// attribution is - so this readout keeps naming the drafter of the round the
++// server is about to close (or has just closed) with that accept call.
++enum common_speculative_type common_speculative_round_drafter_type(const common_speculative * spec, llama_seq_id seq_id) {
++    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_last.size()) {
++        return COMMON_SPECULATIVE_TYPE_NONE;
++    }
++
++    if (spec->impl_last[seq_id] == nullptr) {
++        return COMMON_SPECULATIVE_TYPE_NONE;
++    }
++
++    return spec->impl_last[seq_id]->type;
++}
++
+ int32_t common_speculative_concat_k1(const common_speculative * spec) {
+     return spec ? spec->concat_k1 : 0;
+ }
+diff --git a/common/speculative.h b/common/speculative.h
+index ba28607e8..777ad8feb 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -121,6 +121,13 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
+ // the per-seq round attribution this readout is derived from.
+ int32_t common_speculative_concat_head_size(const common_speculative * spec, llama_seq_id seq_id);
+ 
++// t20 f3 (pi-stack): type of the implementation that closed the last draft
++// round for this sequence (COMMON_SPECULATIVE_TYPE_NONE = no round attributed
++// yet for this seq). Unlike the concat-head readout above, the impl_last
++// attribution is per-round state that survives common_speculative_accept(),
++// so this can be read on either side of the accept call closing the round.
++enum common_speculative_type common_speculative_round_drafter_type(const common_speculative * spec, llama_seq_id seq_id);
++
+ // t8 stadio 2 (spec §6): the configured concat head size (--spec-concat-k1,
+ // 0 = concat rounds disabled)
+ int32_t common_speculative_concat_k1(const common_speculative * spec);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index debe94eda..baddaa1fc 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -760,6 +760,17 @@ struct server_metrics {
+     // appears on first increment stays invisible until then)
+     uint64_t spec_route_concat_mtp_accepted_total = 0;
+ 
++    // t20 f3 (pi-stack): draft rounds attributed per drafter family, exported
++    // as spec_route_ngram_drafts_total (ngram-*, pure prompt lookup with no
++    // model call) and spec_route_model_drafts_total (draft-mtp / draft-dflash
++    // per the routing). Unlabeled scalars emitted unconditionally at render
++    // time like spec_route_concat_mtp_accepted_total above, so both are
++    // present at 0 from boot: the F3 engagement smoke must distinguish
++    // "drafter never engaged" (absent from boot would be ambiguous) from
++    // "engaged with zero delta".
++    uint64_t spec_route_ngram_drafts_total  = 0;
++    uint64_t spec_route_model_drafts_total = 0;
++
+     void init() {
+         t_start = ggml_time_us();
+ 
+@@ -791,6 +802,23 @@ struct server_metrics {
+         spec_route_concat_mtp_accepted_total += n_tokens;
+     }
+ 
++    // t20 f3 (pi-stack): count one draft round by drafter family. The if/else
++    // makes a round land on exactly one counter: every ngram-* impl drafts
++    // from the prompt alone, every other drafting impl is a model drafter
++    // (draft-mtp / draft-dflash on this server; the name prefixes are the
++    // stable common_speculative_type_to_str convention, same one
++    // spec_route_short_name() strips). NONE - no round attributed for the
++    // seq - is not a round and stays uncounted.
++    void on_spec_route_round_drafter(common_speculative_type type) {
++        const std::string name = common_speculative_type_to_str(type);
++
++        if (name.rfind("ngram-", 0) == 0) {
++            spec_route_ngram_drafts_total++;
++        } else if (name.rfind("draft-", 0) == 0) {
++            spec_route_model_drafts_total++;
++        }
++    }
++
+     void on_prompt_eval(const server_slot & slot) {
+         n_prompt_tokens_processed_total += slot.n_prompt_tokens_processed;
+         n_prompt_tokens_processed       += slot.n_prompt_tokens_processed;
+@@ -2685,6 +2713,10 @@ private:
+                     // t8 stadio 2 (spec §6, Task 6): concat observability counter
+                     res->spec_route_concat_mtp_accepted_total = metrics.spec_route_concat_mtp_accepted_total;
+ 
++                    // t20 f3 (pi-stack): per-drafter draft-round counters
++                    res->spec_route_ngram_drafts_total  = metrics.spec_route_ngram_drafts_total;
++                    res->spec_route_model_drafts_total = metrics.spec_route_model_drafts_total;
++
+                     if (task.metrics_reset_bucket) {
+                         metrics.reset_bucket();
+                     }
+@@ -4295,8 +4327,18 @@ private:
+                     // impl's i_h, speculative.cpp accept()).
+                     const int32_t n_concat_head = common_speculative_concat_head_size(spec.get(), slot.id);
+ 
++                    // t20 f3 (pi-stack): drafter of the round being closed. Read next
++                    // to the concat-head readout for symmetry, but unlike impl_head
++                    // the impl_last attribution survives the accept call below.
++                    const common_speculative_type round_drafter = common_speculative_round_drafter_type(spec.get(), slot.id);
++
+                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+ 
++                    // t20 f3 (pi-stack): per-round and OUTSIDE the concat if below -
++                    // an ngram round never satisfies n_concat_head > 0, so counting
++                    // inside it would leave spec_route_ngram_drafts_total stuck at 0.
++                    metrics.on_spec_route_round_drafter(round_drafter);
++
+                     if (n_concat_head > 0) {
+                         const int32_t n_concat_mtp = std::min<int32_t>((int32_t) (accepted.size() - 1), n_concat_head);
+ 
+@@ -5186,6 +5228,21 @@ void server_routes::init_routes() {
+                 {"value", res_task->spec_route_concat_mtp_accepted_total},
+             });
+ 
++            // t20 f3 (pi-stack): emitted unconditionally so both counters are
++            // present at 0 from boot (see server_metrics) - the engagement
++            // smoke reads their delta across the F3 replay
++            counter_defs.push_back({
++                {"name",  "spec_route_ngram_drafts_total"},
++                {"help",  "Number of draft rounds attributed to the ngram drafter."},
++                {"value", res_task->spec_route_ngram_drafts_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "spec_route_model_drafts_total"},
++                {"help",  "Number of draft rounds attributed to a model drafter (MTP or DFlash)."},
++                {"value", res_task->spec_route_model_drafts_total},
++            });
++
+             for (const auto & [kind, count] : res_task->spec_route_cache_rebuilds) {
+                 counter_defs.push_back({
+                     {"name",   "spec_route_cache_rebuild_total"},
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 557f13b8f..9178f4dca 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -552,6 +552,12 @@ struct server_task_result_metrics : server_task_result {
+     // t8 stadio 2 (spec §6, Task 6): MTP head tokens accepted in concat rounds
+     uint64_t spec_route_concat_mtp_accepted_total = 0;
+ 
++    // t20 f3 (pi-stack): draft rounds attributed per drafter family - the
++    // ngram drafter (pure prompt lookup, no model) vs the model drafter (MTP
++    // or DFlash per the per-request routing)
++    uint64_t spec_route_ngram_drafts_total  = 0;
++    uint64_t spec_route_model_drafts_total = 0;
++
+     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
+     // therefore, we use json to temporarily store the slot.to_json() result
+     json slots_data = json::array();
+-- 
+2.53.0
+

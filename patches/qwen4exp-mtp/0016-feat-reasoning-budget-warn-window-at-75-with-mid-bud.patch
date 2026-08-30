@@ -1,0 +1,364 @@
+From 21cc5de67fcb079be3409756a87ca9c3b78215ac Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 30 Aug 2026 19:22:14 +0200
+Subject: [PATCH] feat(reasoning-budget): warn window at 75% with mid-budget
+ message injection + residual convergence window
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Nota colleghi pi-stack 2026-08-30-2015 (GO utente 20:25): il messaggio di
+convergenza veniva forzato solo a budget esaurito (prefisso della sequenza
+di chiusura) — il modello riceveva 'wrap up' con ~0 token per agire (TALE
+ACL 2025: compliance imperfetta dei budget a priori; s1: gli interventi
+mid-generation funzionano). Ora: stato WARN_FORCING che forza i token del
+messaggio UNA volta quando remaining scende a budget*(1-ratio) (default
+0.75), poi torna a COUNTING: il modello conserva la finestra residua per
+chiudere da solo (natural end); il forced end resta backstop e, col warn
+attivo, porta solo la chiusura (il messaggio è già nel flusso generato).
+Param reasoning_budget_warn_ratio per-request nel body OAI con default CLI
+opt (pattern 0006/0008); 0 = warn off = comportamento attuale. UTF-8-safe
+(il warn slitta al primo token completo); warned/warn_pos/warn_at clonati
+(stesso motivo di remaining/force_pos: rollback spec); re-arm su nuovo
+start tag. Cache-safety: iniezione nel flusso generato, mai nel prefisso.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/common.h                |  2 +
+ common/reasoning-budget.cpp    | 80 +++++++++++++++++++++++++++++++++-
+ common/reasoning-budget.h      | 24 +++++++---
+ common/sampling.cpp            |  4 +-
+ tools/server/server-common.cpp |  1 +
+ tools/server/server-common.h   |  1 +
+ tools/server/server-task.cpp   | 24 ++++++++--
+ 7 files changed, 124 insertions(+), 12 deletions(-)
+
+diff --git a/common/common.h b/common/common.h
+index 163b2af8a..1a3238ef5 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -279,6 +279,8 @@ struct common_params_sampling {
+     std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
+     std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
+     std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
++    std::vector<llama_token> reasoning_budget_warn;            // warn message tokens, forced once at warn_ratio (empty = warn off)
++    float                    reasoning_budget_warn_ratio = 0.75f; // consumed share of the budget before the warn fires
+ 
+     bool backend_sampling = false;
+ 
+diff --git a/common/reasoning-budget.cpp b/common/reasoning-budget.cpp
+index afabc0ba8..910f9e701 100644
+--- a/common/reasoning-budget.cpp
++++ b/common/reasoning-budget.cpp
+@@ -43,6 +43,15 @@ struct common_reasoning_budget_ctx {
+     token_matcher end_matcher;
+     std::vector<llama_token> forced_tokens;
+ 
++    // warn window (s1-style mid-budget convergence): warn_tokens is forced once
++    // when remaining drops to warn_at, then counting resumes with the residual
++    // budget — the model closes by itself (natural end) or the forced end fires
++    // at 0 as backstop. Empty warn_tokens = warn disabled.
++    std::vector<llama_token> warn_tokens;
++    int32_t warn_at = 0;      // warn fires when remaining <= warn_at
++    bool warned = false;      // one-shot per reasoning block
++    size_t warn_pos = 0;      // next position in warn_tokens to force
++
+     int32_t budget;           // maximum tokens in reasoning block
+     int32_t remaining;        // tokens remaining in budget
+ 
+@@ -99,6 +108,20 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
+                 }
+             } else if (ctx->state == REASONING_BUDGET_COUNTING) {
+                 ctx->remaining--;
++                // warn window: fire once when the consumed share crosses warn_ratio.
++                // Deferred to the next UTF-8-complete token so the forced message
++                // never splits a multi-byte sequence mid-way.
++                if (!ctx->warned && !ctx->warn_tokens.empty() && utf8_complete
++                        && ctx->remaining <= ctx->warn_at && ctx->remaining > 0) {
++                    ctx->warned = true;
++                    ctx->warn_pos = 0;
++                    ctx->end_matcher.reset();
++                    ctx->state = REASONING_BUDGET_WARN_FORCING;
++                    LOG_INF("reasoning-budget: warn injected at %d%% (used %d/%d)\n",
++                        (int) ((float) (ctx->budget - ctx->remaining) * 100.0f / (float) ctx->budget),
++                        ctx->budget - ctx->remaining, ctx->budget);
++                    break;
++                }
+                 if (ctx->remaining <= 0) {
+                     if (utf8_complete) {
+                         ctx->state = REASONING_BUDGET_FORCING;
+@@ -114,6 +137,19 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
+             }
+             break;
+         }
++        case REASONING_BUDGET_WARN_FORCING:
++        {
++            // the warn message is part of the generated stream; once fully forced,
++            // resume counting — the model keeps the residual budget to close by
++            // itself (natural end) before the forced end fires at 0.
++            ctx->warn_pos++;
++            if (ctx->warn_pos >= ctx->warn_tokens.size()) {
++                ctx->state = REASONING_BUDGET_COUNTING;
++                ctx->end_matcher.reset();
++                LOG_INF("reasoning-budget: warn complete, resuming countdown (remaining %d)\n", ctx->remaining);
++            }
++            break;
++        }
+         case REASONING_BUDGET_FORCING:
+             ctx->force_pos++;
+             if (ctx->force_pos >= ctx->forced_tokens.size()) {
+@@ -128,6 +164,8 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
+                 ctx->state = REASONING_BUDGET_COUNTING;
+                 ctx->remaining = ctx->budget;
+                 ctx->end_matcher.reset();
++                ctx->warned = false;
++                ctx->warn_pos = 0;
+                 LOG_INF("reasoning-budget: re-activated on new start tag, budget=%d tokens\n", ctx->budget);
+ 
+                 if (ctx->remaining <= 0) {
+@@ -143,6 +181,19 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
+ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+ 
++    if (ctx->state == REASONING_BUDGET_WARN_FORCING) {
++        if (ctx->warn_pos >= ctx->warn_tokens.size()) {
++            return;
++        }
++        const llama_token forced = ctx->warn_tokens[ctx->warn_pos];
++        for (size_t i = 0; i < cur_p->size; i++) {
++            if (cur_p->data[i].id != forced) {
++                cur_p->data[i].logit = -INFINITY;
++            }
++        }
++        return;
++    }
++
+     if (ctx->state != REASONING_BUDGET_FORCING) {
+         // passthrough — don't modify logits
+         return;
+@@ -169,12 +220,15 @@ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
+     ctx->start_matcher.reset();
+     ctx->end_matcher.reset();
+     ctx->force_pos = 0;
++    ctx->warned = false;
++    ctx->warn_pos = 0;
+ }
+ 
+ // forward declaration for use in clone
+ static struct llama_sampler * common_reasoning_budget_init_state(
+         const struct llama_vocab * vocab, const std::vector<llama_token> & start_tokens,
+         const std::vector<llama_token> & end_tokens, const std::vector<llama_token> & forced_tokens,
++        const std::vector<llama_token> & warn_tokens, float warn_ratio,
+         int32_t budget, common_reasoning_budget_state initial_state);
+ 
+ static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
+@@ -185,6 +239,8 @@ static struct llama_sampler * common_reasoning_budget_clone(const struct llama_s
+         ctx->start_matcher.tokens,
+         ctx->end_matcher.tokens,
+         ctx->forced_tokens,
++        ctx->warn_tokens,
++        1.0f, // warn_at is carried as mutable state below
+         ctx->budget,
+         ctx->state);
+ 
+@@ -197,11 +253,18 @@ static struct llama_sampler * common_reasoning_budget_clone(const struct llama_s
+     // partial rejection (ctx seq_rm type FULL, e.g. any draft-dflash config -
+     // ~46% acceptance means most rounds reject), while mono-MTP (PART type,
+     // no sampler restore) enforces it fine.
++    // The warn state (warned/warn_pos/warn_at) is part of the same mutable
++    // state for the same reason: a rollback before the warn must re-arm it
++    // (the regenerated stream does not contain the message), a rollback after
++    // it must not inject it twice.
+     auto * cctx = (common_reasoning_budget_ctx *) clone->ctx;
+     cctx->remaining         = ctx->remaining;
+     cctx->start_matcher.pos = ctx->start_matcher.pos;
+     cctx->end_matcher.pos   = ctx->end_matcher.pos;
+     cctx->force_pos         = ctx->force_pos;
++    cctx->warned            = ctx->warned;
++    cctx->warn_pos          = ctx->warn_pos;
++    cctx->warn_at           = ctx->warn_at;
+ 
+     return clone;
+ }
+@@ -228,6 +291,8 @@ static struct llama_sampler * common_reasoning_budget_init_state(
+         const std::vector<llama_token>       & start_tokens,
+         const std::vector<llama_token>       & end_tokens,
+         const std::vector<llama_token>       & forced_tokens,
++        const std::vector<llama_token>       & warn_tokens,
++        float                                  warn_ratio,
+         int32_t                                budget,
+         common_reasoning_budget_state          initial_state) {
+     // promote COUNTING with budget <= 0 to FORCING
+@@ -235,6 +300,13 @@ static struct llama_sampler * common_reasoning_budget_init_state(
+         initial_state = REASONING_BUDGET_FORCING;
+     }
+ 
++    // warn fires when remaining drops to warn_at (the consumed share crosses
++    // warn_ratio); disabled with empty warn_tokens or a non-positive window
++    int32_t warn_at = 0;
++    if (!warn_tokens.empty() && budget > 0 && warn_ratio > 0.0f && warn_ratio < 1.0f) {
++        warn_at = (int32_t) ((float) budget * (1.0f - warn_ratio));
++    }
++
+     return llama_sampler_init(
+         /* .iface = */ &common_reasoning_budget_i,
+         /* .ctx   = */ new common_reasoning_budget_ctx {
+@@ -242,6 +314,10 @@ static struct llama_sampler * common_reasoning_budget_init_state(
+             /* .start_matcher = */ { start_tokens, 0 },
+             /* .end_matcher   = */ { end_tokens, 0 },
+             /* .forced_tokens = */ forced_tokens,
++            /* .warn_tokens   = */ warn_tokens,
++            /* .warn_at       = */ warn_at,
++            /* .warned        = */ false,
++            /* .warn_pos      = */ 0,
+             /* .budget        = */ budget,
+             /* .remaining     = */ budget,
+             /* .state         = */ initial_state,
+@@ -256,8 +332,10 @@ struct llama_sampler * common_reasoning_budget_init(
+         const std::vector<llama_token> & end_tokens,
+         const std::vector<llama_token> & forced_tokens,
+         int32_t                          budget,
++        const std::vector<llama_token> & warn_tokens,
++        float                            warn_ratio,
+         common_reasoning_budget_state    initial_state) {
+-    return common_reasoning_budget_init_state(vocab, start_tokens, end_tokens, forced_tokens, budget, initial_state);
++    return common_reasoning_budget_init_state(vocab, start_tokens, end_tokens, forced_tokens, warn_tokens, warn_ratio, budget, initial_state);
+ }
+ 
+ common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl) {
+diff --git a/common/reasoning-budget.h b/common/reasoning-budget.h
+index ef37f46ee..25a5e82fe 100644
+--- a/common/reasoning-budget.h
++++ b/common/reasoning-budget.h
+@@ -8,6 +8,7 @@
+ enum common_reasoning_budget_state {
+     REASONING_BUDGET_IDLE,         // waiting for start sequence
+     REASONING_BUDGET_COUNTING,     // counting down tokens
++    REASONING_BUDGET_WARN_FORCING, // forcing the warn message mid-budget, then back to COUNTING
+     REASONING_BUDGET_FORCING,      // forcing budget message + end sequence
+     REASONING_BUDGET_WAITING_UTF8, // budget exhausted, waiting for UTF-8 completion
+     REASONING_BUDGET_DONE,         // passthrough forever
+@@ -16,12 +17,17 @@ enum common_reasoning_budget_state {
+ // Creates a reasoning budget sampler that limits token generation inside a
+ // reasoning block (e.g. between <think> and </think>).
+ //
+-// State machine: IDLE -> COUNTING -> WAITING_UTF8 -> FORCING -> DONE
+-//   IDLE:         passthrough, watching for start_tokens sequence
+-//   COUNTING:     counting down remaining tokens, watching for natural end_tokens
+-//   WAITING_UTF8: budget exhausted, allowing tokens to complete a UTF-8 sequence
+-//   FORCING:      forces forced_tokens token-by-token (all other logits -> -inf)
+-//   DONE:         passthrough forever
++// State machine: IDLE -> COUNTING -> [WARN_FORCING -> COUNTING] -> WAITING_UTF8 -> FORCING -> DONE
++//   IDLE:          passthrough, watching for start_tokens sequence
++//   COUNTING:      counting down remaining tokens, watching for natural end_tokens;
++//                  when warn_tokens is non-empty and remaining drops to warn_at,
++//                  forces warn_tokens once (mid-budget convergence window, s1-style)
++//                  and returns to COUNTING with the residual budget left to the model
++//   WARN_FORCING:  forces warn_tokens token-by-token (all other logits -> -inf),
++//                  then goes back to COUNTING (never terminates the block itself)
++//   WAITING_UTF8:  budget exhausted, allowing tokens to complete a UTF-8 sequence
++//   FORCING:       forces forced_tokens token-by-token (all other logits -> -inf)
++//   DONE:          passthrough forever
+ //
+ // Parameters:
+ //   vocab          - vocabulary (used for UTF-8 boundary detection; can be nullptr)
+@@ -29,6 +35,10 @@ enum common_reasoning_budget_state {
+ //   end_tokens     - token sequence for natural deactivation
+ //   forced_tokens  - token sequence forced when budget expires
+ //   budget         - max tokens allowed in the reasoning block
++//   warn_tokens    - message forced once at warn_at; empty = warn disabled
++//   warn_ratio     - fraction of the budget consumed before the warn (0 < r < 1);
++//                    warn_at = budget * (1 - warn_ratio); ignored when warn_tokens
++//                    is empty
+ //   initial_state  - initial state
+ //
+ struct llama_sampler * common_reasoning_budget_init(
+@@ -37,6 +47,8 @@ struct llama_sampler * common_reasoning_budget_init(
+         const std::vector<llama_token> & end_tokens,
+         const std::vector<llama_token> & forced_tokens,
+         int32_t                          budget,
++        const std::vector<llama_token> & warn_tokens = {},
++        float                            warn_ratio  = 0.75f,
+         common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE);
+ 
+ common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 869ab8355..e8a25aa1c 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -308,7 +308,9 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
+             params.reasoning_budget_start,
+             params.reasoning_budget_end,
+             params.reasoning_budget_forced,
+-            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
++            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens,
++            params.reasoning_budget_warn,
++            params.reasoning_budget_warn_ratio);
+ 
+         for (const auto & token : prefill_tokens) {
+             llama_sampler_accept(rbudget, token);
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index e418e65e7..62ad2e359 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1189,6 +1189,7 @@ json oaicompat_chat_params_parse(
+             llama_params["reasoning_budget_tokens"] = reasoning_budget;
+             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
+             llama_params["reasoning_budget_end_tag"] = chat_params.thinking_end_tag;
++            llama_params["reasoning_budget_warn_ratio"] = json_value(body, "reasoning_budget_warn_ratio", opt.reasoning_budget_warn_ratio);
+             // the copy-through of remaining body keys below skips keys already set
+             // here, so the per-request message must be read explicitly (CLI default
+             // otherwise, as done for the budget itself)
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index c28558d8b..0ed3d6111 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -296,6 +296,7 @@ struct server_chat_params {
+     bool enable_thinking = true;
+     int  reasoning_budget = -1;
+     std::string reasoning_budget_message;
++    float reasoning_budget_warn_ratio = 0.75f; // consumed share before the warn message (0 = warn off)
+     std::string media_path;
+     bool force_pure_content = false;
+ };
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index b02ca21e6..cefee38fd 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -571,13 +571,29 @@ task_params server_task::params_from_json_cmpl(
+             // li emette da se' il resend diverge di 1-2 token (osservato Δ=2 su T3 S1-a:
+             // lcp=cached-2). La sequenza forzata include il '\n\n' finale cosi' il round-
+             // trip e' esatto a prescindere dal contenuto che il modello produce dopo.
+-            params.sampling.reasoning_budget_forced = common_tokenize(
+-                vocab, "\n" + message + (message.empty() ? "" : "\n") + end_tag + "\n\n", false, true);
++            // warn window (s1-style mid-budget convergence): when the warn is on,
++            // the message is forced once at warn_ratio with the same round-trip
++            // encoding used by the forced message, and the exhausted-forced
++            // sequence carries only the closing — the message has already been
++            // delivered inside the reasoning stream.
++            const float warn_ratio = json_value(data, "reasoning_budget_warn_ratio", params.sampling.reasoning_budget_warn_ratio);
++            params.sampling.reasoning_budget_warn_ratio = warn_ratio;
++            if (!message.empty() && budget > 0 && warn_ratio > 0.0f && warn_ratio < 1.0f) {
++                params.sampling.reasoning_budget_warn = common_tokenize(
++                    vocab, "\n" + message + "\n", false, true);
++                params.sampling.reasoning_budget_forced = common_tokenize(
++                    vocab, "\n" + end_tag + "\n\n", false, true);
++            } else {
++                params.sampling.reasoning_budget_warn.clear();
++                params.sampling.reasoning_budget_forced = common_tokenize(
++                    vocab, "\n" + message + (message.empty() ? "" : "\n") + end_tag + "\n\n", false, true);
++            }
+ 
+-            SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
+-                budget, params.sampling.generation_prompt.c_str(),
++            SRV_DBG("reasoning budget: tokens=%d, warn_ratio=%.2f, generation_prompt='%s', start=%zu toks, end=%zu toks, warn=%zu toks, forced=%zu toks\n",
++                budget, warn_ratio, params.sampling.generation_prompt.c_str(),
+                 params.sampling.reasoning_budget_start.size(),
+                 params.sampling.reasoning_budget_end.size(),
++                params.sampling.reasoning_budget_warn.size(),
+                 params.sampling.reasoning_budget_forced.size());
+         }
+     }
+-- 
+2.53.0
+

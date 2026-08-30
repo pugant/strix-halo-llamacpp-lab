@@ -1,0 +1,177 @@
+From 2c6309e3ba4b3571da9b4f4d65b0a7bd16c0bf37 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sat, 29 Aug 2026 15:44:24 +0200
+Subject: [PATCH] fix(server): defer checkpoint creation in the F4 reset window
+ + counter
+
+Il reset F4 invalida pending_h per ~1 round dopo ogni parziale-rifiuto (~20%
+dei round di draft in produzione): i due LOG_WRN sparivano a ogni evento
+(1500+ righe/run) e la finestra invalida avvelenava i checkpoint di contesto
+(create_checkpoint catturava data_spec vuoto via get_state fallita; il salvage
+poi rifiutava il restore "spec_state=0" -> cold fallback con re-prefill
+integrale 44k, 2 occorrenze in ~40 min a ctx 34k-44k, task 8690/11226).
+
+- i 2 warning a DBG (firma nota e routine: round post partial-reject)
+- contatore /metrics spec_state_resets_total (cumulativo, da 0 a boot)
+- create_checkpoint: probe dello stato spec PRIMA dell'eviction; se non
+  disponibile, defer (le condizioni di distanza restano vere al giro dopo)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/speculative.cpp          | 13 +++++++--
+ tools/server/server-context.cpp | 49 +++++++++++++++++++++++++++++++--
+ tools/server/server-task.h      |  4 +++
+ 3 files changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index bb4f12631..d18675cf8 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1986,7 +1986,12 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+                     (*dparams_routing)[seq_id].drafter == type;
+ 
+                 if (drafts_this_seq) {
+-                    LOG_WRN("%s: MTP boundary missing for seq_id=%d pos=%d (current=%d/%d previous=%d/%d); "
++                    // PI F4 follow-up (29/08): with the partial-reject state reset
++                    // (server-side, f4 2d9ca97e1) this fires on the round that follows
++                    // every partial rejection - ~20% of draft rounds, routine by
++                    // design. Demoted to debug; the /metrics counter
++                    // spec_state_resets_total carries the frequency in production.
++                    LOG_DBG("%s: MTP boundary missing for seq_id=%d pos=%d (current=%d/%d previous=%d/%d); "
+                             "resyncing after a non-token batch (e.g. vision chunk)\n",
+                             __func__, (int) seq_id, (int) pos_needed,
+                             (int) pending_h_pos[seq_id], (int) pending_h_valid[seq_id],
+@@ -2146,7 +2151,11 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+                     (*dparams_routing)[seq_id].drafter == COMMON_SPECULATIVE_TYPE_NONE ||
+                     (*dparams_routing)[seq_id].drafter == type;
+                 if (drafts_this_seq) {
+-                    LOG_WRN("%s: disabling MTP draft for seq_id=%d: boundary pos=%d/%d, needed=%d\n",
++                    // PI F4 follow-up (29/08): companion of the process() "MTP boundary
++                    // missing" demotion above - fires on the round after every partial
++                    // rejection while the reset state is re-synced. Debug level; the
++                    // spec_state_resets_total counter observes it in production.
++                    LOG_DBG("%s: disabling MTP draft for seq_id=%d: boundary pos=%d/%d, needed=%d\n",
+                             __func__, (int) seq_id, (int) pending_h_pos[seq_id],
+                             (int) pending_h_valid[seq_id], (int) pos_needed);
+                 } else {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 00c7d5674..6f845e67b 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -771,6 +771,15 @@ struct server_metrics {
+     uint64_t spec_route_ngram_drafts_total  = 0;
+     uint64_t spec_route_model_drafts_total = 0;
+ 
++    // PI F4 follow-up (pi-stack 29/08): speculative drafter state resets. The
++    // partial-reject reset (F4 fix, 2d9ca97e1) invalidates the MTP boundary for
++    // ~1 round after every partial rejection (~20% of draft rounds); the two
++    // LOG_WRN sites that used to expose it are demoted to debug, so this counter
++    // is the production observability for that path. Cumulative like the other
++    // spec counters (reset_bucket does not touch it), emitted unconditionally
++    // at render time.
++    uint64_t spec_state_resets_total = 0;
++
+     void init() {
+         t_start = ggml_time_us();
+ 
+@@ -802,6 +811,12 @@ struct server_metrics {
+         spec_route_concat_mtp_accepted_total += n_tokens;
+     }
+ 
++    // PI F4 follow-up (29/08): one per partial-reject state reset (see the
++    // spec_state_resets_total field above)
++    void on_spec_state_reset() {
++        spec_state_resets_total++;
++    }
++
+     // t20 f3 (pi-stack): count one draft round by drafter family. The if/else
+     // makes a round land on exactly one counter: every ngram-* impl drafts
+     // from the prompt alone, every other drafting impl is a model drafter
+@@ -2532,6 +2547,24 @@ private:
+ 
+     // n_tokens_cur: the number of tokens added to the batch for the current slot
+     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
++        // PI F4 follow-up (29/08, production task 11226): get_state() fails while
++        // the MTP boundary is invalidated by the partial-reject reset (F4) - a
++        // checkpoint created in that window carries an empty data_spec, and the
++        // cache salvage later refuses to restore it ("spec_state=0"), forcing a
++        // full cold re-prefill (44k tokens observed, twice in ~40 min at high
++        // ctx). Defer instead: the distance conditions that gate do_checkpoint
++        // are recomputed every iteration and stay true, so the next round
++        // retries and captures a valid spec blob. Probe before touching the
++        // checkpoint ring so a deferred creation does not evict old entries.
++        std::vector<uint8_t> data_spec;
++        if (spec && common_speculative_state_required(spec.get())) {
++            common_speculative_get_state(spec.get(), slot.id, data_spec);
++            if (data_spec.empty()) {
++                SLT_WRN(slot, "%s", "deferring context checkpoint creation: speculative state unavailable (partial-reject reset window)\n");
++                return;
++            }
++        }
++
+         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+             // make room for the new checkpoint, if needed
+             const auto & cur = slot.prompt.checkpoints.front();
+@@ -2560,9 +2593,9 @@ private:
+ 
+         // snapshot the speculative-impl state (MTP boundary rows) at the same
+         // position, so a checkpoint restore can also rewind the draft bookkeeping
++        // (probed at entry - same instant, known non-empty there)
+         if (spec && common_speculative_state_required(spec.get())) {
+-            cur.data_spec.clear();
+-            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
++            cur.data_spec = std::move(data_spec);
+         }
+ 
+         SLT_INF(slot,
+@@ -2717,6 +2750,9 @@ private:
+                     res->spec_route_ngram_drafts_total  = metrics.spec_route_ngram_drafts_total;
+                     res->spec_route_model_drafts_total = metrics.spec_route_model_drafts_total;
+ 
++                    // PI F4 follow-up (29/08): speculative state reset counter
++                    res->spec_state_resets_total = metrics.spec_state_resets_total;
++
+                     if (task.metrics_reset_bucket) {
+                         metrics.reset_bucket();
+                     }
+@@ -4396,6 +4432,7 @@ private:
+                 // la neutral resync di process().
+                 if (ids.size() < n_draft + 1) {
+                     common_speculative_set_state(spec.get(), slot.id, {});
++                    metrics.on_spec_state_reset();
+                 }
+ 
+                 for (size_t i = 0; i < ids.size(); ++i) {
+@@ -5253,6 +5290,14 @@ void server_routes::init_routes() {
+                 {"value", res_task->spec_route_model_drafts_total},
+             });
+ 
++            // PI F4 follow-up (pi-stack 29/08): emitted unconditionally so the
++            // counter is present at 0 from boot (see server_metrics)
++            counter_defs.push_back({
++                {"name",  "spec_state_resets_total"},
++                {"help",  "Number of speculative drafter state resets on partial-reject (F4 fix)."},
++                {"value", res_task->spec_state_resets_total},
++            });
++
+             for (const auto & [kind, count] : res_task->spec_route_cache_rebuilds) {
+                 counter_defs.push_back({
+                     {"name",   "spec_route_cache_rebuild_total"},
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 9178f4dca..e3eaa3695 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -558,6 +558,10 @@ struct server_task_result_metrics : server_task_result {
+     uint64_t spec_route_ngram_drafts_total  = 0;
+     uint64_t spec_route_model_drafts_total = 0;
+ 
++    // PI F4 follow-up (29/08): speculative drafter state resets (the partial-reject
++    // reset window), exported as spec_state_resets_total
++    uint64_t spec_state_resets_total = 0;
++
+     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
+     // therefore, we use json to temporarily store the slot.to_json() result
+     json slots_data = json::array();
+-- 
+2.53.0
+

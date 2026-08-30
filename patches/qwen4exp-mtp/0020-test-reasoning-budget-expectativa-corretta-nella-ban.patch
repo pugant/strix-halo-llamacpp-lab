@@ -1,0 +1,36 @@
+From 62416acd3c9be311e4853226098e84924d5fdd18 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 30 Aug 2026 19:46:05 +0200
+Subject: [PATCH] test(reasoning-budget): expectativa corretta nella banda
+ never-fire
+
+Con budget=3 l'ultimo token del loop porta remaining a 0: lo stato atteso
+e' FORCING (diretto, senza warn), non COUNTING. Il codice era corretto.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tests/test-reasoning-budget.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/tests/test-reasoning-budget.cpp b/tests/test-reasoning-budget.cpp
+index bfbdf7923..7c16aaa29 100644
+--- a/tests/test-reasoning-budget.cpp
++++ b/tests/test-reasoning-budget.cpp
+@@ -178,11 +178,12 @@ static void test_warn_never_fire_band() {
+     auto * s = common_reasoning_budget_init(nullptr, start, end, forced, 3,
+                                             REASONING_BUDGET_IDLE, warn, 0.75f);
+     llama_sampler_accept(s, 10);
+-    for (auto t : {1, 2, 3}) {
++    for (auto t : {1, 2}) {
+         llama_sampler_accept(s, t);
+         GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING); // no WARN_FORCING ever
+     }
+-    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_FORCING); // straight to forced close
++    llama_sampler_accept(s, 3); // remaining hits 0 here
++    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_FORCING); // straight to forced close, no warn
+     llama_sampler_free(s);
+     fprintf(stderr, "  Test 'warn never-fire band' passed\n");
+ }
+-- 
+2.53.0
+

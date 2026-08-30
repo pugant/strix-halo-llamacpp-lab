@@ -1,0 +1,26 @@
+From ca498353d56baeac4de013521328aeff19372629 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 30 Aug 2026 19:40:19 +0200
+Subject: [PATCH] fix(sampling): initial_state esplicito dopo il reorder della
+ firma rbudget init
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/sampling.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index e8a25aa1c..a792bbf56 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -309,6 +309,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
+             params.reasoning_budget_end,
+             params.reasoning_budget_forced,
+             params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens,
++            REASONING_BUDGET_IDLE,
+             params.reasoning_budget_warn,
+             params.reasoning_budget_warn_ratio);
+ 
+-- 
+2.53.0
+

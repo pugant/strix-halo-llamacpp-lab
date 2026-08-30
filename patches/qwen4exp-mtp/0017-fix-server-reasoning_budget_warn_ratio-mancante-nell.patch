@@ -1,0 +1,30 @@
+From 8be2545506c38f9cdf678260b94c94b8b0066440 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 30 Aug 2026 19:29:18 +0200
+Subject: [PATCH] fix(server): reasoning_budget_warn_ratio mancante nella
+ chat_params initializer list
+
+Il campo aggiunto a server_chat_params slittava la initializer list
+posizionale in server-context.cpp (media_path riceveva il valore sbagliato
+-> 'no match for operator=' alla build). Aggiunto in posizione dichiarata.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 6f845e67b..8f809719d 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1620,6 +1620,7 @@ private:
+                 /* enable_thinking       */ enable_thinking,
+                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
+                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
++                /* reasoning_budget_warn_ratio */ params_base.sampling.reasoning_budget_warn_ratio,
+                 /* media_path            */ params_base.media_path,
+                 /* force_pure_content    */ params_base.force_pure_content_parser
+             };
+-- 
+2.53.0
+

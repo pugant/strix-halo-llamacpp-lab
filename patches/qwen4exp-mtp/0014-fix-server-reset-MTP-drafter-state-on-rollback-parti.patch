@@ -1,0 +1,41 @@
+From 2d9ca97e13ba164fceb0501a650d65ef4df7cc6b Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sat, 29 Aug 2026 07:35:00 +0200
+Subject: [PATCH] fix(server): reset MTP drafter state on rollback
+ partial-reject (H1)
+
+Al partial-reject il rollback di memoria non ripulisce lo stato della head
+MTP: il round successivo parte con token fantasma e il p0-reject sale
+(0,272 vs 0,099 base; banco F4 29/08: reset head -> 0,161, acc-len
+condizionato 1,51 -> 1,73; braccio H2 ring re-assert: nessun effetto).
+Fix = reset del solo drafter al rollback (primitivo cold-fallback).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index baddaa1fc..00c7d5674 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4388,6 +4388,16 @@ private:
+                     common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+                 }
+ 
++                // PI F4 fix (T20/F4, ipotesi H1 confermata dal banco 29/08): al partial-reject il
++                // rollback di memoria non ripulisce lo stato della head MTP e il round successivo
++                // parte con token fantasma (P(p0-reject|prec-reject) 0,272 vs 0,099 base; con reset
++                // head 0,161, acc-len condizionato 1,51->1,73). Il reset del solo drafter (blob
++                // vuoto, stesso primitivo dei cold-fallback) riallinea il round successivo tramite
++                // la neutral resync di process().
++                if (ids.size() < n_draft + 1) {
++                    common_speculative_set_state(spec.get(), slot.id, {});
++                }
++
+                 for (size_t i = 0; i < ids.size(); ++i) {
+                     completion_token_output result;
+ 
+-- 
+2.53.0
+

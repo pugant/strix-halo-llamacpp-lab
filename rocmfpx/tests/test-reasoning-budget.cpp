@@ -124,6 +124,94 @@ static void test_reasoning_budget(
     (void)sequence;
 }
 
+// --- warn window (review 30/08): mid-budget message injection + residual window ---
+static void test_warn_window_natural_end() {
+    // budget 4, ratio 0.5 -> warn_at 2; warn fires at remaining==2, message forced,
+    // countdown resumes, block closes naturally (no exhaustion)
+    const std::vector<llama_token> start = {10}, end = {20}, forced = {30, 31}, warn = {40, 41, 42};
+    auto * s = common_reasoning_budget_init(nullptr, start, end, forced, 4,
+                                            REASONING_BUDGET_IDLE, warn, 0.5f);
+    // apply-masking probe during WARN_FORCING: exactly one finite logit = forced token
+    auto probe_forced = [&](llama_token expected) {
+        std::vector<llama_token_data> cur;
+        for (int i = 0; i <= 60; i++) cur.push_back({(llama_token)i, 1.0f, 0.0f});
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(s, &cur_p);
+        int finite = 0; llama_token tok = -1;
+        for (auto & c : cur) if (std::isfinite(c.logit)) { finite++; tok = c.id; }
+        GGML_ASSERT(finite == 1 && tok == expected);
+    };
+    llama_sampler_accept(s, 10); GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING);
+    llama_sampler_accept(s, 1);  GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING);
+    llama_sampler_accept(s, 2);  GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_WARN_FORCING);
+    probe_forced(40);
+    llama_sampler_accept(s, 40); probe_forced(41);
+    llama_sampler_accept(s, 41); probe_forced(42);
+    llama_sampler_accept(s, 42); GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING); // residual window
+    llama_sampler_accept(s, 3);  GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING);
+    llama_sampler_accept(s, 20); GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_DONE); // natural end AFTER warn
+    llama_sampler_free(s);
+    fprintf(stderr, "  Test 'warn window natural end' passed\n");
+}
+
+static void test_warn_window_exhausted_after() {
+    // no natural end: after the warn the residual budget runs out -> forced close-only
+    const std::vector<llama_token> start = {10}, end = {20}, forced = {30, 31}, warn = {40, 41, 42};
+    auto * s = common_reasoning_budget_init(nullptr, start, end, forced, 4,
+                                            REASONING_BUDGET_IDLE, warn, 0.5f);
+    for (auto t : {10, 1, 2}) llama_sampler_accept(s, t);
+    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_WARN_FORCING);
+    for (auto t : {40, 41, 42}) llama_sampler_accept(s, t);
+    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING);
+    llama_sampler_accept(s, 3);  GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING); // remaining 1
+    llama_sampler_accept(s, 4);  GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_FORCING);  // exhausted -> close
+    llama_sampler_accept(s, 30); llama_sampler_accept(s, 31);
+    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_DONE);
+    llama_sampler_free(s);
+    fprintf(stderr, "  Test 'warn window exhausted after' passed\n");
+}
+
+static void test_warn_never_fire_band() {
+    // budget 3, ratio 0.75 -> warn_at = 0: the warn can never fire (matches the
+    // server-side guard warn_at >= 2); behaviour must degrade to the pre-patch path
+    const std::vector<llama_token> start = {10}, end = {20}, forced = {30, 31}, warn = {40, 41, 42};
+    auto * s = common_reasoning_budget_init(nullptr, start, end, forced, 3,
+                                            REASONING_BUDGET_IDLE, warn, 0.75f);
+    llama_sampler_accept(s, 10);
+    for (auto t : {1, 2}) {
+        llama_sampler_accept(s, t);
+        GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING); // no WARN_FORCING ever
+    }
+    llama_sampler_accept(s, 3); // remaining hits 0 here
+    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_FORCING); // straight to forced close, no warn
+    llama_sampler_free(s);
+    fprintf(stderr, "  Test 'warn never-fire band' passed\n");
+}
+
+static void test_warn_clone_carries_state() {
+    // clone mid-warn (warn_pos=1): the clone must continue the message, not
+    // re-inject it (spec rollback restores the sampler snapshot)
+    const std::vector<llama_token> start = {10}, end = {20}, forced = {30, 31}, warn = {40, 41, 42};
+    auto * s = common_reasoning_budget_init(nullptr, start, end, forced, 4,
+                                            REASONING_BUDGET_IDLE, warn, 0.5f);
+    for (auto t : {10, 1, 2, 40}) llama_sampler_accept(s, t); // WARN_FORCING, warn_pos == 1
+    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_WARN_FORCING);
+    auto * c = llama_sampler_clone(s);
+    // probe the clone: next forced token must be 41 (warn_pos carried), not 40
+    std::vector<llama_token_data> cur;
+    for (int i = 0; i <= 60; i++) cur.push_back({(llama_token)i, 1.0f, 0.0f});
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(c, &cur_p);
+    int finite = 0; llama_token tok = -1;
+    for (auto & x : cur) if (std::isfinite(x.logit)) { finite++; tok = x.id; }
+    GGML_ASSERT(finite == 1 && tok == 41);
+    llama_sampler_accept(c, 41); llama_sampler_accept(c, 42);
+    GGML_ASSERT(common_reasoning_budget_get_state(c) == REASONING_BUDGET_COUNTING); // no re-inject, residual window
+    llama_sampler_free(c);
+    llama_sampler_free(s);
+    fprintf(stderr, "  Test 'warn clone carries state' passed\n");
+}
+
 // UTF-8 boundary detection unit test
 // Tests common_utf8_is_complete() from reasoning-budget.h
 static void test_utf8_boundary_detection() {
@@ -251,6 +339,13 @@ int main(void) {
     }
 
     printf("OK (6 tests passed)\n");
+
+    printf("Testing warn window (mid-budget message)...\n");
+    test_warn_window_natural_end();
+    test_warn_window_exhausted_after();
+    test_warn_never_fire_band();
+    test_warn_clone_carries_state();
+    printf("OK (4 warn tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();

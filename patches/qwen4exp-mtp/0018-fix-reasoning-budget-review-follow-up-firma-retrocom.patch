@@ -1,0 +1,237 @@
+From 54615f3d2e61fad0546f99b5bd5573d584096ec5 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 30 Aug 2026 19:38:27 +0200
+Subject: [PATCH] =?UTF-8?q?fix(reasoning-budget):=20review=20follow-up=20?=
+ =?UTF-8?q?=E2=80=94=20firma=20retrocompatibile,=20banda=20never-fire,=20f?=
+ =?UTF-8?q?lag=20CLI,=20test=20WARN=5FFORCING?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Review indipendente 30/08 sera: (1) MAJOR-1: warn_tokens/warn_ratio spostati
+DOPO initial_state nella firma pubblica (i caller posizionali — il test
+registrato — tornano a compilare; verificato -fsyntax-only); aggiunti 4 test
+WARN_FORCING (fire+residual window+natural end, exhausted-after, banda
+never-fire, clone carries warn_pos/warned). (2) MAJOR-3: la composizione
+richiede warn_at >= 2 (stessa formula del sampler): sotto la soglia il tail
+torna message+closing (pre-patch) così il messaggio è sempre consegnato —
+mai perso in silenzio. (3) MINOR-1: flag --reasoning-budget-warn-ratio
+(LLAMA_ARG_THINK_BUDGET_WARN_RATIO), il default 0.75 segue la catena
+arg->sampling->chat_params->opt. MAJOR-2 (giunzioni tokenizzazione del
+resend) = classe pre-esistente resa sistematica: gate empirico post-deploy
+(resend + lcp alla giunzione), non eliminabile a tavolino.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/arg.cpp                  |  7 +++
+ common/reasoning-budget.cpp     |  8 +--
+ common/reasoning-budget.h       |  6 ++-
+ tests/test-reasoning-budget.cpp | 94 +++++++++++++++++++++++++++++++++
+ tools/server/server-task.cpp    | 10 +++-
+ 5 files changed, 119 insertions(+), 6 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index fbf6f5ee3..e3a60ad20 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3179,6 +3179,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.sampling.reasoning_budget_message = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
++    add_opt(common_arg(
++        {"--reasoning-budget-warn-ratio"}, "RATIO",
++        "fraction of the reasoning budget consumed before the warn message is injected mid-thinking (0 = warn off, default: 0.75)",
++        [](common_params & params, const std::string & value) {
++            params.sampling.reasoning_budget_warn_ratio = std::stof(value);
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_WARN_RATIO"));
+     add_opt(common_arg(
+         {"--chat-template"}, "JINJA_TEMPLATE",
+         string_format(
+diff --git a/common/reasoning-budget.cpp b/common/reasoning-budget.cpp
+index 910f9e701..47b8a1e92 100644
+--- a/common/reasoning-budget.cpp
++++ b/common/reasoning-budget.cpp
+@@ -230,6 +230,8 @@ static struct llama_sampler * common_reasoning_budget_init_state(
+         const std::vector<llama_token> & end_tokens, const std::vector<llama_token> & forced_tokens,
+         const std::vector<llama_token> & warn_tokens, float warn_ratio,
+         int32_t budget, common_reasoning_budget_state initial_state);
++// note: internal helper keeps its own param order; the public init() exposes
++// warn params AFTER initial_state for positional-caller compatibility
+ 
+ static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
+     const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+@@ -242,7 +244,7 @@ static struct llama_sampler * common_reasoning_budget_clone(const struct llama_s
+         ctx->warn_tokens,
+         1.0f, // warn_at is carried as mutable state below
+         ctx->budget,
+-        ctx->state);
++        ctx->state); // (internal param order: warn before budget/state)
+ 
+     // carry the full mutable state: the remaining budget, the matchers'
+     // positions and the forcing position. common_sampler_clone() snapshots the
+@@ -332,9 +334,9 @@ struct llama_sampler * common_reasoning_budget_init(
+         const std::vector<llama_token> & end_tokens,
+         const std::vector<llama_token> & forced_tokens,
+         int32_t                          budget,
++        common_reasoning_budget_state    initial_state,
+         const std::vector<llama_token> & warn_tokens,
+-        float                            warn_ratio,
+-        common_reasoning_budget_state    initial_state) {
++        float                            warn_ratio) {
+     return common_reasoning_budget_init_state(vocab, start_tokens, end_tokens, forced_tokens, warn_tokens, warn_ratio, budget, initial_state);
+ }
+ 
+diff --git a/common/reasoning-budget.h b/common/reasoning-budget.h
+index 25a5e82fe..1b6bd7336 100644
+--- a/common/reasoning-budget.h
++++ b/common/reasoning-budget.h
+@@ -47,8 +47,10 @@ struct llama_sampler * common_reasoning_budget_init(
+         const std::vector<llama_token> & end_tokens,
+         const std::vector<llama_token> & forced_tokens,
+         int32_t                          budget,
++        common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE,
++        // review 30/08: warn params LAST (defaulted) so existing positional
++        // callers (tests) keep compiling
+         const std::vector<llama_token> & warn_tokens = {},
+-        float                            warn_ratio  = 0.75f,
+-        common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE);
++        float                            warn_ratio  = 0.75f);
+ 
+ common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
+diff --git a/tests/test-reasoning-budget.cpp b/tests/test-reasoning-budget.cpp
+index f7a601789..bfbdf7923 100644
+--- a/tests/test-reasoning-budget.cpp
++++ b/tests/test-reasoning-budget.cpp
+@@ -124,6 +124,93 @@ static void test_reasoning_budget(
+     (void)sequence;
+ }
+ 
++// --- warn window (review 30/08): mid-budget message injection + residual window ---
++static void test_warn_window_natural_end() {
++    // budget 4, ratio 0.5 -> warn_at 2; warn fires at remaining==2, message forced,
++    // countdown resumes, block closes naturally (no exhaustion)
++    const std::vector<llama_token> start = {10}, end = {20}, forced = {30, 31}, warn = {40, 41, 42};
++    auto * s = common_reasoning_budget_init(nullptr, start, end, forced, 4,
++                                            REASONING_BUDGET_IDLE, warn, 0.5f);
++    // apply-masking probe during WARN_FORCING: exactly one finite logit = forced token
++    auto probe_forced = [&](llama_token expected) {
++        std::vector<llama_token_data> cur;
++        for (int i = 0; i <= 60; i++) cur.push_back({(llama_token)i, 1.0f, 0.0f});
++        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
++        llama_sampler_apply(s, &cur_p);
++        int finite = 0; llama_token tok = -1;
++        for (auto & c : cur) if (std::isfinite(c.logit)) { finite++; tok = c.id; }
++        GGML_ASSERT(finite == 1 && tok == expected);
++    };
++    llama_sampler_accept(s, 10); GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING);
++    llama_sampler_accept(s, 1);  GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING);
++    llama_sampler_accept(s, 2);  GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_WARN_FORCING);
++    probe_forced(40);
++    llama_sampler_accept(s, 40); probe_forced(41);
++    llama_sampler_accept(s, 41); probe_forced(42);
++    llama_sampler_accept(s, 42); GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING); // residual window
++    llama_sampler_accept(s, 3);  GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING);
++    llama_sampler_accept(s, 20); GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_DONE); // natural end AFTER warn
++    llama_sampler_free(s);
++    fprintf(stderr, "  Test 'warn window natural end' passed\n");
++}
++
++static void test_warn_window_exhausted_after() {
++    // no natural end: after the warn the residual budget runs out -> forced close-only
++    const std::vector<llama_token> start = {10}, end = {20}, forced = {30, 31}, warn = {40, 41, 42};
++    auto * s = common_reasoning_budget_init(nullptr, start, end, forced, 4,
++                                            REASONING_BUDGET_IDLE, warn, 0.5f);
++    for (auto t : {10, 1, 2}) llama_sampler_accept(s, t);
++    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_WARN_FORCING);
++    for (auto t : {40, 41, 42}) llama_sampler_accept(s, t);
++    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING);
++    llama_sampler_accept(s, 3);  GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING); // remaining 1
++    llama_sampler_accept(s, 4);  GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_FORCING);  // exhausted -> close
++    llama_sampler_accept(s, 30); llama_sampler_accept(s, 31);
++    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_DONE);
++    llama_sampler_free(s);
++    fprintf(stderr, "  Test 'warn window exhausted after' passed\n");
++}
++
++static void test_warn_never_fire_band() {
++    // budget 3, ratio 0.75 -> warn_at = 0: the warn can never fire (matches the
++    // server-side guard warn_at >= 2); behaviour must degrade to the pre-patch path
++    const std::vector<llama_token> start = {10}, end = {20}, forced = {30, 31}, warn = {40, 41, 42};
++    auto * s = common_reasoning_budget_init(nullptr, start, end, forced, 3,
++                                            REASONING_BUDGET_IDLE, warn, 0.75f);
++    llama_sampler_accept(s, 10);
++    for (auto t : {1, 2, 3}) {
++        llama_sampler_accept(s, t);
++        GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_COUNTING); // no WARN_FORCING ever
++    }
++    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_FORCING); // straight to forced close
++    llama_sampler_free(s);
++    fprintf(stderr, "  Test 'warn never-fire band' passed\n");
++}
++
++static void test_warn_clone_carries_state() {
++    // clone mid-warn (warn_pos=1): the clone must continue the message, not
++    // re-inject it (spec rollback restores the sampler snapshot)
++    const std::vector<llama_token> start = {10}, end = {20}, forced = {30, 31}, warn = {40, 41, 42};
++    auto * s = common_reasoning_budget_init(nullptr, start, end, forced, 4,
++                                            REASONING_BUDGET_IDLE, warn, 0.5f);
++    for (auto t : {10, 1, 2, 40}) llama_sampler_accept(s, t); // WARN_FORCING, warn_pos == 1
++    GGML_ASSERT(common_reasoning_budget_get_state(s) == REASONING_BUDGET_WARN_FORCING);
++    auto * c = llama_sampler_clone(s);
++    // probe the clone: next forced token must be 41 (warn_pos carried), not 40
++    std::vector<llama_token_data> cur;
++    for (int i = 0; i <= 60; i++) cur.push_back({(llama_token)i, 1.0f, 0.0f});
++    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
++    llama_sampler_apply(c, &cur_p);
++    int finite = 0; llama_token tok = -1;
++    for (auto & x : cur) if (std::isfinite(x.logit)) { finite++; tok = x.id; }
++    GGML_ASSERT(finite == 1 && tok == 41);
++    llama_sampler_accept(c, 41); llama_sampler_accept(c, 42);
++    GGML_ASSERT(common_reasoning_budget_get_state(c) == REASONING_BUDGET_COUNTING); // no re-inject, residual window
++    llama_sampler_free(c);
++    llama_sampler_free(s);
++    fprintf(stderr, "  Test 'warn clone carries state' passed\n");
++}
++
+ // UTF-8 boundary detection unit test
+ // Tests common_utf8_is_complete() from reasoning-budget.h
+ static void test_utf8_boundary_detection() {
+@@ -252,6 +339,13 @@ int main(void) {
+ 
+     printf("OK (6 tests passed)\n");
+ 
++    printf("Testing warn window (mid-budget message)...\n");
++    test_warn_window_natural_end();
++    test_warn_window_exhausted_after();
++    test_warn_never_fire_band();
++    test_warn_clone_carries_state();
++    printf("OK (4 warn tests passed)\n");
++
+     printf("Testing UTF-8 boundary detection... ");
+     test_utf8_boundary_detection();
+     printf("OK\n");
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index cefee38fd..76aaba56e 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -578,7 +578,15 @@ task_params server_task::params_from_json_cmpl(
+             // delivered inside the reasoning stream.
+             const float warn_ratio = json_value(data, "reasoning_budget_warn_ratio", params.sampling.reasoning_budget_warn_ratio);
+             params.sampling.reasoning_budget_warn_ratio = warn_ratio;
+-            if (!message.empty() && budget > 0 && warn_ratio > 0.0f && warn_ratio < 1.0f) {
++            // review 30/08 MAJOR-3: keep the warn and the forced tail CONSISTENT —
++            // the sampler fires only when warn_at >= 1 (and the UTF-8 guard can
++            // defer by one more token), so require a minimal usable window
++            // (warn_at >= 2, same formula as the sampler). Below that the warn
++            // could never fire while the tail would be close-only: the message
++            // would be silently lost. Fall back to the pre-patch tail (message
++            // + closing) so the message is always delivered.
++            const int32_t warn_at = (int32_t) ((float) budget * (1.0f - warn_ratio));
++            if (!message.empty() && budget > 0 && warn_ratio > 0.0f && warn_ratio < 1.0f && warn_at >= 2) {
+                 params.sampling.reasoning_budget_warn = common_tokenize(
+                     vocab, "\n" + message + "\n", false, true);
+                 params.sampling.reasoning_budget_forced = common_tokenize(
+-- 
+2.53.0
+
