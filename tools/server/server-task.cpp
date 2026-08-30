@@ -578,7 +578,15 @@ task_params server_task::params_from_json_cmpl(
             // delivered inside the reasoning stream.
             const float warn_ratio = json_value(data, "reasoning_budget_warn_ratio", params.sampling.reasoning_budget_warn_ratio);
             params.sampling.reasoning_budget_warn_ratio = warn_ratio;
-            if (!message.empty() && budget > 0 && warn_ratio > 0.0f && warn_ratio < 1.0f) {
+            // review 30/08 MAJOR-3: keep the warn and the forced tail CONSISTENT —
+            // the sampler fires only when warn_at >= 1 (and the UTF-8 guard can
+            // defer by one more token), so require a minimal usable window
+            // (warn_at >= 2, same formula as the sampler). Below that the warn
+            // could never fire while the tail would be close-only: the message
+            // would be silently lost. Fall back to the pre-patch tail (message
+            // + closing) so the message is always delivered.
+            const int32_t warn_at = (int32_t) ((float) budget * (1.0f - warn_ratio));
+            if (!message.empty() && budget > 0 && warn_ratio > 0.0f && warn_ratio < 1.0f && warn_at >= 2) {
                 params.sampling.reasoning_budget_warn = common_tokenize(
                     vocab, "\n" + message + "\n", false, true);
                 params.sampling.reasoning_budget_forced = common_tokenize(

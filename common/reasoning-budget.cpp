@@ -230,6 +230,8 @@ static struct llama_sampler * common_reasoning_budget_init_state(
         const std::vector<llama_token> & end_tokens, const std::vector<llama_token> & forced_tokens,
         const std::vector<llama_token> & warn_tokens, float warn_ratio,
         int32_t budget, common_reasoning_budget_state initial_state);
+// note: internal helper keeps its own param order; the public init() exposes
+// warn params AFTER initial_state for positional-caller compatibility
 
 static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
     const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
@@ -242,7 +244,7 @@ static struct llama_sampler * common_reasoning_budget_clone(const struct llama_s
         ctx->warn_tokens,
         1.0f, // warn_at is carried as mutable state below
         ctx->budget,
-        ctx->state);
+        ctx->state); // (internal param order: warn before budget/state)
 
     // carry the full mutable state: the remaining budget, the matchers'
     // positions and the forcing position. common_sampler_clone() snapshots the
@@ -332,9 +334,9 @@ struct llama_sampler * common_reasoning_budget_init(
         const std::vector<llama_token> & end_tokens,
         const std::vector<llama_token> & forced_tokens,
         int32_t                          budget,
+        common_reasoning_budget_state    initial_state,
         const std::vector<llama_token> & warn_tokens,
-        float                            warn_ratio,
-        common_reasoning_budget_state    initial_state) {
+        float                            warn_ratio) {
     return common_reasoning_budget_init_state(vocab, start_tokens, end_tokens, forced_tokens, warn_tokens, warn_ratio, budget, initial_state);
 }
 

@@ -47,8 +47,10 @@ struct llama_sampler * common_reasoning_budget_init(
         const std::vector<llama_token> & end_tokens,
         const std::vector<llama_token> & forced_tokens,
         int32_t                          budget,
+        common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE,
+        // review 30/08: warn params LAST (defaulted) so existing positional
+        // callers (tests) keep compiling
         const std::vector<llama_token> & warn_tokens = {},
-        float                            warn_ratio  = 0.75f,
-        common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE);
+        float                            warn_ratio  = 0.75f);
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
