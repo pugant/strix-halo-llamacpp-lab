@@ -11,7 +11,7 @@ prefill cost lives, and whether long sessions degrade thermally.
 
 Everything below was measured on one machine: AMD Strix Halo (Ryzen AI MAX+ 395,
 Radeon 8060S iGPU, gfx1151, 128 GB unified LPDDR5X), our llama.cpp fork, one model
-family (Qwen3.8 Flash-Next, our 98.5 GiB ROCmFP4-STRIX_LEAN quant unless stated),
+family (Qwen3.8-Flash-Next, our 98.5 GiB ROCmFP4-STRIX_LEAN quant unless stated),
 dedicated GPU windows, medians, warm-up discarded — point measurements, not statistics.
 
 **TL;DR**
@@ -24,9 +24,10 @@ dedicated GPU windows, medians, warm-up discarded — point measurements, not st
   run-to-run variance from **±10% to ±0.6%**.
 - **Production switch (2026-08-29)**: Vulkan + `--no-mmap` + KV q8_0 — the KV quant
   funds the RAM that resident weights need, at a measured cost the prose win pays for.
-- **The physics, measured**: tg is memory-bound (closed); flash-attention is **44.8%
-  of GPU time at 80k context** at MFU 13% vs ~40% on plain matmul; clocks hold a
-  **2220 MHz** plateau with no thermal degradation.
+- **The physics, measured**: tg (token generation) is memory-bound (closed);
+  flash-attention is **44.8% of GPU time at 80k context** at an MFU (model-FLOPs
+  utilization) of ~13% vs ~40% on plain matmul; clocks hold a **2220 MHz** plateau
+  with no thermal degradation.
 
 ---
 
@@ -38,7 +39,7 @@ the operating rule:
 - `2026-08-14` — first in-house validation on Qwen3.6-35B
   ([results-2026-08-14-vulkan-vs-rocm.md](results-2026-08-14-vulkan-vs-rocm.md)): at
   equal quant RADV beat ROCm on tg by +14.1%, but the ROCmFP4 stack won both fronts on
-  the strength of the lighter format; ROCm kept pp (+34.8%).
+  the strength of the lighter format; ROCm kept pp (prompt processing) at +34.8%.
 - `2026-08-15` — on the dense 27B, ROCm won tg by +53% and pp by +11%
   ([results-2026-08-15-qwen38-27b.md](results-2026-08-15-qwen38-27b.md)) — the number
   that set the "dense → ROCm" rule.
@@ -64,6 +65,9 @@ ROCm build vs Vulkan build of the same fork, same GGUF:
 | alphabet | 30.4 | **36.7** | **+21%** |
 | counting | — | — | +7% |
 
+The counting cells are empty because the absolutes for that pair were never
+published — only the +7% delta.
+
 Prose — the workload that dominates agent sessions — is where the margin lives, at
 +22%; the alphabet prompt matches it at +21%; on the counting prompt the ordering holds
 but the margin narrows to +7%. Same asymmetry the drafter threads kept measuring:
@@ -83,13 +87,13 @@ took one flag:
 | Vulkan, `--no-mmap` | **244** |
 
 **mmap collapses Vulkan prompt processing 3×.** The mechanism, on this APU: with the
-default mmap path the weights are file-backed pages landed in **GTT pageable memory**,
-and the prefill pays a paging stall every time a batch first touches a page — the
-paging path runs mid-kernel, serializing the prefill. `--no-mmap` instead reads the
-weights into **anonymous memory** at load time, which stays resident. The price is
-load time (a cold start of the 98.5 GiB file runs ~14 minutes; page-cache-warm, a
-couple of minutes) and RAM: resident is resident, which is what forces the next
-decision (§4).
+default mmap path the weights are file-backed pages landed in **GTT pageable memory**
+(GTT is the iGPU's pageable graphics aperture), and the prefill pays a paging stall
+every time a batch first touches a page — the paging path runs mid-kernel,
+serializing the prefill. `--no-mmap` instead reads the weights into **anonymous
+memory** at load time, which stays resident. The price is load time (a cold start of
+the 98.5 GiB file runs ~14 minutes; page-cache-warm, a couple of minutes) and RAM:
+resident is resident, which is what forces the next decision (§4).
 
 Two operational readings, both learned the honest way:
 
@@ -150,7 +154,7 @@ degrades long before the arithmetic says it must. Any long-context prefill work 
 attention work; nothing else is worth touching.
 
 **Is the hybrid scan expensive? No.** The gated-deltanet recurrent scan measures at
-**0.1–0.9% of GPU time** — not the double-digit share sometimes claimed for hybrid
+**0.1–0.9% of GPU time** — not the double-digit share occasionally suggested for hybrid
 models' scan overhead. The architecture's long-context cost is in its attention
 layers, like everyone else's.
 
@@ -161,8 +165,8 @@ Sustained decode speed reflects the memory floor and the context, not the therma
 ## 6. Where this leaves the machine
 
 The serving config the thread produced — Vulkan/RADV + `--no-mmap` + KV q8_0, cache
-sized for the agent — has been the production baseline since 2026-08-29, and every
-speculative-decoding table in this repo runs on it. What remains genuinely open on
+sized for the agent — has been the production baseline since 2026-08-29, and the
+speculative tables since the switch run on it. What remains genuinely open on
 this hardware is short: the attention-side long-context prefill cost above, and the
 ~38 ms/round structural residue on Vulkan measured in
 [speculative-round-software.md](speculative-round-software.md). The physics questions

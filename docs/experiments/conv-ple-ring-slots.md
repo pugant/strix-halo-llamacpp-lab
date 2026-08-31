@@ -10,16 +10,16 @@ correctness bug in the rollback machinery that speculative decoding had just sta
 exercising: the ring that snapshots the hybrid's recurrent state had only ever been
 writing one of its slots, so every partial-reject rollback restored the
 convolution and n-gram-table histories from zeros. This note is the symptom, the
-misread, the root cause, and the fix that took acceptance from ~0.74 to 0.91-0.95
-and throughput from 24 to 41-44 tok/s.
+misread, the root cause, and the fix that took acceptance from ~0.74 to 0.91–0.95
+and throughput from 24 to 41–44 tok/s.
 
 Context: Qwen3.8-Flash-Next (`qwen4exp`) on our llama.cpp fork, Vulkan (RADV) build,
 Strix Halo — a gated-deltanet hybrid where 36 of 48 layers are linear attention with
 a short convolution history, an indexer-attention block with its own KV stream, and
-a 51B-parameter PLE n-gram embedding table consulted early in the stack. Speculation
-runs an external MTP head; partial rejects are rewound through a snapshot ring
-(rollback salvage, ~7.2 GiB of buffers) instead of paying a full checkpoint restore.
-The runtime story up to that point is
+a 51B-parameter PLE (per-layer embedding) n-gram table consulted early in the stack.
+Speculation runs an external MTP head; partial rejects are rewound through a snapshot
+ring (rollback salvage, ~7.2 GiB of buffers) instead of paying a full checkpoint
+restore. The runtime story up to that point is
 [qwen4exp-runtime.md](qwen4exp-runtime.md) §6.
 
 **TL;DR**
@@ -39,9 +39,9 @@ The runtime story up to that point is
   `delta-net-base.cpp` — fork commit `c1d31353e`, 2026-08-30, patch `0012` of
   [`patches/qwen4exp-mtp/`](../../patches/qwen4exp-mtp/).
 - **Measured**: zero anomalies across three post-fix runs (about 24 per five runs
-  before); acceptance **~0.74 → 0.91-0.95**; tg **24 → 41-44 tok/s** at n=6 on code
-  workloads; and the "inherent post-rollback dip" earlier analyses had measured
-  simply vanished.
+  before); acceptance **~0.74 → 0.91–0.95**; tg (token generation) **24 → 41–44
+  tok/s** at n=6 on code workloads; and the "inherent post-rollback dip" earlier
+  analyses had measured simply vanished.
 - **The lesson, promoted to a rule**: a quality regression that appears after a
   rollback-path change is a rollback-bug candidate *before* it is a quant suspect.
 
@@ -136,14 +136,14 @@ in [`rocmfpx/`](../../rocmfpx/).
 | metric | before | after |
 |---|---|---|
 | corruption anomalies | ~24 per five code-generation runs | **0 across three runs** |
-| draft acceptance (code, n=6) | ~0.74 | **0.91-0.95** |
-| tg, code workloads, n=6 | 24 tok/s | **41-44 tok/s** |
+| draft acceptance (code, n=6) | ~0.74 | **0.91–0.95** |
+| tg, code workloads, n=6 | 24 tok/s | **41–44 tok/s** |
 | "post-rollback dip" | measured, analyzed, partly attributed to drafter state | **gone** |
 
 The last row deserves honesty about the analysis history. Before this fix, the
 post-rollback acceptance dip was real and had been *measured and worked on*:
 one-round poisoning after a reject (P(p0-reject | previous round rejected) 0.233
-with the ring vs 0.071-0.075 after a full accept — the base rate, identical across
+with the ring vs 0.071–0.075 after a full accept — the base rate, identical across
 arms), and a drafter-state reset (H1) that shaved the excess (0.172 → 0.078). Those
 measurements were correct on their own terms — but a
 meaningful share of what they were explaining was the zeros. Once every ring slot
@@ -174,7 +174,7 @@ measurement.
    tokens, one snapshot per rewind position) and port the list too.
 5. **Cheap rollback has two halves.** The ring's gather side had been verified; the
    write side had not. A fast path that reads state nobody wrote is worse than the
-   slow path it replaced — it was both slower in effect (24 vs 41-44 tok/s) and
+   slow path it replaced — it was both slower in effect (24 vs 41–44 tok/s) and
    wrong.
 
 ---

@@ -114,8 +114,9 @@ within the ring window; beyond that it fell back to a **full cold reprocess** �
 divergence.
 
 The observation that unlocks it: by the time the fallback is reached, the target and
-draft *memories* have already been truncated successfully — what cannot be rewound
-on a recurrent architecture is the memory state itself, and only a saved snapshot
+draft *memories* have already been truncated successfully — the cheap part of the
+rewind (the KV truncation) is already done; what a replay cannot recompute on a
+recurrent architecture is the memory state itself, and only a saved snapshot
 can restore that. The server already had context checkpoints for another path (the
 sliding-window attention save/restore). Salvage reuses the primitive: restore the
 newest checkpoint at or below the divergence point, replay the tokens after it,

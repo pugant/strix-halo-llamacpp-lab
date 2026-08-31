@@ -1,6 +1,6 @@
 # Experiments — the story index
 
-The raw notes are one file per experiment (plus `data/` for the datasets); this index is the story that connects them. Every note below is referenced from one of the six threads; numbers in the README of this repo trace back to these files.
+The raw notes are one file per experiment (plus `data/` for the datasets); this index is the story that connects them. Every note below is referenced from one of the six threads; numbers in the README of this repo trace back to these files (T-numbers are our internal task ids).
 
 ## Quantization & quality
 
@@ -126,7 +126,7 @@ The flagship note for this thread is [qwen4exp-runtime.md](qwen4exp-runtime.md);
 
 ## pi-stack
 
-The π stack is the lab's own daily driver: a long-lived thinking agent with tool calls, running for hours at a time. The thread asks where its time and its quality actually go — measured on the production workload rather than on benches, and each candidate change gated before deploy.
+The agent stack is the lab's own daily driver: a long-lived thinking agent with tool calls, running for hours at a time. The thread asks where its time and its quality actually go — measured on the production workload rather than on benches, and each candidate change gated before deploy.
 
 Timeline:
 
@@ -154,7 +154,7 @@ Timeline:
 - `2026-08-17` [results-2026-08-17-ckpt-ring-tg-24k.md](results-2026-08-17-ckpt-ring-tg-24k.md) — checkpoint/ring tuning is a **dead lever** (prefill checkpoint cost ≤4%, ring 32 vs 4 indistinguishable); MTP boost is **constant with context** (~3.09× at both 1k and 24k).
 - `2026-08-17` [results-2026-08-17-rocm-vs-vulkan-tg.md](results-2026-08-17-rocm-vs-vulkan-tg.md) — at unified protocol the backends are **equivalent** on tg (1k and 24k); the historical "+53% ROCm dense" reading does not reproduce and is resolved as a protocol artifact — protocol-dependent, not physics.
 - **Production switch to Vulkan + `--no-mmap`** — on Flash-Next prose Vulkan beats ROCm by ~+22%, but **mmap collapses Vulkan prompt processing ~3× (244 → 70 tok/s)**, so the production combo is Vulkan + `--no-mmap` + KV q8_0 (the KV quant here buys the RAM that no-mmap needs, at a cost the prose win pays for). Thread note: [vulkan-nommap-backend.md](vulkan-nommap-backend.md).
-- **Agent-latency decomposition** ([agent-latency.md](agent-latency.md)) — of the round-trip latency budget, the dominant residual is **client-side** (agent stalls, not GPU); the cold re-prefill quota traced back to a client-side cache-breaking timestamp and fell 64.6% with the client fix (the salvage that absorbed the aborts: [Infrastructure fixes](#infrastructure-fixes)).
+- **Agent-latency decomposition** ([agent-latency.md](agent-latency.md)) — of the round-trip latency budget, the dominant residual is **client-side** (agent stalls, not GPU); the cold re-prefill quota traced back to a client-side cache-breaking timestamp and went to zero cold fallbacks with the client fix, while C4 fell 64.6% (the salvage that absorbed the aborts: [Infrastructure fixes](#infrastructure-fixes)).
 - **Measured 8060S facts** — tg is memory-bound (closed); attention is **44.8% of GPU time at 80k context** running at MFU 13% vs ~40% for plain matmul (time-crossover ~15–25k tokens, well before the FLOP crossover); GDN scan cost is 0.1–0.9% — not the ~44% sometimes claimed; clocks hold a 2220 MHz plateau with no thermal degradation across long runs.
 
 ### Backend choice by model class: ROCm vs Vulkan

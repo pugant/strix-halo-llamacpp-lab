@@ -20,17 +20,18 @@ run as real sessions, back-to-back across arms.
 - **T23, disk-KV survey** — catalogued the community disk-KV pattern (KV pages on NVMe,
   restore on prefix hit) as the candidate RAM relief; deliberately parked at low
   priority because the RAM margin was not yet blocking. When the pressure became real,
-  the answer came from another direction: the qwen4exp PLE disk-offload
-  ([qwen4exp-runtime.md](qwen4exp-runtime.md)). The KV cache itself never moved to disk.
+  the answer came from another direction: the qwen4exp PLE (per-layer embedding)
+  disk-offload ([qwen4exp-runtime.md](qwen4exp-runtime.md)). The KV cache itself never
+  moved to disk.
 - **T24, the matrix** — same tasks, real agent sessions, arms across quant, drafter and
   sampling. The LEAN + speculative + greedy arm showed broken thinking segments,
   zero-degeneration episodes and truncated writes; the plain-quant arm ran the same work
   incident-free.
-- **The decisive isolation** — out-of-format tool calls appeared on the plain arm too,
-  on a 28k-token write, with a clean server log: independent of quant and speculation,
-  i.e. a model-or-parser issue, fixed with a defensive parse on the client side.
-- **The speed side** — plain-quant decode on a real session fell 15.7 tok/s at 19k
-  context to 6.3 at 50k, while the speculative LEAN still held ~16 tok/s at 40k:
+- **The decisive isolation** — out-of-format tool calls are not tied to quant or
+  speculation (they occurred on the plain arm too — once, on a 28k-token write, with a
+  clean server log): a model-or-parser issue, fixed with a defensive parse client-side.
+- **The speed side** — plain-quant decode on a real session fell from 15.7 tok/s at
+  19k context to 6.3 at 50k, while the speculative LEAN still held ~16 tok/s at 40k:
   speculation, not quant, is what holds the decode floor as context grows.
 - The production quality verdict these sessions fed is recorded in
   [2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md).
@@ -40,9 +41,10 @@ run as real sessions, back-to-back across arms.
 ## 1. Where these two sit
 
 The improvement cycle of 2026-08-28/29 closed its levers by measurement: hipCUB
-enablement regressed deep-context prefill (−42% pp at 131k), KV quantization cost
-19–26% tg on the real-session regime, the n-gram drafter had no terrain, and the
-drafter-state rollback fix shipped. Two questions were left open on purpose.
+enablement regressed deep-context prefill by −42% pp (prompt processing) at 131k, KV
+quantization cost 19–26% tg (token generation) on the real-session regime, the n-gram
+drafter had no terrain, and the drafter-state rollback fix shipped. Two questions were
+left open on purpose.
 
 The first was **RAM**. The cycle had established that on this machine KV compression
 buys no speed — the decode bottleneck is the bytes of the weights, not of the KV — so
@@ -95,13 +97,15 @@ fresh investigation.
 The matrix was designed to do what the T22 post-scriptum could not: attribute defects
 to a layer. **Same tasks** — the daily coding-and-tool-use workload of our production
 agent, thinking mode on, ~40-minute sessions — run as **real sessions**, one arm at a
-time, same engine build and flags except the arm variable. The arms:
+time, same engine build and flags except the arm variable, all arms on
+Qwen3.8-Flash-Next. The arms:
 
 | Arm | Quant | Drafter | Sampling |
 |---|---|---|---|
 | A | our STRIX_LEAN | MTP on | greedy |
-| B | plain quant (unsloth UD) | none | default |
-| C | plain quant (unsloth UD) | none | temp 1.0 |
+| B | plain quant (Unsloth UD) | none | default |
+| C | plain quant (Unsloth UD) | none | temp 1.0 |
+| D | plain quant (Unsloth UD) | MTP on | — |
 
 What was recorded was not a score but an **incident taxonomy**: broken thinking segments
 (reasoning stopping mid-sentence), degeneration (runs of repeated zeros), truncated
@@ -123,7 +127,8 @@ consistent with a mechanism that needs the greedy + speculative combination (nea
 flips in batched verify, or rollback-adjacent state), not with the model's intrinsic
 quality. The standing caveat is inherited from T22 and kept honest: in the
 production-shaped arms the quant and the drafter move together, so this is a strong
-observational isolation, not a factorial one — a LEAN-plain control remains the open
+observational isolation, not a factorial one — the one cross arm probed (D: UD +
+speculation, a brief run) was clean server-side; a LEAN-plain control remains the open
 thread, exactly as recorded there.
 
 The decisive finding is the fourth row, and it is the reason the matrix was worth
