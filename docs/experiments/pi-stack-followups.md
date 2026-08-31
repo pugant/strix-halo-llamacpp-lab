@@ -17,8 +17,9 @@ run as real sessions, back-to-back across arms.
 
 **TL;DR**
 
-- **T23, disk-KV survey** — catalogued the community disk-KV pattern (KV pages on NVMe,
-  restore on prefix hit) as the candidate RAM relief; deliberately parked at low
+- **T23, disk-KV survey** — catalogued the disk-resident-state pattern (inspired by
+  antirez's dwarstar; KV pages on NVMe, restore on prefix hit) as the candidate RAM
+  relief; deliberately parked at low
   priority because the RAM margin was not yet blocking. When the pressure became real,
   the answer came from another direction: the qwen4exp PLE (per-layer embedding)
   disk-offload ([qwen4exp-runtime.md](qwen4exp-runtime.md)). The KV cache itself never
@@ -57,7 +58,9 @@ ends, each closed enough to record.
 
 ## 2. T23 — the disk-KV survey: the right question, answered from elsewhere
 
-Community inference stacks were shipping disk-KV layers: page the KV of cold prefixes
+The direct inspiration was **Salvatore Sanfilippo (antirez)'s dwarstar**, which keeps
+model state on disk and pays only for what a generation actually touches. Around that
+idea, community inference stacks were shipping disk-KV layers: page the KV of cold prefixes
 out to NVMe, restore it on a prefix hit, and buy back RAM at the price of disk latency
 on the restore path. We surveyed the pattern as our RAM-relief candidate — what is
 resident today (weights, KV, the rollback ring at ~7.2 GiB, the external drafter at

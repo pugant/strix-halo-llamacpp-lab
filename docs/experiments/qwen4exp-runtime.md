@@ -175,11 +175,14 @@ production combo is Vulkan + `--no-mmap` (mmap collapses this build's prompt pro
 [vulkan-nommap-backend.md](vulkan-nommap-backend.md)) — those 35.76 GiB are real resident RAM
 beside the other weights, the KV cache, a 3.85 GiB drafter and a 7.2 GiB ring.
 
-`--ple-disk` changes where the table lives, not what the model computes. The tensor is
-never created at load; rows are read **on demand from the GGUF file itself** via
-`pread`, through a fixed-size LRU of whole 128-row blocks (16 shards, `--ple-cache-mib`,
-default 4096). No sidecar files, no preprocessing, the published GGUF used verbatim —
-the row dequantization is unit-tested bit-exact against the in-memory gather path.
+`--ple-disk` changes where the table lives, not what the model computes. The direct
+inspiration is **Salvatore Sanfilippo (antirez)'s dwarstar** — disk-resident model
+state, pay only for what a generation touches — here applied to one sparse n-gram
+table. The tensor is never created at load; rows are read **on demand from the GGUF
+file itself** via `pread`, through a fixed-size LRU of whole 128-row blocks (16
+shards, `--ple-cache-mib`, default 4096). No sidecar files, no preprocessing, the
+published GGUF used verbatim — the row dequantization is unit-tested bit-exact
+against the in-memory gather path.
 
 | Gate (v1) | Result |
 |---|---|

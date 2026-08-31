@@ -136,7 +136,9 @@ This lab adds a thin layer on top of giants' work.
 - **Unsloth** — the UD quantization family and the Flash-Next reference material; our pipeline builds on their published BF16 GGUFs and write-ups.
 - **agentionai** — author of the external MTP drafter that pairs with our qwen4exp quant.
 - **kingjones777** — reference tg/pp numbers on Strix Halo that we cross-checked our own measurements against.
-- **antirez / ds4** — the README pattern this page follows.
+- **antirez / Salvatore Sanfilippo** — the ds4 README pattern this page follows, and
+  the disk-resident model state of his dwarstar, the direct inspiration for our PLE
+  disk-offload (`--ple-disk`).
 
 If we forgot anyone: it is an omission, not intentional — open an issue and we will credit you.
 
