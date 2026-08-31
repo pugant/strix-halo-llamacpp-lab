@@ -4,7 +4,7 @@ The raw notes are one file per experiment (plus `data/` for the datasets); this 
 
 ## Quantization & quality
 
-This lab began as a quantization pipeline: take the community-born ROCmFP4-STRIX_LEAN preset and turn out measured, sanitized quants of the models the author actually runs. That pipeline era produced the first eight HF model cards of the lab (grug, Ornith, Nemotron Lightning, the Qwen3.6 27B/35B pair, and the Qwen3.8-27B model + its imatrix) — each with its bench note and, for the early ones, an adversarially reviewed design spec.
+This lab began as a quantization pipeline: take the community-born ROCmFP4-STRIX_LEAN preset and turn out measured, sanitized quants of the models we actually run. That pipeline era produced the lab's first HF model cards (grug, Ornith, Nemotron Lightning, the Qwen3.6 27B/35B pair, and the Qwen3.8-27B model + its imatrix) — each with its bench note and, for the early ones, an adversarially reviewed design spec.
 
 Once the pipeline was routine, the question became quality: what exactly do the preset choices cost? That produced the preset comparison thread — FULL vs LEAN vs the `_EVEN` controls (the "+53% ROCm" reading of the era is resolved later as a protocol artifact, see [Performance & hardware](#performance--hardware)) — the discovery that the "3-bit" preset is not a 3-bit on hybrid gated-deltanet models, and the cross-check against Unsloth's UD family.
 
@@ -50,7 +50,7 @@ Timeline:
 | DFlash2 n5 (best single drafter) | 17.5 / 15.9 | 52.2 / 39.5 | [`:17`](results-2026-08-19-dflash2-vs-mtp.md) |
 | **Dual routing (production)** | 19.7 / 20.4 (≈ MTP) | 54.7 / 40.7 (+19.2% / +20.8%) | [`results-2026-08-20-drafter-routing-t1-t5.md:30-36`](results-2026-08-20-drafter-routing-t1-t5.md) |
 
-Each cell is two runs. "Deterministic" = counting/alphabet-style prompts. Dual-routing prose values are prompts P1/P2 of the T4 table. The MTP control row and the T4 gate runs were **separate sessions** (e.g. mono prose 19.6/20.2 here vs 19.8/20.4 in the T4 table) — compare deltas, not absolute cells, across sessions. Read the table as: routing keeps MTP-class prose speed *and* captures most of the DFlash2 deterministic win, in one server.
+Each cell is two runs. "Deterministic" = counting/alphabet-style prompts. Dual-routing prose values are prompts P1/P2 of the T4 table. The MTP control row and the T4 gate runs were **separate sessions** (e.g. mono prose 19.6/20.2 here vs 19.8/20.4 in the T4 table — the gate re-ran the prose pair) — compare deltas, not absolute cells, across sessions. Read the table as: routing keeps MTP-class prose speed *and* captures most of the DFlash2 deterministic win, in one server.
 
 ### Why routing works: workload and acceptance
 
@@ -105,9 +105,9 @@ Timeline:
 - **Quant + card** — 98.5 GiB ROCmFP4-STRIX_LEAN quant published with its mmproj; the largest model the lab runs.
 - **Runtime port** — full `qwen4exp` support on the fork (HIP and Vulkan builds alike), branch `qwen4exp-rt`.
 - **External MTP drafter** — upstream PR #27836 ported and adapted (converter side from PR #27742): the MTP/NextN head runs from a drafter GGUF via `-md`; four silent porting bugs fixed, the mmproj×MTP abort among them.
-- **Vision × MTP** — image chunks are embd-only, so the drafter-side replay is skipped while the head still sees the image through the trunk hidden state; measured acceptance on a vision request 98.3% cumulative.
+- **Vision × MTP** — image chunks are embd-only, so the drafter-side replay is skipped while the head still sees the image through the trunk hidden state; measured acceptance on a vision request: 98.3% cumulative.
 - **RS-rollback + ring fix** — one line enables the RS ring-salvage rollback for qwen4exp; with the conv/PLE ring-slot writer fix (see [Infrastructure fixes](#infrastructure-fixes)) the stack sustains 41–44 tok/s at n=6, ~+70% over the pre-fix server.
-- **Reasoning-budget warn window** — the 75% convergence nudge (patches 0016-0020, note: [reasoning-budget-warn75.md](reasoning-budget-warn75.md)).
+- **Reasoning-budget warn window** — the 75% convergence nudge (patches 0016–0020, note: [reasoning-budget-warn75.md](reasoning-budget-warn75.md)).
 - `2026-08-31` **PLE disk-offload deployed** — `--ple-disk`: the 35.76 GiB PLE table is read on demand from the GGUF itself, ~36 GB of RAM freed, output char-identical; guide: [`docs/guide/qwen4exp-ple-disk.md`](../guide/qwen4exp-ple-disk.md).
 
 ### Outcome (dedicated GPU, 98.5 GiB target + 3.85 GiB Q8_0 drafter, ctx 8192, median of 3)
@@ -116,9 +116,9 @@ Timeline:
 |---|---|---|---|
 | deterministic (counting) | 22.1 | 46.0 (**+108%**) | **50.2 (+127%)** |
 | deterministic (alphabet) | 20.9 | 32.0 (+53%) | 32.6 (+56%) |
-| open prose | 22.6 | 22.8–25.4 (+1..12%) | — |
+| open prose | 22.6 | 22.8–25.4 (+1–12%) | — |
 
-Draft acceptance 95.7% of tokens (mean accepted length 3.24 at n=3; still 5.20/6 at n=5 on deterministic text). The mechanical read: the round bottleneck is the **batched verify over the hybrid trunk** (KV + GDN + QSA index + PLE), not the drafter — deterministic work converts acceptance into speed almost 1:1, open prose decays after position 1. After the rollback-restore fix the same stack on Vulkan/RADV sustains 41–44 tok/s at n=6 on code-generation workloads (draft acceptance 0.91–0.95), and n=6 is the measured optimum (n=8 regresses to 35 tok/s: draft positions 7–8 do not pay for themselves).
+Draft acceptance 95.7% of tokens (mean accepted length 3.24 at n=3; still 5.20 of 6 at n=5 on deterministic text). The mechanical read: the round bottleneck is the **batched verify over the hybrid trunk** (KV + GDN + QSA index + PLE), not the drafter — deterministic work converts acceptance into speed almost 1:1, open prose decays after position 1. After the rollback-restore fix the same stack on Vulkan/RADV sustains 41–44 tok/s at n=6 on code-generation workloads (draft acceptance 0.91–0.95), and n=6 is the measured optimum (n=8 regresses to 35 tok/s: draft positions 7–8 do not pay for themselves).
 
 The flagship note for this thread is [qwen4exp-runtime.md](qwen4exp-runtime.md); the quant comparison on this model is [2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md).
 
@@ -131,14 +131,14 @@ The π stack is the lab's own daily driver: a long-lived thinking agent with too
 Timeline:
 
 - `2026-08-28/29` [2026-08-29-pi-stack-improvement.md](2026-08-29-pi-stack-improvement.md) — the improvement cycle, all gates closed, deployed as `rs2`:
-  - hipCUB enablement (port of upstream PR #27874) — **NO-GO**: pp at 131k context **−42%** (B/A 0.58); measure, don't assume.
-  - KV quantization — **costs 19–26%** tg on this workload → f16 K/V in production.
-  - n-gram drafter — instrumented with per-drafter counters, **no terrain** (the engagement precondition fails).
-  - drafter-state rollback fix (F4/H1) — resetting the MTP drafter state on partial-reject rollback cuts p0-reject 0.272 → 0.161.
+  - hipCUB enablement (port of upstream PR #27874) — **NO-GO**: pp at 131k context **−42%** (0.58× the control); measure, don't assume.
+  - KV quantization — **costs 19–26%** tg on this workload → f16 K/V for that cycle (the later Vulkan switch re-introduced q8_0 KV to fund `--no-mmap`, see [Performance & hardware](#performance--hardware)).
+  - n-gram drafter — instrumented with per-drafter counters, **no headroom** — the drafter never engages (its engagement precondition fails).
+  - drafter-state rollback fix (F4/H1) — resetting the MTP drafter state on partial-reject rollback cuts the position-0 rejection rate (p0-reject) 0.272 → 0.161.
 - `2026-08-30` [reasoning-budget-warn75.md](reasoning-budget-warn75.md) — the warn window at 75% of the thinking budget: in a one-hour real agent session (48 requests) every request closed naturally, the single triggered warning converged in 1.3 s, zero budgets exhausted.
 - **Quality matrix on the real agent** — out-of-format tool-calls turned out to be **independent of quant and spec** configuration (a model/parser-level issue, fixed client-side), and the quality verdict on Flash-Next quants moved daily use to the UD-plain variant ([2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md)).
 - **Thinking-cap steering — NO-GO** (soft redirect at the budget line: notice + squeeze, 2026-08-17): the pressure never stopped the exhaustion — 9/10 generations still hit the cap — and it broke the cache resend under pressure; the warn window that later shipped is the surviving idea (design [design-2026-08-17-reasoning-pressure.md](design-2026-08-17-reasoning-pressure.md), patch series [`patches/reasoning-pressure/`](../../patches/reasoning-pressure/)).
-- **Thinkingcap budget-aware anchor line — NO-GO**: a budget-aware anchor line meant to hold the remaining reasoning budget stable mid-generation; the anchor line caused quality regressions and was dropped. What survived from the thinkingcap thread is the hard cap plus the warn window above.
+- **Thinking-cap budget-aware anchor line — NO-GO**: a line meant to hold the remaining reasoning budget stable mid-generation; it caused quality regressions and was dropped. What survived from the thinking-cap thread is the hard cap plus the warn window above.
 
 **What shipped:** [`patches/f4-rollback-fix/`](../../patches/f4-rollback-fix/) and [`patches/ngram-drafter-instrumentation/`](../../patches/ngram-drafter-instrumentation/) (both in the `rocmfpx/` snapshot), the warn-75 window (qwen4exp-mtp patches 0016–0020) deployed on the real server, and the production switch to Vulkan that closes the cycle (next thread).
 
@@ -148,18 +148,18 @@ One machine, one physics: 128 GB of unified memory behind a ~256 GB/s pipe. This
 
 Timeline:
 
-- `2026-08-14` [results-2026-08-14-vulkan-vs-rocm.md](results-2026-08-14-vulkan-vs-rocm.md) — first in-house Vulkan vs ROCm validation on Qwen3.6-35B-A3B (ROCm pp/tg both ahead on that MoE class).
+- `2026-08-14` [results-2026-08-14-vulkan-vs-rocm.md](results-2026-08-14-vulkan-vs-rocm.md) — first in-house Vulkan vs ROCm validation on Qwen3.6-35B-A3B (ROCm stack ahead on both fronts that day — vs the Vulkan UD-Q5 stack; on the same GGUF, RADV already won tg +14%).
 - `2026-08-14` [results-2026-08-14-vulkan-rocmfp4-fork.md](results-2026-08-14-vulkan-rocmfp4-fork.md) — ROCmFP4 types on the Vulkan build: the community 78–90 tok/s claim confirmed in-house (81.6); "Vulkan can't run ROCmFP4" falls (it is a fork capability).
 - `2026-08-17` [results-2026-08-17-kv-quant-tg-context.md](results-2026-08-17-kv-quant-tg-context.md) — asymmetric q8_0 KV vs f16 — **NO-GO**: quantized KV worsens or ties everywhere; the long-ctx bottleneck is not KV read bytes.
 - `2026-08-17` [results-2026-08-17-ckpt-ring-tg-24k.md](results-2026-08-17-ckpt-ring-tg-24k.md) — checkpoint/ring tuning is a **dead lever** (prefill checkpoint cost ≤4%, ring 32 vs 4 indistinguishable); MTP boost is **constant with context** (~3.09× at both 1k and 24k).
-- `2026-08-17` [results-2026-08-17-rocm-vs-vulkan-tg.md](results-2026-08-17-rocm-vs-vulkan-tg.md) — at unified protocol the backends are **equivalent** on tg (1k and 24k); the historical "+53% ROCm dense" reading does not reproduce and is resolved as a protocol artifact.
+- `2026-08-17` [results-2026-08-17-rocm-vs-vulkan-tg.md](results-2026-08-17-rocm-vs-vulkan-tg.md) — at unified protocol the backends are **equivalent** on tg (1k and 24k); the historical "+53% ROCm dense" reading does not reproduce and is resolved as a protocol artifact — protocol-dependent, not physics.
 - **Production switch to Vulkan + `--no-mmap`** — on Flash-Next prose Vulkan beats ROCm by ~+22%, but **mmap collapses Vulkan prompt processing ~3× (244 → 70 tok/s)**, so the production combo is Vulkan + `--no-mmap` + KV q8_0 (the KV quant here buys the RAM that no-mmap needs, at a cost the prose win pays for).
 - **Agent-latency decomposition** (internal cycle, note to come) — of the round-trip latency budget, the dominant residual is **client-side** (agent stalls, not GPU); cold re-prefill cascades were the second sink, addressed in [Infrastructure fixes](#infrastructure-fixes).
-- **Measured 8060S facts** — tg is memory-bound (closed); attention is **44.8% of GPU time at 80k context** running at MFU 13% vs ~40% for plain matmul (time-crossover ~15–25k tokens, well before the FLOP crossover); GDN scan cost is 0.1–0.9% (not 44%); clocks hold a 2220 MHz plateau with no thermal degradation across long runs.
+- **Measured 8060S facts** — tg is memory-bound (closed); attention is **44.8% of GPU time at 80k context** running at MFU 13% vs ~40% for plain matmul (time-crossover ~15–25k tokens, well before the FLOP crossover); GDN scan cost is 0.1–0.9% — not the ~44% sometimes claimed; clocks hold a 2220 MHz plateau with no thermal degradation across long runs.
 
 ### Backend choice by model class: ROCm vs Vulkan
 
-On dense 27B models the fork's ROCm build beats its Vulkan build on generation; on MoE FP4 the Vulkan build wins ([`results-2026-08-15-qwen38-27b.md:58-60`](results-2026-08-15-qwen38-27b.md)):
+On the 08-15 bench the ROCm build beat Vulkan on dense-27B generation (+53%) — a margin the unified-protocol re-run two days later did not reproduce (tg equivalent at 1k/24k); we keep dense → ROCm as our operating default, but the margin is protocol-dependent, not physics. On MoE FP4 the Vulkan build wins ([`results-2026-08-15-qwen38-27b.md:58-60`](results-2026-08-15-qwen38-27b.md)):
 
 | Metric | ROCm | Vulkan RADV | Note |
 |---|---|---|---|
@@ -171,8 +171,8 @@ Practical rule we follow: dense → ROCm; MoE FP4 → Vulkan fork. (The speculat
 
 ### Methodology
 
-- **One machine** — the author's Strix Halo (Ryzen AI MAX+ 395, 128 GB), dedicated GPU window (production service stopped during runs).
-- temp 0, single stream, warm-up discarded, **2–3 runs per number** — these are not statistical means; treat them as careful point measurements.
+- **One machine** — our Strix Halo (Ryzen AI MAX+ 395, 128 GB), dedicated GPU window (production service stopped during runs).
+- temp 0, single stream, warm-up discarded, **2–5 runs, median, per note** — these are not statistical means; treat them as careful point measurements.
 - Full raw data, logs and per-experiment setup live in [`docs/experiments/`](.) — they are the raw working notes. This index is the summary and entry point.
 
 **What shipped:** the production serving config (Vulkan/RADV + `--no-mmap` + KV q8_0, cache-ram sized for the agent), and the closed levers (KV-quant, checkpoint/ring, hipCUB) documented so they stay closed.

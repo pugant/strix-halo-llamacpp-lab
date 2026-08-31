@@ -118,7 +118,7 @@ Minimal smoke test (image from the Build section above, LEAN model from [Model w
 docker run -d --name owl --network host --device /dev/dri --group-add render \
   -v ~/llmodels:/llmodels:ro --entrypoint llama-server docker-llm-service:vulkan-fork \
   -m /llmodels/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN.gguf \
-  -ngl 999 --jinja -c 16384 --ple-disk --metrics --port 1234
+  -ngl 999 --jinja -c 16384 --no-mmap --ple-disk --metrics --port 1234
 
 curl http://localhost:1234/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Who is the Strix Owl?"}]}'

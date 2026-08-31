@@ -1,6 +1,6 @@
 # qwen4exp PLE disk-offload — guide
 
-How the 98.5 GiB Qwen3.8-Flash-Next quant ([`pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF`](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF)) runs on one 128 GB Strix Halo machine with ~36 GB of RAM to spare: the biggest tensor in the model never enters memory.
+How the 98.5 GiB Qwen3.8-Flash-Next quant ([`pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF`](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF)) runs on one 128 GB Strix Halo machine with ~36 GB of RAM to spare: the biggest tensor in the model is never loaded.
 
 Deployed on a real always-on agent server since **2026-08-31**; rolling back is one flag and one restart (see [Rollback](#rollback)).
 
@@ -12,7 +12,7 @@ The qwen4exp architecture carries a **PLE n-gram table** (`per_layer_token_embd`
 - **Zero preprocessing** — no conversion step, no extra disk usage; the flag changes where the table lives, not what the model computes.
 - **Bit-exact by construction** — the store serves dequantized rows identical to the in-memory path (unit-tested bit-exact against the CPU `get_rows` path, with a ULP-level parity fallback for the Vulkan gather).
 
-The full design and the A/B measurements are the T25 experiment; the implementation is the 15-patch series [`patches/t25-ple-disk/`](../../patches/t25-ple-disk/) (12 base + 3 v2), already part of the [`rocmfpx/`](../../rocmfpx/) snapshot — no patching needed, just build it.
+The design and the A/B scripts live in the patch series [`patches/t25-ple-disk/`](../../patches/t25-ple-disk/) (15 patches: 12 base + 3 v2; the char-identical check and the tg/pp A/B bench are patches 0011/0012), already part of the [`rocmfpx/`](../../rocmfpx/) snapshot — no patching needed, just build it. Arriving from the HF card and want to go start-to-finish? The [Build section of the root README](../../README.md#build) builds this engine from [`docker/Dockerfile.vulkan-rocmfpx-local`](../../docker/Dockerfile.vulkan-rocmfpx-local).
 
 ## The memory math
 
@@ -21,9 +21,12 @@ The full design and the A/B measurements are the T25 experiment; the implementat
 | PLE n-gram table, 35.76 GiB | **on disk** (GGUF itself), RAM only for cached blocks |
 | Everything else (~62.7 GiB of weights) | RAM/GPU as usual |
 | Block cache | `--ple-cache-mib`, default 4096 MiB |
-| KV cache, external MTP drafter (~3.85 GiB at Q8_0), runtime | RAM as usual |
+| KV cache | sized by `-c`/cache-RAM — grows with context |
+| External MTP drafter | ~3.85 GiB at Q8_0 |
+| GDN/RS rollback state ring | ~7.2 GiB of buffers |
+| Vulkan/runtime/OS overhead | a few GiB |
 
-On the 128 GB machine that arithmetic leaves ~36 GB free — headroom for the KV cache at long agent contexts, instead of a model that barely fits with none.
+On the 128 GB machine that arithmetic leaves ~36 GB free in practice, in our production instance — headroom for the KV cache at long agent contexts, instead of a model that barely fits with none.
 
 ## How to enable it
 
@@ -34,23 +37,23 @@ llama-server -m Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN.gguf \
 
 - `--ple-disk` — turn the offload on (`--no-ple-disk` to disable; default off).
 - `--ple-cache-mib N` — block-cache budget in MiB, **default 4096**; the server rejects values **below 102**.
-- `--no-mmap` — the offload **pairs with `--no-mmap`** in our production combo: with mmap the kernel may fault the table pages in wholesale and the offload loses its meaning (on Vulkan, mmap also collapses prompt processing — see the [README](../../README.md)). With `--no-mmap`, budget the rest of RAM for the non-PLE weights, KV and the block cache.
+- `--no-mmap` — the offload **pairs with `--no-mmap`** in our production combo: with mmap the kernel may fault the table pages in wholesale and the offload loses its meaning (on Vulkan, mmap also collapses prompt processing — see [Performance & hardware](../experiments/README.md#performance--hardware)). With `--no-mmap`, budget the rest of RAM for the non-PLE weights, KV and the block cache.
 
 The same two flags pass through `llama-bench` (`--ple-disk`, `--ple-cache-mib`), which is how the A/B numbers were taken.
 
 ## What to expect
 
-- **Warm page cache → ~3% tg cost.** With the kernel page cache already holding the touched blocks, measured tg was 30.45 vs ~31.5 tok/s with the table fully in RAM — the price of the on-demand gather path.
+- **Warm page cache → ~3% tg (token generation) cost.** With the kernel page cache already holding the touched blocks, measured tg was 30.45 vs ~31.5 tok/s with the table fully in RAM — the price of the on-demand gather path.
 - **Cold first touch is slower** — every block pays its first physical read from disk (the first real encounter with those bytes). This is a warm-up cost, not a steady-state one.
-- **Fully cold cache (bench from `drop_caches`): pp512 −58% / pp2048 −52%** — the one regime where the offload genuinely hurts is prompt processing on a cold cache.
-- **The kernel page cache is the real L2.** Once a block has been touched it stays in RAM until evicted, so repeated workloads (an always-on agent server) run at the warm figures above. The v2 patches in the series (per-block dedup + `POSIX_FADV_WILLNEED` readahead submission) close most of the remaining cold gap once the kernel cache is warm.
+- **Fully cold cache (bench from `drop_caches`): pp (prompt processing) 512 −58% / pp2048 −52%** — the one regime where the offload genuinely hurts is prompt processing on a cold cache.
+- **The kernel page cache is the real L2.** Once a block has been touched it stays in RAM until evicted, so repeated workloads (an always-on agent server) run at the warm figures above. The v2 patches in the series (per-block dedup + `POSIX_FADV_WILLNEED` readahead submission) close most of the residual gap in the kernel-warm regime.
 
 The three regimes, in one table:
 
 | Regime | What you pay | Typical figure |
 |---|---|---|
 | Block cache warm (steady server) | gather-path overhead only | tg ~3% (30.45 vs ~31.5 tok/s) |
-| Kernel page cache warm, block cache cold | dequant + copy, no disk I/O | small; v2 closes most of the historical gap here |
+| Kernel page cache warm, block cache cold | dequant + copy, no disk I/O | small; v2 closes most of the residual gap in this regime |
 | Everything cold (fresh boot / `drop_caches`) | first physical read of every touched block | pp512 −58% / pp2048 −52% |
 
 Practical reading: for a long-lived server this is close to free; for one-shot cold bench runs, expect the cold numbers.
@@ -61,7 +64,7 @@ Practical reading: for a long-lived server this is close to free; for one-shot c
 
 **Does it work together with the external MTP drafter?** Yes — that is the production configuration; the published A/B benches were run with the MTP drafter active (`tg`/`pp`, 5 reps, median).
 
-**Does it work on both backends?** The row gather is host-side, so the store is backend-neutral; what we measured and ship parity-checked is the **Vulkan/RADV** build (the series carries a VK-vs-CPU `get_rows` parity utility with a ULP fallback).
+**Does it work on both backends?** The row gather is host-side, so the store is backend-neutral; what we measured — and what the series parity-checks — is the **Vulkan/RADV** build (the series carries a VK-vs-CPU `get_rows` parity utility with a ULP fallback).
 
 **Is the GGUF modified, or is anything written next to it?** No and no. The model file is read-only input; there are no sidecar files and no preprocessing step.
 
@@ -89,4 +92,4 @@ curl -s http://127.0.0.1:8080/metrics | grep '^llamacpp:ple_'
 
 Remove `--ple-disk` from the server command line and restart: the model loads with the PLE table in RAM exactly as before the feature existed. There is no data migration, no extra file to clean up, and the GGUF is byte-identical either way — rollback cost is one model load.
 
-For the measured A/B (char-identical output check, tg/pp cost, the v2 gap reduction) see the T25 note linked from [`docs/experiments/README.md`](../experiments/README.md).
+For the measured A/B (char-identical output check, tg/pp cost, the v2 gap reduction) see the A/B scripts in the patch series ([`patches/t25-ple-disk/`](../../patches/t25-ple-disk/), patches 0011/0012) and the series index in [`PATCHES.md`](../../PATCHES.md).
