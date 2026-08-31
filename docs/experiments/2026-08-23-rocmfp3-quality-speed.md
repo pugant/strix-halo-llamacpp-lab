@@ -22,7 +22,7 @@ weight bytes would translate almost linearly into decode time.
 - **Arms** — `Q3_0_ROCMFPX` (base) and `Q3_0_ROCMFPX_AGENT`, both quantized in the
   convert container from the same local BF16 GGUF and the same self-produced
   496-entry imatrix as the 18/08 preset comparison
-  ([results-2026-08-18-rocmfp4-full-vs-strix-lean.md](../benchmarks/results-2026-08-18-rocmfp4-full-vs-strix-lean.md)).
+  ([results-2026-08-18-rocmfp4-full-vs-strix-lean.md](results-2026-08-18-rocmfp4-full-vs-strix-lean.md)).
 - **Quality gate** — `llama-perplexity` on wikitext-2-en (150k tokens) + Italian
   technical (51.5k), `-c 512 -b 512 -fa on`; BF16 references 6.6409 / 11.7156. The
   LEAN control was re-run in the same session and reproduced within sigma.
@@ -84,7 +84,7 @@ verdicts are unchanged at backend parity. llama-bench numbers are a single sessi
 - Weights + full model card: <https://huggingface.co/pugant/Qwen3.8-27B-MTP-Q3_0_ROCMFPX>
 - Imatrix: [pugant/Qwen3.8-27B-imatrix](https://huggingface.co/pugant/Qwen3.8-27B-imatrix)
 - FP4 preset comparison this note leans on:
-  [`docs/benchmarks/results-2026-08-18-rocmfp4-full-vs-strix-lean.md`](../benchmarks/results-2026-08-18-rocmfp4-full-vs-strix-lean.md)
+  [`docs/benchmarks/results-2026-08-18-rocmfp4-full-vs-strix-lean.md`](results-2026-08-18-rocmfp4-full-vs-strix-lean.md)
 - Full experiment protocol (Italian): lab workspace records.
 
 ---

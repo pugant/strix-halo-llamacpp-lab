@@ -58,7 +58,7 @@ For a general audience, the vocabulary of this note in one line each:
 | **Arm A / Arm B** | The two configurations of an A/B experiment. Defined per experiment below; always identical payload, identical server flags except the one under test. |
 
 Before this research line, we had already established — and productionized — the
-*alternating* use of the two drafters. The T7 A/B ([results-2026-08-19-dflash2-vs-mtp.md](../benchmarks/results-2026-08-19-dflash2-vs-mtp.md))
+*alternating* use of the two drafters. The T7 A/B ([results-2026-08-19-dflash2-vs-mtp.md](results-2026-08-19-dflash2-vs-mtp.md))
 showed a stark asymmetry:
 
 | Arm (single drafter) | prose tg (tok/s), 2 prompts | deterministic tg (tok/s), 2 prompts |
@@ -78,7 +78,7 @@ Since no single drafter wins everywhere, we built **per-request drafter routing*
 (T7): the server keys on the `tools` signal — agentic/tool-calling requests go to
 DFlash2, prose goes to MTP — with an optional per-request override and a
 drafter-tagged prompt cache. It shipped only after gates T1–T5 passed
-([results-2026-08-20-drafter-routing-t1-t5.md](../benchmarks/results-2026-08-20-drafter-routing-t1-t5.md)):
+([results-2026-08-20-drafter-routing-t1-t5.md](results-2026-08-20-drafter-routing-t1-t5.md)):
 
 | Gate | Checks | Result |
 |---|---|---|
@@ -712,8 +712,8 @@ Negative results are results. The artifacts of this line — the exclusion patch
 detector, the analysis scripts, the raw logs behind every table above — are kept in
 our lab records so that nobody, ourselves included, has to re-run them; the
 routing-baseline notes referenced in this document are in this repo under
-[`docs/benchmarks/`](../benchmarks/).
+[`docs/benchmarks/`](README.md).
 
 ---
 
-*Raw benchmark notes for the routing baseline: [`docs/benchmarks/results-2026-08-19-dflash2-vs-mtp.md`](../benchmarks/results-2026-08-19-dflash2-vs-mtp.md), [`docs/benchmarks/results-2026-08-20-drafter-routing-t1-t5.md`](../benchmarks/results-2026-08-20-drafter-routing-t1-t5.md). The T8 line's internal reports (phase A, phase 0, branch-2, 2×2, n-max, tree feasibility and counterfactual) are dated lab notes from 2026-08-21 → 2026-08-23; the numbers in this document are transcribed from them verbatim.*
+*Raw benchmark notes for the routing baseline: [`docs/benchmarks/results-2026-08-19-dflash2-vs-mtp.md`](results-2026-08-19-dflash2-vs-mtp.md), [`docs/benchmarks/results-2026-08-20-drafter-routing-t1-t5.md`](results-2026-08-20-drafter-routing-t1-t5.md). The T8 line's internal reports (phase A, phase 0, branch-2, 2×2, n-max, tree feasibility and counterfactual) are dated lab notes from 2026-08-21 → 2026-08-23; the numbers in this document are transcribed from them verbatim.*
