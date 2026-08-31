@@ -120,8 +120,9 @@ reconnaissance found the actual root cause with a four-legged proof:
 
 And the aborts the first reading blamed? **Recovered all along**: all 7 intra-turn
 resends were served by the checkpoint-salvage rollback (the cache-boundary fix
-series, see [spec-boundary-cache.md](spec-boundary-cache.md)) with 90-98% prefix
-replay — 17,404 replayed tokens over 399,886 (95.6% saved). The confounder was
+series, see [spec-boundary-cache.md](spec-boundary-cache.md)) at 90-98% prefix
+reuse — only 17,404 of 399,886 prompt tokens re-evaluated (95.6% saved). The
+confounder was
 process churn: aborts and new processes co-occurred. The counterfactual was cheap —
 make the caveat line static, a 1-3 line client change — and bounded the recovery at
 ≥95% of the re-prefill quota (S2 ceiling ~13.0-13.5 tok/s in that regime).
@@ -153,9 +154,10 @@ mostly phase structure — reasoning steady runs 17.0, content 28.3.
 at 4.25, would routing reasoning to the MTP head pay? Per-token gain on the phase:
 [−7.0, +17.2] ms/tok across the anchor grid, +9.2 realistic (−15% on reasoning
 ms/token). But a mid-request drafter switch costs a one-shot rebuild of the block
-drafter's state over the whole context — 4.5-15.8 s per request, 7.0-28.0 ms/reasoning-
-token weighted, up to 415 ms/token on short-reasoning requests, and growing with
-context. Net realistic: **[−18.9, +2.2] — no-go** without spending a single GPU run.
+drafter's state over the whole context — 4.5-15.8 s per request, 7.0-28.0 ms per
+reasoning token weighted, up to 415 ms/token on short-reasoning requests, and
+growing with context. Net realistic: **[−18.9, +2.2] — no-go** without spending a
+single GPU run.
 The surviving variant is the free one: requests that are reasoning-only (13 of 35)
 could take the MTP head with zero switches, worth +2.8% S1 in the realistic anchor —
 parked pending one measurement of the MTP head's acceptance on real reasoning, which

@@ -142,9 +142,10 @@ priority: it fires once per context lifetime, not per turn.
 
 The later session-decomposition work
 ([agent-latency.md](agent-latency.md)) measured what these fixes do under real
-client behavior, not just in gates: intra-turn aborts recovered by the salvage path
-at 95.6% replay (17,404 of 399,886 tokens re-processed), and a 6 h 45 m validation
-session with 121 of 124 requests served from cache/checkpoint replay — 99.26% of
+client behavior, not just in gates: intra-turn aborts recovered by the salvage
+path — only 17,404 of 399,886 prompt tokens re-evaluated, 95.6% saved — and a
+6 h 45 m validation session with 121 of 124 requests served from
+cache/checkpoint replay — 99.26% of
 the 16.69 M served prompt tokens never re-evaluated.
 
 ## 6. What shipped
