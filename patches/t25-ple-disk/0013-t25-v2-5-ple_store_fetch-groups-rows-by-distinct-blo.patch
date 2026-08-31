@@ -1,0 +1,115 @@
+From 94ce21034dbfccd5d4a8e1a877a8e93dc1136d62 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 31 Aug 2026 15:22:52 +0200
+Subject: [PATCH] t25 v2#5: ple_store_fetch groups rows by distinct block (lock
+ per block, not per row)
+
+Classify in first-occurrence order, per-row hit/miss accounting reconstructed
+from group sizes, dequant of the whole group under the shard lock (no eviction
+can free it meanwhile). Preserves the pinned thrash trace (row-order bumps).
+Unit tests bit-exact + accounting unchanged (ALL PASS).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/llama-ple-store.cpp | 63 ++++++++++++++++++++++++++++++++---------
+ 1 file changed, 49 insertions(+), 14 deletions(-)
+
+diff --git a/src/llama-ple-store.cpp b/src/llama-ple-store.cpp
+index 5d9695db6..cb73bb7ed 100644
+--- a/src/llama-ple-store.cpp
++++ b/src/llama-ple-store.cpp
+@@ -269,21 +269,52 @@ bool ple_store_fetch(ple_store * s, const int32_t * rows, int64_t n,
+     // guard against future concurrent callers
+     std::lock_guard<std::mutex> flk(s->fetch_mutex);
+ 
+-    // pass 1: classify rows against the current cache snapshot (stats only),
+-    // collect missing blocks (deduped)
++    // v2#5: group the requested rows by DISTINCT block, in first-occurrence
++    // (= row) order, so every later stage locks each shard once per block
++    // instead of once per row. Layout is CSR: block k owns row_idx[start[k],
++    // start[k+1]). Per-row hit/miss accounting is reconstructed from the
++    // group sizes, and the LRU bump order matches v1's row-order bumps for
++    // the single-row-per-block case (the pinned thrash trace).
++    std::vector<int64_t> blocks;
++    std::vector<uint32_t> group_size;
++    std::unordered_map<int64_t, uint32_t> block_pos;
++    block_pos.reserve((size_t) n * 2);
+     for (int64_t i = 0; i < n; i++) {
+         const int64_t block_idx = rows[i] / (int64_t) s->block_rows;
++        auto it = block_pos.find(block_idx);
++        if (it == block_pos.end()) {
++            block_pos.emplace(block_idx, (uint32_t) blocks.size());
++            blocks.push_back(block_idx);
++            group_size.push_back(1);
++        } else {
++            group_size[it->second]++;
++        }
++    }
++    std::vector<uint32_t> start(group_size.size() + 1, 0);
++    for (size_t k = 0; k < group_size.size(); k++) {
++        start[k + 1] = start[k] + group_size[k];
++    }
++    std::vector<uint32_t> fill(group_size.size(), 0);
++    std::vector<int64_t> row_idx((size_t) n);
++    for (int64_t i = 0; i < n; i++) {
++        const int64_t block_idx = rows[i] / (int64_t) s->block_rows;
++        const uint32_t k = block_pos[block_idx];
++        row_idx[start[k] + fill[k]++] = i;
++    }
++
++    // pass 1: classify DISTINCT blocks against the current cache snapshot
++    // (stats only), collect missing ones
++    for (size_t k = 0; k < blocks.size(); k++) {
++        const int64_t block_idx = blocks[k];
+         shard & sh = s->shard_for(block_idx);
+         std::lock_guard<std::mutex> sh_lk(sh.mutex);
+         auto it = sh.map.find(block_idx);
+         if (it != sh.map.end()) {
+             sh.lru.splice(sh.lru.begin(), sh.lru, it->second.first); // LRU bump
+-            rows_hit++;
++            rows_hit += group_size[k];
+         } else {
+-            rows_miss++;
+-            if (std::find(missing.begin(), missing.end(), block_idx) == missing.end()) {
+-                missing.push_back(block_idx);
+-            }
++            rows_miss += group_size[k];
++            missing.push_back(block_idx);
+         }
+     }
+ 
+@@ -299,11 +330,11 @@ bool ple_store_fetch(ple_store * s, const int32_t * rows, int64_t n,
+         }
+     }
+ 
+-    // pass 3: gather with read-through (re-loads evicted blocks on demand)
+-    for (int64_t i = 0; i < n; i++) {
+-        const int64_t row = rows[i];
+-        const int64_t block_idx = row / (int64_t) s->block_rows;
+-        const uint64_t in_block = (uint64_t) (row % (int64_t) s->block_rows);
++    // pass 3 (v2#5): per DISTINCT block, read-through then dequant the whole
++    // group under the shard lock — eviction cannot free the block while the
++    // lock is held, and with single-flight there is no real contention.
++    for (size_t k = 0; k < blocks.size(); k++) {
++        const int64_t block_idx = blocks[k];
+         if (!ensure_cached(s, block_idx, err, errlen)) {
+             return false;
+         }
+@@ -317,8 +348,12 @@ bool ple_store_fetch(ple_store * s, const int32_t * rows, int64_t n,
+             snprintf(err, errlen, "ple_store: block %lld missing after ensure_cached", (long long) block_idx);
+             return false;
+         }
+-        const uint8_t * row_bytes = it->second.second.data.data() + in_block * s->row_bytes;
+-        dequant_row_q5_1(row_bytes, dst_host + i * dst_stride_elems, s->head_dim);
++        const uint8_t * base = it->second.second.data.data();
++        for (uint32_t j = start[k]; j < start[k + 1]; j++) {
++            const int64_t i = row_idx[j];
++            const uint64_t in_block = (uint64_t) (rows[i] % (int64_t) s->block_rows);
++            dequant_row_q5_1(base + in_block * s->row_bytes, dst_host + i * dst_stride_elems, s->head_dim);
++        }
+     }
+ 
+     {
+-- 
+2.53.0
+

@@ -1,0 +1,35 @@
+From e8aa8a6fe90fac8d2c92635a2cde08a533249075 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 31 Aug 2026 13:26:53 +0200
+Subject: [PATCH] t25: subtract the externalized PLE tensor from the loader
+ progress total
+
+M1 from the Chunk 2 review: with --ple-disk the tensor is never created
+but size_data still counted it, so size_done >= size_data never fired and
+the final progress_callback(1.0f) plus the mmap unmap tail were skipped.
+Same accounting as the unused-tensor skip in create_tensor.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/models/qwen4exp.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 8dac1adbf..b27f71651 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -145,6 +145,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+             if (ple_store_handle == nullptr) {
+                 throw std::runtime_error(err); // loader idiom (loader.cpp:632): clean load failure the server can report
+             }
++            // T25: the tensor is externalized and will never be loaded, so keep its
++            // bytes out of the progress total (same accounting as the unused-tensor
++            // skip in llama_model_loader::create_tensor), or size_done never reaches
++            // size_data and the final progress_callback(1.0f)/unmap tail is skipped.
++            ml.size_data -= ggml_nbytes(ple_w->tensor);
+             const double row_bytes = hparams.ple_head_dim / 32.0 * 24.0; // Q5_1: 24 B per 32 elements
+             LLAMA_LOG_INFO("%s: PLE table disk-resident: %.2f GiB externalized (Q5_1, %lld rows), cache %.2f GiB\n",
+                     __func__, ple_rows * row_bytes / (1024.0 * 1024.0 * 1024.0), (long long) ple_rows,
+-- 
+2.53.0
+

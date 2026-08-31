@@ -81,6 +81,7 @@ struct llama_model_loader {
     bool no_alloc;
 
     llama_files files;
+    std::vector<std::string> file_paths; // T25: paths of the source GGUFs (llama_file hides them)
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -169,6 +170,9 @@ struct llama_model_loader {
     enum llm_arch get_arch() const;
 
     const llama_tensor_weight * get_weight(const char * name) const;
+
+    // T25: path of source file idx (throws for the FILE* variant, which has no path)
+    const std::string & file_path(uint16_t idx) const;
 
     const llama_tensor_weight & require_weight(const char * name) const;
 

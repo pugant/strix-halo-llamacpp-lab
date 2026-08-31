@@ -1,0 +1,224 @@
+// T25 informational gate: measure the numerical divergence of ggml_get_rows
+// on a Q5_1 PLE table between the CPU backend and the first available GPU
+// backend (Vulkan in production). The OFF mode of --ple-disk gathers the
+// rows ON GPU, so if the Task 11 char-identical A/B fails this utility
+// tells a priori whether the cause is ulp-only (spec §7.2 fallback) or
+// something else. This test NEVER fails on a diff: it only prints
+//   test-ple-dequant-parity: max_abs_diff=%g rows_differing=%d/%d
+// A nonzero exit is reserved for setup failures (no fixture, no CPU backend).
+//
+// Zero-GPU hosts: prints SKIP and exits 0 (the run gate of chunks 1-2).
+// Backend wiring (buffer allocation + graph compute + copy back) follows
+// tests/test-backend-ops.cpp (eval() around :1290, run around :1495).
+
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-cpp.h"
+
+#include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <random>
+#include <string>
+#include <vector>
+
+#include <unistd.h>
+
+static const int64_t HEAD_DIM = 160; // ple_head_dim (verified, plan "Numeri fissi")
+static const int64_t N_ROWS   = 256;
+
+static std::string g_tmp_path;
+
+// unlink the fixture from every exit path
+static struct fixture_cleanup_t {
+    ~fixture_cleanup_t() {
+        if (!g_tmp_path.empty()) {
+            unlink(g_tmp_path.c_str());
+        }
+    }
+} g_fixture_cleanup;
+
+// build the synthetic table, quantize to Q5_1, write [pad][table] to file,
+// then read the table back from the file so the gathered bytes are exactly
+// the ones a disk-resident store would serve (same approach as test-ple-store)
+static std::vector<uint8_t> g_quant;
+
+static bool build_fixture(uint64_t pad_bytes) {
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+
+    const size_t row_bytes = HEAD_DIM / 32 * 24; // 5 x Q5_1 block = 120 B
+    g_quant.resize(N_ROWS * row_bytes);
+
+    std::vector<float> row(HEAD_DIM);
+    for (int64_t r = 0; r < N_ROWS; r++) {
+        for (auto & v : row) v = dist(rng);
+        float * src = row.data();
+        // nrows = 1: ggml_quantize_chunk quantizes nrows * n_per_row floats
+        const size_t nb = ggml_quantize_chunk(GGML_TYPE_Q5_1, src, g_quant.data() + r * row_bytes,
+                                              0, 1, HEAD_DIM, nullptr);
+        if (nb != row_bytes) {
+            return false;
+        }
+    }
+
+    char tmpl[] = "/tmp/t25-ple-parity-XXXXXX";
+    const int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        return false;
+    }
+    g_tmp_path = tmpl;
+
+    bool ok = true;
+    std::vector<uint8_t> pad(pad_bytes, 0xAB);
+    ok = ok && write(fd, pad.data(), pad.size()) == (ssize_t) pad.size();
+    ok = ok && write(fd, g_quant.data(), g_quant.size()) == (ssize_t) g_quant.size();
+    close(fd);
+    if (!ok) {
+        return false;
+    }
+
+    // read the table back through the pad offset
+    FILE * f = fopen(g_tmp_path.c_str(), "rb");
+    if (!f || fseek(f, (long) pad_bytes, SEEK_SET) != 0) {
+        if (f) fclose(f);
+        return false;
+    }
+    std::vector<uint8_t> from_disk(g_quant.size());
+    ok = fread(from_disk.data(), 1, from_disk.size(), f) == from_disk.size();
+    fclose(f);
+    if (!ok || memcmp(from_disk.data(), g_quant.data(), g_quant.size()) != 0) {
+        return false;
+    }
+    return true;
+}
+
+enum run_result_t { RUN_OK, RUN_UNSUPPORTED, RUN_ERROR };
+
+// gather `rows` from the Q5_1 table on `backend`, copy the f32 result back
+// to host. Tensors live in a backend-owned buffer (ggml_backend_alloc_ctx_
+// tensors), inputs go up via ggml_backend_tensor_set, the result comes back
+// via ggml_backend_tensor_get (pattern of test-backend-ops.cpp eval()).
+static run_result_t run_get_rows(ggml_backend_t backend, const std::vector<int32_t> & rows,
+                                 std::vector<float> & out) {
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 16 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(ip));
+    if (!ctx) {
+        return RUN_ERROR;
+    }
+
+    ggml_tensor * table = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q5_1, HEAD_DIM, N_ROWS);
+    ggml_tensor * rows_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t) rows.size());
+    ggml_tensor * gather = ggml_get_rows(ctx.get(), table, rows_t);
+    assert(gather->type == GGML_TYPE_F32);
+
+    // does the backend implement every op of this graph? (test-backend-ops.cpp:1320)
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+        if (!ggml_backend_supports_op(backend, t)) {
+            return RUN_UNSUPPORTED;
+        }
+    }
+    if (!ggml_backend_supports_op(backend, gather)) {
+        return RUN_UNSUPPORTED;
+    }
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (buf == nullptr) {
+        return RUN_ERROR;
+    }
+
+    ggml_backend_tensor_set(table, g_quant.data(), 0, g_quant.size());
+    ggml_backend_tensor_set(rows_t, rows.data(), 0, rows.size() * sizeof(int32_t));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, gather);
+
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "test-ple-dequant-parity: graph compute failed on %s: %s\n",
+                ggml_backend_name(backend), ggml_status_to_string(status));
+        return RUN_ERROR;
+    }
+
+    out.resize((size_t) rows.size() * HEAD_DIM);
+    ggml_backend_tensor_get(gather, out.data(), 0, out.size() * sizeof(float));
+    return RUN_OK;
+}
+
+int main() {
+    if (!build_fixture(4096)) {
+        fprintf(stderr, "test-ple-dequant-parity: FAIL fixture setup\n");
+        return 1;
+    }
+
+    // representative row set: boundaries, spread, duplicates
+    const std::vector<int32_t> rows = {0, 1, 37, 160, 255, 160, 42};
+
+    // --- CPU reference run ---
+    ggml_backend_ptr cpu(ggml_backend_cpu_init());
+    if (cpu == nullptr) {
+        fprintf(stderr, "test-ple-dequant-parity: FAIL cpu backend init\n");
+        return 1;
+    }
+    std::vector<float> out_cpu;
+    if (run_get_rows(cpu.get(), rows, out_cpu) != RUN_OK) {
+        fprintf(stderr, "test-ple-dequant-parity: FAIL cpu run\n");
+        return 1;
+    }
+
+    // --- GPU run (first available device) ---
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (dev == nullptr) {
+        printf("test-ple-dequant-parity: SKIP no GPU device\n");
+        return 0;
+    }
+
+    ggml_backend_ptr gpu(ggml_backend_dev_init(dev, nullptr));
+    if (gpu == nullptr) {
+        printf("test-ple-dequant-parity: SKIP GPU device '%s' failed to init\n", ggml_backend_dev_name(dev));
+        return 0;
+    }
+
+    printf("test-ple-dequant-parity: gpu=%s (%s)\n",
+           ggml_backend_name(gpu.get()), ggml_backend_dev_description(dev));
+
+    std::vector<float> out_gpu;
+    switch (run_get_rows(gpu.get(), rows, out_gpu)) {
+        case RUN_UNSUPPORTED:
+            printf("test-ple-dequant-parity: SKIP %s does not support get_rows on Q5_1\n",
+                   ggml_backend_name(gpu.get()));
+            return 0;
+        case RUN_ERROR:
+            // a graph/compute failure on a device that claims support is a
+            // setup failure, not a numerical divergence
+            fprintf(stderr, "test-ple-dequant-parity: FAIL gpu run\n");
+            return 1;
+        case RUN_OK:
+            break;
+    }
+
+    // --- informational comparison: never a hard failure ---
+    double max_abs_diff = 0.0;
+    int    rows_differing = 0;
+    for (size_t r = 0; r < rows.size(); r++) {
+        const float * a = out_cpu.data() + r * HEAD_DIM;
+        const float * b = out_gpu.data() + r * HEAD_DIM;
+        if (memcmp(a, b, HEAD_DIM * sizeof(float)) != 0) {
+            rows_differing++;
+        }
+        for (int64_t i = 0; i < HEAD_DIM; i++) {
+            max_abs_diff = std::max(max_abs_diff, (double) std::fabs((double) a[i] - (double) b[i]));
+        }
+    }
+
+    printf("test-ple-dequant-parity: max_abs_diff=%g rows_differing=%d/%d\n",
+           max_abs_diff, rows_differing, (int) rows.size());
+    return 0;
+}

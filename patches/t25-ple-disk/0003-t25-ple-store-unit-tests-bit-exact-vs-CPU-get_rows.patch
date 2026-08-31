@@ -1,0 +1,233 @@
+From 612e24ad11b29de7242950ad35f793cce6d5f576 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 31 Aug 2026 12:43:35 +0200
+Subject: [PATCH] t25: ple-store unit tests (bit-exact vs CPU get_rows)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tests/CMakeLists.txt     |   1 +
+ tests/test-ple-store.cpp | 200 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 201 insertions(+)
+ create mode 100644 tests/test-ple-store.cpp
+
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index a3b7a83ca..c50dce3b6 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -241,6 +241,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
+   llama_build_and_test(test-opt.cpp)
+ endif()
+ llama_build_and_test(test-gguf.cpp)
++llama_build_and_test(test-ple-store.cpp)
+ llama_build_and_test(test-backend-ops.cpp)
+ 
+ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
+diff --git a/tests/test-ple-store.cpp b/tests/test-ple-store.cpp
+new file mode 100644
+index 000000000..6a9a191c8
+--- /dev/null
++++ b/tests/test-ple-store.cpp
+@@ -0,0 +1,200 @@
++// Unit tests for the T25 PLE disk store. Zero GPU, zero llama runtime:
++// a synthetic Q5_1 table is quantized in-process, written to a temp file
++// with a nonzero leading offset, and fetched through ple_store. The
++// reference for bit-exactness is CPU ggml_get_rows on the same data.
++
++#include "../src/llama-ple-store.h"
++
++#include "ggml.h"
++#include "ggml-cpu.h" // ggml_graph_compute_with_ctx (precedent: tests/test-col2im-1d.cpp)
++
++#include <cassert>
++#include <cmath>
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <cstdlib>
++#include <random>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <unistd.h>
++
++static const int64_t HEAD_DIM = 160;
++
++static std::string g_tmp_path;
++
++// build the synthetic table, quantize to Q5_1, write [pad][table] to file
++static std::vector<uint8_t> g_quant; // table bytes as in the file
++
++static void build_fixture(int64_t n_rows, uint64_t pad_bytes, uint64_t & out_offset) {
++    std::mt19937 rng(1234);
++    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
++
++    const size_t row_bytes = HEAD_DIM / 32 * 24;
++    g_quant.resize(n_rows * row_bytes);
++
++    std::vector<float> row(HEAD_DIM);
++    for (int64_t r = 0; r < n_rows; r++) {
++        for (auto & v : row) v = dist(rng);
++        float * src = row.data();
++        // nrows = 1: ggml_quantize_chunk quantizes nrows * n_per_row floats (signature ggml.h:2855)
++        const size_t nb = ggml_quantize_chunk(GGML_TYPE_Q5_1, src, g_quant.data() + r * row_bytes,
++                                              0, 1, HEAD_DIM, nullptr);
++        (void) nb;
++        assert(nb == row_bytes);
++    }
++
++    char tmpl[] = "/tmp/t25-ple-store-XXXXXX";
++    const int fd = mkstemp(tmpl);
++    assert(fd >= 0);
++    g_tmp_path = tmpl;
++
++    std::vector<uint8_t> pad(pad_bytes, 0xAB);
++    ssize_t rc = write(fd, pad.data(), pad.size());  assert(rc == (ssize_t) pad.size());
++    rc = write(fd, g_quant.data(), g_quant.size());  assert(rc == (ssize_t) g_quant.size());
++    close(fd);
++
++    out_offset = pad_bytes;
++}
++
++// reference: CPU ggml_get_rows on a Q5_1 tensor holding g_quant
++static void reference_get_rows(const std::vector<int32_t> & rows, std::vector<float> & out) {
++    const int64_t n_rows = (int64_t) (g_quant.size() / (HEAD_DIM / 32 * 24));
++
++    ggml_init_params ip = {/*.mem_size   =*/ 96u << 20, /*.mem_buffer =*/ nullptr, /*.no_alloc   =*/ false};
++    ggml_context * ctx = ggml_init(ip);
++    assert(ctx);
++
++    ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_Q5_1, HEAD_DIM, n_rows);
++    memcpy(table->data, g_quant.data(), g_quant.size()); // CPU ctx: data lives in the pool
++
++    ggml_tensor * rows_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) rows.size());
++    memcpy(rows_t->data, rows.data(), rows.size() * sizeof(int32_t));
++
++    ggml_tensor * gather = ggml_get_rows(ctx, table, rows_t);
++
++    ggml_cgraph * graph = ggml_new_graph(ctx);
++    ggml_build_forward_expand(graph, gather);
++    ggml_graph_compute_with_ctx(ctx, graph, /*n_threads=*/ 4);
++
++    out.resize(rows.size() * HEAD_DIM);
++    memcpy(out.data(), gather->data, out.size() * sizeof(float));
++
++    ggml_free(ctx);
++}
++
++static int g_failures = 0;
++
++#define CHECK(cond, msg) do { \
++    if (!(cond)) { printf("FAIL: %s\n", msg); g_failures++; } \
++} while (0)
++
++int main() {
++    // 70 full blocks + partial final block 70 (rows 8960-8969, 1200 B on disk —
++    // fixture generality: the production table divides evenly). Shard 0 owns
++    // blocks {0,16,32,48,64}.
++    const int64_t N_ROWS = 128 * 70 + 10;
++    uint64_t offset = 0;
++    build_fixture(N_ROWS, 4096, offset);
++
++    // budget = 16 shards x 2 blocks x 15360 B = 491520 B (2 blocks per shard)
++    const uint64_t BUDGET = 16ull * 2 * 15360;
++    char err[512];
++    ple_store * s = ple_store_open(g_tmp_path.c_str(), offset, GGML_TYPE_Q5_1,
++                                   HEAD_DIM, N_ROWS, BUDGET, err, sizeof(err));
++    CHECK(s != nullptr, "open with 2-blocks-per-shard budget");
++
++    // --- bit-exact vs CPU ggml_get_rows, order preserved, duplicates ok;
++    //     row 8965 exercises the partial final block read path ---
++    std::vector<int32_t> rows = {0, 1, 160, 511, 511, 3, 128, 300, 8965};
++    std::vector<float> ref, got(rows.size() * HEAD_DIM);
++    reference_get_rows(rows, ref);
++    CHECK(ple_store_fetch(s, rows.data(), (int64_t) rows.size(), got.data(), HEAD_DIM, err, sizeof(err)), "fetch ok");
++    CHECK(memcmp(ref.data(), got.data(), ref.size() * sizeof(float)) == 0, "bit-exact vs CPU get_rows (dup + order + partial block)");
++    {
++        // dedup pin: rows span blocks {0,1,2,3,70} exactly (block 70 -> shard 6)
++        auto st = ple_store_get_stats(s);
++        CHECK(st.blocks_read == 5, "5 distinct blocks loaded on first fetch (dedup incl. partial block)");
++    }
++
++    // --- stats: rows already cached count as hits on the second fetch ---
++    auto st0 = ple_store_get_stats(s);
++    CHECK(ple_store_fetch(s, rows.data(), (int64_t) rows.size(), got.data(), HEAD_DIM, err, sizeof(err)), "second fetch ok");
++    auto st1 = ple_store_get_stats(s);
++    CHECK(st1.hits - st0.hits == (uint64_t) rows.size(), "all rows hit on second fetch");
++    CHECK(st1.misses == st0.misses, "no new misses on second fetch");
++
++    // --- eviction / read-through: all 5 blocks below map to shard 0
++    //     (block % 16 == 0), which holds only 2 blocks: the working set (5)
++    //     exceeds shard capacity, so pass-3 read-through MUST reload evicted
++    //     blocks instead of failing. Deterministic trace (single-flight,
++    //     snapshot stats in pass 1):
++    //       rep1: cache shard0={0}          -> miss 4 hit 1; reads 4 (prefetch) + 5 (re-read) = 9
++    //       rep2: cache shard0={64,48}      -> miss 3 hit 2; reads 3 + 5 = 8
++    //       rep3: same state as rep2        -> miss 3 hit 2; reads 3 + 5 = 8
++    //     Totals over 3 reps: blocks_read +25, misses +10, hits +5.
++    std::vector<int32_t> spread = {0, 2048, 4096, 6144, 8192}; // block starts of 0,16,32,48,64
++    std::vector<float> tmp(spread.size() * HEAD_DIM);
++    auto st2 = ple_store_get_stats(s);
++    for (int rep = 0; rep < 3; rep++) {
++        CHECK(ple_store_fetch(s, spread.data(), (int64_t) spread.size(), tmp.data(), HEAD_DIM, err, sizeof(err)), "spread fetch (read-through survives capacity thrash)");
++    }
++    auto st3 = ple_store_get_stats(s);
++    CHECK(st3.misses - st2.misses == 10, "row-miss accounting under thrash: 4+3+3");
++    CHECK(st3.hits   - st2.hits   == 5,  "row-hit accounting under thrash: 1+2+2");
++    CHECK(st3.blocks_read - st2.blocks_read == 25, "block reads under thrash: 9+8+8 (mismatch = investigate the algorithm, do not retune the number)");
++
++    // --- out of range -> explicit failure ---
++    std::vector<int32_t> bad = {(int32_t) N_ROWS};
++    std::vector<float> tmp2(HEAD_DIM);
++    CHECK(!ple_store_fetch(s, bad.data(), 1, tmp2.data(), HEAD_DIM, err, sizeof(err)), "out-of-range rejected");
++    CHECK(strlen(err) > 0, "error message set");
++
++    // --- truncated file -> explicit failure on the SIZE check (budget is valid here,
++    //     so the failure can only come from the fstat size check, as the message claims) ---
++    {
++        std::string short_path = g_tmp_path + ".short";
++        const size_t cut = offset + 2 * 15360 + 100; // stops into block 2
++        FILE * src = fopen(g_tmp_path.c_str(), "rb");
++        FILE * dst = fopen(short_path.c_str(), "wb");
++        assert(src && dst);
++        std::vector<uint8_t> buf(cut);
++        CHECK(fread (buf.data(), 1, cut, src) == cut, "read fixture prefix");
++        CHECK(fwrite(buf.data(), 1, cut, dst) == cut, "write short fixture");
++        fclose(src); fclose(dst);
++
++        char err2[512];
++        ple_store * s2 = ple_store_open(short_path.c_str(), offset, GGML_TYPE_Q5_1,
++                                        HEAD_DIM, N_ROWS, BUDGET, err2, sizeof(err2));
++        CHECK(s2 == nullptr, "open on truncated file fails (size check)");
++    }
++
++    // --- concurrency: two threads fetching the same and distinct rows ---
++    {
++        std::thread t1([&] { std::vector<float> o(rows.size() * HEAD_DIM);
++                             ple_store_fetch(s, rows.data(), (int64_t) rows.size(), o.data(), HEAD_DIM, err, sizeof(err)); });
++        std::thread t2([&] { std::vector<int32_t> r2 = {64, 192, 320, 448};
++                             std::vector<float> o(r2.size() * HEAD_DIM);
++                             ple_store_fetch(s, r2.data(), (int64_t) r2.size(), o.data(), HEAD_DIM, err, sizeof(err)); });
++        t1.join(); t2.join();
++        CHECK(true, "concurrent fetches did not deadlock/crash");
++    }
++
++    // --- final bit-exact sanity after all the churn ---
++    std::fill(got.begin(), got.end(), 0.f);
++    CHECK(ple_store_fetch(s, rows.data(), (int64_t) rows.size(), got.data(), HEAD_DIM, err, sizeof(err)), "final fetch ok");
++    CHECK(memcmp(ref.data(), got.data(), ref.size() * sizeof(float)) == 0, "bit-exact after eviction churn");
++
++    ple_store_close(s);
++    unlink(g_tmp_path.c_str());
++    unlink((g_tmp_path + ".short").c_str());
++
++    if (g_failures == 0) {
++        printf("test-ple-store: ALL PASS\n");
++        return 0;
++    }
++    printf("test-ple-store: %d FAILURES\n", g_failures);
++    return 1;
++}
+-- 
+2.53.0
+

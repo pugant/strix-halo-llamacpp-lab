@@ -1,0 +1,150 @@
+From e947dcca508b05a18f148faf048d75600c4ea4cf Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 31 Aug 2026 13:00:47 +0200
+Subject: [PATCH] t25: qwen4exp load skips the PLE table when --ple-disk (store
+ opens on the GGUF)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/llama-model-loader.cpp |  8 ++++++++
+ src/llama-model-loader.h   |  4 ++++
+ src/llama-model.cpp        |  2 +-
+ src/models/models.h        | 11 +++++++++++
+ src/models/qwen4exp.cpp    | 24 ++++++++++++++++++++++--
+ 5 files changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 9830b9c53..afebbc088 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -636,6 +636,7 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
+         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
++        file_paths.push_back(fname); // T25: mirror of `files` (direct-io reopen below reuses the same path)
+         contexts.emplace_back(ctx);
+ 
+         if (use_mmap && use_direct_io) {
+@@ -718,6 +719,7 @@ llama_model_loader::llama_model_loader(
+                 }
+ 
+                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
++                file_paths.push_back(fname_split); // T25: mirror of `files` for the split shards
+                 contexts.emplace_back(ctx);
+ 
+                 // Save tensors data offset info of the shard.
+@@ -925,6 +927,12 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
+     return nullptr;
+ }
+ 
++const std::string & llama_model_loader::file_path(uint16_t idx) const {
++    // T25: populated at every constructor site that knows a path; the FILE*
++    // variant registers none, so .at() throws there if ever used
++    return file_paths.at(idx);
++}
++
+ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weight(const char * name) const {
+     const llama_tensor_weight * weight = get_weight(name);
+     if (!weight) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index c476026d3..9acf2ba59 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -81,6 +81,7 @@ struct llama_model_loader {
+     bool no_alloc;
+ 
+     llama_files files;
++    std::vector<std::string> file_paths; // T25: paths of the source GGUFs (llama_file hides them)
+     llama_ftype ftype;
+     llama_fver  fver;
+ 
+@@ -170,6 +171,9 @@ struct llama_model_loader {
+ 
+     const llama_tensor_weight * get_weight(const char * name) const;
+ 
++    // T25: path of source file idx (throws for the FILE* variant, which has no path)
++    const std::string & file_path(uint16_t idx) const;
++
+     const llama_tensor_weight & require_weight(const char * name) const;
+ 
+     struct ggml_tensor * get_tensor_meta(const char * name) const;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index a98e65436..7db38f640 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1465,7 +1465,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
+-    ml.done_getting_tensors();
++    ml.done_getting_tensors(params.ple_disk); // T25: partial when the PLE table is externalized
+ 
+     // populate tensors_by_name
+     for (auto & [_, ctx_ptr] : ml.ctx_map) {
+diff --git a/src/models/models.h b/src/models/models.h
+index a03e07705..4fd3f5e3b 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -3,6 +3,7 @@
+ #include "llama-model.h"
+ #include "llama-graph.h"
+ #include "llama-model-loader.h"
++#include "llama-ple-store.h"
+ 
+ // note: almost all graphs require at least sqrtf, so include cmath globally
+ #include <cmath>
+@@ -1946,6 +1947,16 @@ struct llama_model_qwen4exp : public llama_model_base {
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
+ 
++    // T25: disk-resident PLE n-gram table (owned here; null unless --ple-disk)
++    ple_store * ple_store_handle = nullptr;
++
++    ~llama_model_qwen4exp() override {
++        if (ple_store_handle != nullptr) {
++            ple_store_close(ple_store_handle);
++            ple_store_handle = nullptr;
++        }
++    }
++
+     struct graph : public llm_build_delta_net_base {
+         graph(const llama_model & model, const llm_graph_params & params);
+     protected:
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 4f0209773..885559ffe 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -131,8 +131,28 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+         const auto * ple_w = ml.get_weight(ple_name.c_str());
+         GGML_ASSERT(ple_w != nullptr && "qwen4exp is missing the PLE n-gram table");
+         const int64_t ple_rows = ple_w->tensor->ne[1];
+-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+-                                           { hparams.ple_head_dim, ple_rows }, 0);
++        if (params.ple_disk) {
++            // T25: the table stays on disk; the store serves rows on demand.
++            // The tensor is deliberately NOT created: the loader skips it
++            // (done_getting_tensors is called with partial=true for this arch).
++            GGML_ASSERT(ple_w->tensor->type == GGML_TYPE_Q5_1 && "T25 v1 supports a Q5_1 PLE table only");
++            char err[512];
++            ple_store_handle = ple_store_open(ml.file_path(ple_w->idx).c_str(), ple_w->offs,
++                                              (enum ggml_type) ple_w->tensor->type,
++                                              hparams.ple_head_dim, ple_rows,
++                                              (uint64_t) params.ple_cache_mib * 1024ull * 1024ull,
++                                              err, sizeof(err));
++            if (ple_store_handle == nullptr) {
++                throw std::runtime_error(err); // loader idiom (loader.cpp:632): clean load failure the server can report
++            }
++            const double row_bytes = hparams.ple_head_dim / 32.0 * 24.0; // Q5_1: 24 B per 32 elements
++            LLAMA_LOG_INFO("%s: PLE table disk-resident: %.2f GiB externalized (Q5_1, %lld rows), cache %.2f GiB\n",
++                    __func__, ple_rows * row_bytes / (1024.0 * 1024.0 * 1024.0), (long long) ple_rows,
++                    params.ple_cache_mib / 1024.0);
++        } else {
++            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
++                                               { hparams.ple_head_dim, ple_rows }, 0);
++        }
+     }
+ 
+     for (int il = 0; il < n_layer; ++il) {
+-- 
+2.53.0
+

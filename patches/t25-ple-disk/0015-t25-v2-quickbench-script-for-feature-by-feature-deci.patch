@@ -1,0 +1,98 @@
+From bc85fcb1deb87fc9df3d842ec7ab0a93b8e7b83b Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 31 Aug 2026 16:01:47 +0200
+Subject: [PATCH] t25 v2: quickbench script for feature-by-feature decisions
+ (server ON, prosa/det, ple_* metrics)
+
+Kernel-warm/fresh matrix over virgin prompt sets; BIN param to A/B binaries
+from the incremental build-vk without image rebuilds.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ scripts/t25-v2-quickbench.sh | 74 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 74 insertions(+)
+ create mode 100644 scripts/t25-v2-quickbench.sh
+
+diff --git a/scripts/t25-v2-quickbench.sh b/scripts/t25-v2-quickbench.sh
+new file mode 100644
+index 000000000..256cce5bf
+--- /dev/null
++++ b/scripts/t25-v2-quickbench.sh
+@@ -0,0 +1,74 @@
++#!/usr/bin/env bash
++# T25 v2 — breve bench (il giusto) per decidere feature-per-feature.
++# Server ON (flag produzione) dal build incrementale build-vk nel container
++# builder; richieste IDENTICHE alla baseline v1 del 31/08:
++#   prosa fredda 400 / STESSA prosa ripetuta / det numeri 400
++# + snapshot delta delle metriche ple_* (/metrics, richiede --metrics).
++# Baseline v1 (t25-vk, cache 4096): prosa 17,0 (miss 86,8%, fetch 9,13 s) /
++# prosa-rep 18,8 (35,6%) / det 27,9 (56%). Braccio OFF: prosa ~29,7 / det ~54.
++# Uso: scripts/t25-v2-quickbench.sh [cache_mib] [tag]
++set -euo pipefail
++WS=/home/pugant/workspaces/rocmfpx-strix-lean
++CLONE=$WS/ROCmFPX
++LOG=$WS/logs/t25/v2-quickbench
++CACHE_MIB="${1:-4096}"
++TAG="${2:-run}"
++BIN="${3:-/ws/build-vk/bin/llama-server}"  # path del binario DENTRO il container
++PORT=8193
++mkdir -p "$LOG"
++
++if ss -tln 2>/dev/null | grep -q ":${PORT}\b"; then echo "PORTA ${PORT} OCCUPATA — abort"; exit 1; fi
++
++NAME="t25-v2-qb"
++docker rm -f "$NAME" >/dev/null 2>&1 || true
++docker run -d --name "$NAME" --network host --device /dev/dri --group-add render \
++    -v "$CLONE":/ws -v /home/pugant/llmodels:/llm:ro -v /tmp:/hosttmp -w /ws -e LD_LIBRARY_PATH=/ws/build-vk/bin \
++    --entrypoint "$BIN" docker-llm-service:t25-builder \
++    -m /llm/models/QWEN3.8/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN.gguf \
++    -md /llm/models/QWEN3.8/Qwen3.8-Flash-Next-MTP-Q8_0.gguf --spec-type draft-mtp --spec-draft-ngl all \
++    --spec-draft-n-max 6 --spec-draft-p-min 0.75 --spec-draft-p-split 0.10 \
++    -ngl 999 -fa on --jinja -c 8192 -fit off --no-mmap --ple-disk --ple-cache-mib "${CACHE_MIB}" \
++    --host 127.0.0.1 --port "${PORT}" --metrics > /dev/null
++if ! docker inspect -f '{{.State.Running}}' "$NAME" | grep -q true; then
++    echo "container non partito"; docker logs "$NAME" 2>&1 | tail -5; exit 1
++fi
++
++T0=$SECONDS
++until [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/health" 2>/dev/null)" = 200 ] || [ $((SECONDS-T0)) -ge 1500 ]; do
++    sleep 5
++done
++if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/health" 2>/dev/null)" != 200 ]; then
++    echo "HEALTH FAIL"; docker logs "$NAME" 2>&1 | tail -20; docker rm -f "$NAME" >/dev/null; exit 1
++fi
++echo "health ok in $((SECONDS-T0))s (cache ${CACHE_MIB} MiB)"
++
++PROME='llamacpp:ple_hits_total|llamacpp:ple_misses_total|llamacpp:ple_blocks_read_total|llamacpp:ple_fetch_us_total|llamacpp:ple_fetches_total'
++snap () { curl -s "http://127.0.0.1:${PORT}/metrics" | grep -E "^($PROME)" | awk '{v=$2; printf "%s ", v}'; echo; }
++
++req () { curl -s "http://127.0.0.1:${PORT}/v1/chat/completions" -H 'Content-Type: application/json' \
++    -d "{\"model\":\"q\",\"max_tokens\":400,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"$1\"}]}" |
++    python3 -c "import json,sys; print(round(json.load(sys.stdin)['timings']['predicted_per_second'],1))"; }
++
++OUT="$LOG/${TAG}.md"
++{
++echo "# v2 quickbench tag=${TAG} cache=${CACHE_MIB} MiB ($(date -Is))"
++echo
++echo "| fase | t/s | Δhits | Δmiss | Δblocks | Δfetch_us |"
++echo "|---|---|---|---|---|---|"
++for fase in "prosa1:Scrivi una lettera immaginaria da un viaggiatore settecentesco a un amico rimasto in patria." \
++            "prosa2:Scrivi una lettera immaginaria da un viaggiatore settecentesco a un amico rimasto in patria." \
++            "det:Scrivi in ordine le lettere dell alfabeto italiano, una per riga."; do
++    name="${fase%%:*}"; prompt="${fase#*:}"
++    A=$(snap); TPS=$(req "$prompt"); B=$(snap)
++    python3 - "$name" "$TPS" "$A" "$B" <<'EOF'
++import sys
++name, tps, a, b = sys.argv[1], sys.argv[2], sys.argv[3].split(), sys.argv[4].split()
++d = [int(float(y)) - int(float(x)) for x, y in zip(a, b)]
++print(f"| {name} | {tps} | {d[0]} | {d[1]} | {d[2]} | {d[3]} |")
++EOF
++done
++} | tee "$OUT"
++
++docker logs "$NAME" > "$LOG/${TAG}-server.log" 2>&1 || true
++docker rm -f "$NAME" >/dev/null
++echo "salvato: $OUT"
+-- 
+2.53.0
+

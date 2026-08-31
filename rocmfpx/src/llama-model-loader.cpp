@@ -636,6 +636,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.push_back(fname); // T25: mirror of `files` (direct-io reopen below reuses the same path)
         contexts.emplace_back(ctx);
 
         if (use_mmap && use_direct_io) {
@@ -718,6 +719,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.push_back(fname_split); // T25: mirror of `files` for the split shards
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -923,6 +925,12 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
     }
 
     return nullptr;
+}
+
+const std::string & llama_model_loader::file_path(uint16_t idx) const {
+    // T25: populated at every constructor site that knows a path; the FILE*
+    // variant registers none, so .at() throws there if ever used
+    return file_paths.at(idx);
 }
 
 const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weight(const char * name) const {

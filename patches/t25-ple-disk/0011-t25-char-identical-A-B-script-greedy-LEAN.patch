@@ -1,0 +1,150 @@
+From 153c3dafca69cbf9022d84d003351fa77aa20efc Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 31 Aug 2026 14:55:06 +0200
+Subject: [PATCH] t25: char-identical A/B script (greedy, LEAN)
+
+Adattamenti scoperti sul campo (documentati nello script): il cli-fork non esce
+dopo la risposta (loop prompt su stdin-EOF) e scrive spinner+timing su stdout:
+attesa su marker di slot-release nel log, filtro deterministico (frame spinner
+char+backspace, taglio alla riga timing non deterministica) prima del cmp.
+Fusione parsimoniosa: la misura MemAvailable del Task 12 avviene negli stessi
+container del Task 11, al task avviato (load completo).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ scripts/t25-char-identical.sh | 123 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 123 insertions(+)
+ create mode 100644 scripts/t25-char-identical.sh
+
+diff --git a/scripts/t25-char-identical.sh b/scripts/t25-char-identical.sh
+new file mode 100644
+index 000000000..f7eecfa49
+--- /dev/null
++++ b/scripts/t25-char-identical.sh
+@@ -0,0 +1,123 @@
++#!/usr/bin/env bash
++# T25 Task 11.2 + 12.1 + 12.2 — char-identical A/B (--ple-disk ON vs OFF) + RAM gate.
++#
++# Fusione parsimoniosa: la misura MemAvailable del Task 12 avviene NEGLI STESSI
++# container del Task 11 (il piano li vuole "container identici"): si cattura
++# /proc/meminfo host al PRIMO token generato (file stdout bind-mounted non-vuoto
++# → load sicuramente completo, modello interamente residente, generazione appena
++# avviata). Nessun marker di log richiesto per la misura; -lv 3 serve per il
++# marker T25 "PLE table disk-resident" (Task 12.2) e la diagnostica, identico nei
++# due bracci (i log vanno su stderr → stdout resta il solo testo generato).
++#
++# Poll condizionati con CAP (nessuno sleep incondizionato).
++set -euo pipefail
++
++WS=/home/pugant/workspaces/rocmfpx-strix-lean
++LOG=$WS/logs/t25/char-identical
++IMG=docker-llm-service:t25-vk
++LEAN=/llm/models/QWEN3.8/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN.gguf
++CAP_LOAD_S=3600    # CAP poll primo-token (load freddo LEAN ~840 s → margine 4x)
++CAP_EXIT_S=600     # CAP attesa exit dopo il primo token (128 token greedy)
++
++# Prompt IT fisso ~200 token, VERBATIM (lezione falling-sand: mai ri-espandere a runtime)
++PROMPT='La memoria dei calcolatori ha attraversato generazioni molto diverse. Nei primi anni si scrivevano i programmi direttamente in linguaggio macchina, registrando le istruzioni su schede perforate che venivano lette una alla volta. Con il tempo sono arrivati i linguaggi di alto livello, i compilatori e i sistemi operativi, che hanno reso la scrittura del software più simile alla composizione di un testo che alla descrizione di un circuito. Oggi i processori contengono miliardi di transistor e le memorie conservano terabyte di informazioni, ma il principio resta quello degli anni quaranta: una sequenza di istruzioni eseguita da una macchina che legge, calcola e scrive risultati. Chi studia l informatica impara presto che la semplicità delle idee fondamentali sopravvive a ogni rivoluzione tecnologica, e che capire bene i concetti di base serve più di conoscere l ultimo strumento di moda.'
++
++mkdir -p "$LOG"
++
++meminfo_snapshot () {  # $1 = tag
++    { echo "# $1 $(date -Is)"
++      grep -E 'MemTotal|MemAvailable|^Cached|^Swap' /proc/meminfo
++    } >> "$LOG/meminfo.txt"
++}
++
++run_arm () {  # $1 = nome (on|off), resto = flag extra
++    local name=$1; shift
++    local out="$LOG/$name.txt" err="$LOG/$name.err"
++    rm -f "$out" "$err"
++    docker rm -f "t25-ci-$name" >/dev/null 2>&1 || true
++    docker run -d --name "t25-ci-$name" --device /dev/dri --group-add render --network host \
++        -v /home/pugant/llmodels:/llm:ro -v "$LOG":/out -e PROMPT="$PROMPT" "$IMG" \
++        bash -c "llama-cli -m '$LEAN' --no-mmap --temp 0 --top-k 1 -s 42 -n 128 -no-cnv -lv 3 \
++                 -p \"\$PROMPT\" $* > /out/$name.txt 2> /out/$name.err" \
++        >/dev/null
++
++    # poll avvio task nel log (load+warmup+slot completi; lo spinner del cli-fork
++    # scrive su stdout da subito → il "file non vuoto" NON è un marker valido)
++    local t0=$SECONDS
++    until grep -q "launch_slot_.*processing task" "$err" 2>/dev/null; do
++        if [ $((SECONDS - t0)) -ge $CAP_LOAD_S ]; then
++            echo "TIMEOUT($name): nessun task dopo ${CAP_LOAD_S}s — vedi $err"; exit 1
++        fi
++        if [ "$(docker inspect -f '{{.State.Running}}' "t25-ci-$name" 2>/dev/null)" != "true" ]; then
++            echo "EXIT-PRECOCE($name): container uscito prima del task — vedi $err"; exit 1
++        fi
++        sleep 2
++    done
++    meminfo_snapshot "$name"
++
++    # attesa completamento generazione: il cli-fork NON esce dopo la risposta
++    # (loop prompt "> " su stdin-EOF con docker -d) → si attende il marker di
++    # release nello slot log, poi idle, e si forza l'uscita del container.
++    t0=$SECONDS
++    until grep -q "stop processing" "$err" 2>/dev/null; do
++        [ $((SECONDS - t0)) -ge $CAP_EXIT_S ] && { echo "TIMEOUT($name): gen >${CAP_EXIT_S}s — vedi $err"; exit 1; }
++        sleep 2
++    done
++    until grep -q "all slots are idle" "$err" 2>/dev/null; do
++        [ $((SECONDS - t0)) -ge $((CAP_EXIT_S * 2)) ] && break
++        sleep 2
++    done
++    docker rm -f "t25-ci-$name" >/dev/null
++    echo "arm $name: done; $(wc -c < "$out") B stdout (raw), $(wc -c < "$err") B log"
++}
++
++echo "=== baseline meminfo ==="
++meminfo_snapshot "baseline"
++
++run_arm off
++run_arm on --ple-disk --ple-cache-mib 4096
++
++echo "=== gate: cmp char-identical ==="
++# Il cli-fork scrive su stdout i frame dello spinner durante il load (char+\x08,
++# volume dipendente dalla durata del load → NON deterministico tra i bracci):
++# si filtrano i frame prima del confronto. Il testo generato non contiene backspace.
++python3 - "$LOG" <<'EOF'
++import re, sys
++for name in ('on', 'off'):
++    p = f"{sys.argv[1]}/{name}.txt"
++    with open(p, 'rb') as f:
++        d = f.read()
++    d = re.sub(rb'[|/\\-]\x08', b'', d)          # frame spinner (char+backspace)
++    d = d.split(b'\n[ Prompt:')[0]               # timing (non determ.) + loop "> "
++    with open(p + '.clean', 'wb') as f:
++        f.write(d)
++EOF
++if cmp "$LOG/on.txt.clean" "$LOG/off.txt.clean"; then
++    echo "CHAR-IDENTICAL: PASS"
++else
++    echo "CHAR-IDENTICAL: FAIL (divergenza — diramazione: test-ple-dequant-parity nel container)"
++    exit 2
++fi
++
++echo "=== gate: marker T25 nel log ON (Task 12.2) ==="
++grep -n "PLE table disk-resident" "$LOG/on.err" || { echo "MARKER T25 MANCANTE"; exit 3; }
++
++echo "=== RAM gate (Task 12.1): Avail_ON - Avail_OFF >= 32212254720 B ==="
++python3 - "$LOG/meminfo.txt" <<'EOF'
++import sys, re
++vals = {}
++for line in open(sys.argv[1]):
++    m = re.match(r'# (\w+) (.*)', line)
++    if m: cur = m.group(1); vals[cur] = {}
++    else:
++        k, v = line.split(':', 1)
++        if k in ('MemAvailable', 'Cached'):
++            vals[cur][k] = int(v.strip().split()[0]) * 1024
++off, on = vals['off'], vals['on']
++d = on['MemAvailable'] - off['MemAvailable']
++print(f"Avail_OFF = {off['MemAvailable']/2**30:8.2f} GiB  (Cached {off['Cached']/2**30:6.2f} GiB)")
++print(f"Avail_ON  = {on['MemAvailable']/2**30:8.2f} GiB  (Cached {on['Cached']/2**30:6.2f} GiB)")
++print(f"delta     = {d/2**30:8.2f} GiB  (gate >= 30 GiB)")
++sys.exit(0 if d >= 32212254720 else 4)
++EOF
++echo "RAM GATE: PASS"
+-- 
+2.53.0
+

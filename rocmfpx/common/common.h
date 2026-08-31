@@ -696,6 +696,9 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_disk_limit_mib = 8192; // disk prompt-cache limit when cache_disk_path is set
 
+    bool    ple_disk       = false; // T25: keep the qwen4exp PLE n-gram table on disk
+    int32_t ple_cache_mib  = 4096;  // T25: PLE block-cache budget (MiB), requires --ple-disk
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

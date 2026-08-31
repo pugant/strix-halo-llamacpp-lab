@@ -1,0 +1,153 @@
+From bd837f1f8421b3e631e4df87de87609b6c9b0258 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 31 Aug 2026 13:29:00 +0200
+Subject: [PATCH] t25: ple_* server metrics (cache hit/miss, blocks, fetch
+ latency)
+
+Cumulative counters read from the model's PLE store at metrics time and
+exposed as six unconditional counters, following the spec_route_* pattern
+(the consumer takes the delta; reset_bucket does not touch them).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/llama-model.h               |  4 +++
+ src/models/models.h             |  6 ++++
+ tools/server/server-context.cpp | 49 +++++++++++++++++++++++++++++++++
+ tools/server/server-task.h      |  8 ++++++
+ 4 files changed, 67 insertions(+)
+
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 509943d9d..9f451710f 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -5,6 +5,7 @@
+ #include "llama-graph.h"
+ #include "llama-hparams.h"
+ #include "llama-memory.h"
++#include "llama-ple-store.h"
+ #include "llama-vocab.h"
+ 
+ #include <map>
+@@ -735,6 +736,9 @@ struct llama_model {
+     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
+     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+ 
++    // T25: live stats of the disk-resident PLE store; zeroed when disabled
++    virtual ple_store_stats get_ple_stats() const { return {}; }
++
+ protected:
+     llama_model_params params;
+ 
+diff --git a/src/models/models.h b/src/models/models.h
+index 4fd3f5e3b..648c9ba5f 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1950,6 +1950,12 @@ struct llama_model_qwen4exp : public llama_model_base {
+     // T25: disk-resident PLE n-gram table (owned here; null unless --ple-disk)
+     ple_store * ple_store_handle = nullptr;
+ 
++    // T25: cumulative store stats; zeroed without --ple-disk (null-safe ternary:
++    // ple_store_get_stats itself is NOT null-safe)
++    ple_store_stats get_ple_stats() const override {
++        return ple_store_handle ? ple_store_get_stats(ple_store_handle) : ple_store_stats{};
++    }
++
+     ~llama_model_qwen4exp() override {
+         if (ple_store_handle != nullptr) {
+             ple_store_close(ple_store_handle);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 8f809719d..da4f52b5a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -11,6 +11,7 @@
+ #include "diffusion.h"
+ #include "llama.h"
+ #include "../../src/llama-ext.h"
++#include "../../src/llama-model.h" // t25: model_tgt->get_ple_stats() needs the full llama_model
+ #include "log.h"
+ #include "sampling.h"
+ #include "speculative.h"
+@@ -2751,6 +2752,15 @@ private:
+                     res->spec_route_ngram_drafts_total  = metrics.spec_route_ngram_drafts_total;
+                     res->spec_route_model_drafts_total = metrics.spec_route_model_drafts_total;
+ 
++                    // t25: cumulative PLE disk-store stats (read from the model)
++                    const ple_store_stats ple_st = model_tgt->get_ple_stats();
++                    res->ple_hits_total        = ple_st.hits;
++                    res->ple_misses_total      = ple_st.misses;
++                    res->ple_blocks_read_total = ple_st.blocks_read;
++                    res->ple_read_bytes_total  = ple_st.bytes_read;
++                    res->ple_fetch_us_total    = ple_st.fetch_us;
++                    res->ple_fetches_total     = ple_st.fetches;
++
+                     // PI F4 follow-up (29/08): speculative state reset counter
+                     res->spec_state_resets_total = metrics.spec_state_resets_total;
+ 
+@@ -5291,6 +5301,45 @@ void server_routes::init_routes() {
+                 {"value", res_task->spec_route_model_drafts_total},
+             });
+ 
++            // t25: PLE disk-store counters (cumulative since model load; the
++            // consumer takes the delta). Emitted unconditionally so they are
++            // present at 0 from boot even without --ple-disk (see server_metrics)
++            counter_defs.push_back({
++                {"name",  "ple_hits_total"},
++                {"help",  "Number of PLE row lookups served from the RAM cache."},
++                {"value", res_task->ple_hits_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "ple_misses_total"},
++                {"help",  "Number of PLE row lookups that required a disk read."},
++                {"value", res_task->ple_misses_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "ple_blocks_read_total"},
++                {"help",  "Number of 128-row PLE blocks read from disk."},
++                {"value", res_task->ple_blocks_read_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "ple_read_bytes_total"},
++                {"help",  "Number of bytes read from disk for the PLE table."},
++                {"value", res_task->ple_read_bytes_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "ple_fetch_us_total"},
++                {"help",  "Cumulative time spent fetching PLE rows, in microseconds."},
++                {"value", res_task->ple_fetch_us_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "ple_fetches_total"},
++                {"help",  "Number of PLE row fetch calls."},
++                {"value", res_task->ple_fetches_total},
++            });
++
+             // PI F4 follow-up (pi-stack 29/08): emitted unconditionally so the
+             // counter is present at 0 from boot (see server_metrics)
+             counter_defs.push_back({
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index e3eaa3695..496109100 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -558,6 +558,14 @@ struct server_task_result_metrics : server_task_result {
+     uint64_t spec_route_ngram_drafts_total  = 0;
+     uint64_t spec_route_model_drafts_total = 0;
+ 
++    // t25: PLE disk-store counters (cumulative since model load)
++    uint64_t ple_hits_total        = 0;
++    uint64_t ple_misses_total      = 0;
++    uint64_t ple_blocks_read_total = 0;
++    uint64_t ple_read_bytes_total  = 0;
++    uint64_t ple_fetch_us_total    = 0;
++    uint64_t ple_fetches_total     = 0;
++
+     // PI F4 follow-up (29/08): speculative drafter state resets (the partial-reject
+     // reset window), exported as spec_state_resets_total
+     uint64_t spec_state_resets_total = 0;
+-- 
+2.53.0
+

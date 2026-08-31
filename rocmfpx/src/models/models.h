@@ -3,6 +3,7 @@
 #include "llama-model.h"
 #include "llama-graph.h"
 #include "llama-model-loader.h"
+#include "llama-ple-store.h"
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
@@ -1945,6 +1946,22 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    // T25: disk-resident PLE n-gram table (owned here; null unless --ple-disk)
+    ple_store * ple_store_handle = nullptr;
+
+    // T25: cumulative store stats; zeroed without --ple-disk (null-safe ternary:
+    // ple_store_get_stats itself is NOT null-safe)
+    ple_store_stats get_ple_stats() const override {
+        return ple_store_handle ? ple_store_get_stats(ple_store_handle) : ple_store_stats{};
+    }
+
+    ~llama_model_qwen4exp() override {
+        if (ple_store_handle != nullptr) {
+            ple_store_close(ple_store_handle);
+            ple_store_handle = nullptr;
+        }
+    }
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);

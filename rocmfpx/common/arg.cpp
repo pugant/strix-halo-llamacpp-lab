@@ -1358,6 +1358,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--ple-disk"}, {"--no-ple-disk"},
+        string_format("keep the qwen4exp PLE n-gram table on disk instead of loading it into memory (T25) (default: %s)",
+            params.ple_disk ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.ple_disk = value;
+        }
+    ).set_env("LLAMA_ARG_PLE_DISK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--ple-cache-mib"}, "N",
+        string_format("PLE disk-store block cache budget in MiB (default: %d, minimum: 102; only meaningful when disk mode is enabled)",
+            params.ple_cache_mib),
+        [](common_params & params, int value) {
+            if (value < 102) {
+                throw std::invalid_argument("invalid value for argument --ple-cache-mib: must be >= 102");
+            }
+            params.ple_cache_mib = value;
+        }
+    ).set_env("LLAMA_ARG_PLE_CACHE_MIB").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--cache-disk"}, "PATH",
         "base directory for the automatic SSD-backed prompt cache (default: disabled); "
         "the server creates and removes an owner-only run directory below PATH",

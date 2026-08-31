@@ -241,6 +241,8 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-gguf.cpp)
+llama_build_and_test(test-ple-store.cpp)
+llama_build_and_test(test-ple-dequant-parity.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

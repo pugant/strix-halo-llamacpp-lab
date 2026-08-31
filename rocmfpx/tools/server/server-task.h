@@ -558,6 +558,14 @@ struct server_task_result_metrics : server_task_result {
     uint64_t spec_route_ngram_drafts_total  = 0;
     uint64_t spec_route_model_drafts_total = 0;
 
+    // t25: PLE disk-store counters (cumulative since model load)
+    uint64_t ple_hits_total        = 0;
+    uint64_t ple_misses_total      = 0;
+    uint64_t ple_blocks_read_total = 0;
+    uint64_t ple_read_bytes_total  = 0;
+    uint64_t ple_fetch_us_total    = 0;
+    uint64_t ple_fetches_total     = 0;
+
     // PI F4 follow-up (29/08): speculative drafter state resets (the partial-reject
     // reset window), exported as spec_state_resets_total
     uint64_t spec_state_resets_total = 0;

@@ -360,6 +360,8 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    bool                             t25_ple_disk      = false; // T25: not part of the cartesian matrix
+    int                              t25_ple_cache_mib = 4096;  // T25
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -423,6 +425,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
+    printf("  --ple-disk                                  T25: keep PLE n-gram table on disk (default: off)\n");
+    printf("  --ple-cache-mib <n>                         T25: PLE block-cache budget in MiB (default: 4096)\n");
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
     }
@@ -795,6 +799,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.use_mmap.insert(params.use_mmap.end(), p.begin(), p.end());
+            } else if (arg == "--ple-disk") {
+                params.t25_ple_disk = true;
+            } else if (arg == "--ple-cache-mib") {
+                if (++i >= argc) { invalid_param = true; break; }
+                params.t25_ple_cache_mib = std::atoi(argv[i]);
+                if (params.t25_ple_cache_mib < 102) { invalid_param = true; break; }
             } else if (arg == "-dio" || arg == "--direct-io") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1142,6 +1152,8 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    bool               t25_ple_disk      = false; // T25: not part of the cartesian matrix
+    int                t25_ple_cache_mib = 4096;  // T25
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1156,6 +1168,8 @@ struct cmd_params_instance {
         mparams.use_mmap      = use_mmap;
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
+        mparams.ple_disk      = t25_ple_disk;      // T25
+        mparams.ple_cache_mib = t25_ple_cache_mib; // T25
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1288,6 +1302,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .t25_ple_disk      = */ params.t25_ple_disk,
+                /* .t25_ple_cache_mib = */ params.t25_ple_cache_mib,
             };
             instances.push_back(instance);
         }
@@ -1325,6 +1341,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .t25_ple_disk      = */ params.t25_ple_disk,
+                /* .t25_ple_cache_mib = */ params.t25_ple_cache_mib,
             };
             instances.push_back(instance);
         }
@@ -1362,6 +1380,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .t25_ple_disk      = */ params.t25_ple_disk,
+                /* .t25_ple_cache_mib = */ params.t25_ple_cache_mib,
             };
             instances.push_back(instance);
         }

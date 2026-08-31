@@ -131,8 +131,33 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const auto * ple_w = ml.get_weight(ple_name.c_str());
         GGML_ASSERT(ple_w != nullptr && "qwen4exp is missing the PLE n-gram table");
         const int64_t ple_rows = ple_w->tensor->ne[1];
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, 0);
+        if (params.ple_disk) {
+            // T25: the table stays on disk; the store serves rows on demand.
+            // The tensor is deliberately NOT created: the loader skips it
+            // (done_getting_tensors is called with partial=true for this arch).
+            GGML_ASSERT(ple_w->tensor->type == GGML_TYPE_Q5_1 && "T25 v1 supports a Q5_1 PLE table only");
+            char err[512];
+            ple_store_handle = ple_store_open(ml.file_path(ple_w->idx).c_str(), ple_w->offs,
+                                              (enum ggml_type) ple_w->tensor->type,
+                                              hparams.ple_head_dim, ple_rows,
+                                              (uint64_t) params.ple_cache_mib * 1024ull * 1024ull,
+                                              err, sizeof(err));
+            if (ple_store_handle == nullptr) {
+                throw std::runtime_error(err); // loader idiom (loader.cpp:632): clean load failure the server can report
+            }
+            // T25: the tensor is externalized and will never be loaded, so keep its
+            // bytes out of the progress total (same accounting as the unused-tensor
+            // skip in llama_model_loader::create_tensor), or size_done never reaches
+            // size_data and the final progress_callback(1.0f)/unmap tail is skipped.
+            ml.size_data -= ggml_nbytes(ple_w->tensor);
+            const double row_bytes = hparams.ple_head_dim / 32.0 * 24.0; // Q5_1: 24 B per 32 elements
+            LLAMA_LOG_INFO("%s: PLE table disk-resident: %.2f GiB externalized (Q5_1, %lld rows), cache %.2f GiB\n",
+                    __func__, ple_rows * row_bytes / (1024.0 * 1024.0 * 1024.0), (long long) ple_rows,
+                    params.ple_cache_mib / 1024.0);
+        } else {
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, 0);
+        }
     }
 
     for (int il = 0; il < n_layer; ++il) {
@@ -1168,20 +1193,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 class llm_graph_input_ple : public llm_graph_input_i {
 public:
     llm_graph_input_ple(const llama_model_qwen4exp & pmodel,
-                        const llama_kv_cache_context * mctx) : pmodel(pmodel), mctx(mctx) {}
+                        const llama_kv_cache_context * mctx,
+                        bool disk)
+        : pmodel(pmodel), mctx(mctx), disk(disk) {}
     virtual ~llm_graph_input_ple() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * rows = nullptr;     // I32 [ple_n_heads * n_tokens]   (mode off)
+    ggml_tensor * gathered = nullptr; // F32 [ple_head_dim, ple_n_heads * n_tokens] (mode on)
 
     const llama_model_qwen4exp & pmodel;
 
     // the predecessor tokens live in the attention KV cells (ext.tok)
     const llama_kv_cache_context * mctx;
 
+    const bool disk; // T25: fetch rows from ple_store_handle instead of ggml_get_rows
+
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<int32_t> idx;    // T25: host indices (mode on)
+    std::vector<float>   scratch; // T25: host gather buffer (mode on)
 };
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
@@ -1244,7 +1276,19 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    if (disk) {
+        // T25: serve rows from the disk store, then upload the gathered block
+        char err[512];
+        scratch.resize((size_t) n_tokens * n_heads * hp.ple_head_dim);
+        if (!ple_store_fetch(pmodel.ple_store_handle, idx.data(),
+                             (int64_t) idx.size(), scratch.data(),
+                             (size_t) hp.ple_head_dim, err, sizeof(err))) {
+            GGML_ABORT("%s", err); // fatal WITH the collected message
+        }
+        ggml_backend_tensor_set(gathered, scratch.data(), 0, scratch.size() * sizeof(float));
+    } else {
+        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size() * ggml_element_size(rows));
+    }
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1324,16 +1368,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_heads = hparams.ple_n_heads;
 
     // the attention cells see every ubatch regardless of the layer types
+    // (in the graph, `model` is a const llama_model & — downcast once for the T25 store handle)
+    const llama_model_qwen4exp & pmodel = static_cast<const llama_model_qwen4exp &>(model);
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
-            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
+            pmodel, mctx_hyb->get_attn(),
+            /*disk=*/ pmodel.ple_store_handle != nullptr);
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
-
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb = nullptr;
+    if (ple_inp->disk) {
+        // T25: `rows` is NOT created as a graph input (llama-context.cpp FIXME:
+        // unused inputs are not allocated and crash); the single input is the
+        // gathered F32 tensor, filled host-side by set_input via ple_store_fetch.
+        ple_inp->gathered = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
+                                               hparams.ple_head_dim, n_heads * n_tokens);
+        ggml_set_input(ple_inp->gathered);
+        emb = ple_inp->gathered;
+        res->add_input(std::move(ple_inp));
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
+        res->add_input(std::move(ple_inp));
+        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", il);
 

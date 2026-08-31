@@ -1567,6 +1567,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
+    mparams.ple_disk       = params.ple_disk;   // T25
+    mparams.ple_cache_mib  = params.ple_cache_mib; // T25
+    if (!params.ple_disk && params.ple_cache_mib != 4096) {
+        LOG_WRN("%s: --ple-cache-mib is set but --ple-disk is disabled; the value is ignored\n", __func__);
+    }
+
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {

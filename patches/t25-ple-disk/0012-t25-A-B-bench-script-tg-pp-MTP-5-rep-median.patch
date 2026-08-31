@@ -1,0 +1,113 @@
+From 38ce700045dd1b0c7c7c139520eb4b2a3b4dfe3e Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Mon, 31 Aug 2026 14:55:06 +0200
+Subject: [PATCH] t25: A/B bench script (tg/pp/MTP, 5-rep median)
+
+Sez A llama-bench (-p 512,2048 -n 128 -r 5 -t 16 -fa on -b 2048 -ub 512 -mmp 0),
+Sez B server MTP (pattern bench-t21-vk.sh: warm-up scartato, 3 rep x 2 prosa + 2 det;
+grep acceptance con pattern 'statistics +draft-mtp' per il padding).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ scripts/t25-bench.sh | 89 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 89 insertions(+)
+ create mode 100644 scripts/t25-bench.sh
+
+diff --git a/scripts/t25-bench.sh b/scripts/t25-bench.sh
+new file mode 100644
+index 000000000..9f3f40161
+--- /dev/null
++++ b/scripts/t25-bench.sh
+@@ -0,0 +1,89 @@
++#!/usr/bin/env bash
++# T25 Task 13 — bench A/B non-regressione (--ple-disk ON vs OFF).
++#   Sez A: llama-bench tg/pp, matrice -p 512,2048 -n 128 -r 5 (mediana nel post)
++#   Sez B: server MTP acceptance (pattern bench-t21-vk.sh: warm-up scartato, 3 rep,
++#          2 prosa + 2 det; acceptance da docker logs — NB pattern 'statistics +draft-mtp'
++#          per il padding, 'statistics draft-mtp' NON matcha mai)
++# Gate (Step 13.2, nel post-processing): |med_ON − med_OFF| / med_OFF ≤ 3% per test.
++# Bracci entrambi --no-mmap (produzione). Poll condizionati con CAP.
++set -euo pipefail
++
++WS=/home/pugant/workspaces/rocmfpx-strix-lean
++LOG=$WS/logs/t25/bench
++IMG=docker-llm-service:t25-vk
++LEAN=/llm/models/QWEN3.8/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN.gguf
++DRAFTER=/llm/models/QWEN3.8/Qwen3.8-Flash-Next-MTP-Q8_0.gguf
++PORT=8193
++mkdir -p "$LOG"
++
++# porta libera pre-run (regola workspace)
++if ss -tln 2>/dev/null | grep -q ":${PORT}\b"; then echo "PORTA ${PORT} OCCUPATA — abort"; exit 1; fi
++
++# ---------------- Sezione A: llama-bench ----------------
++bench_arm () {  # $1 = tag, resto = flag extra
++    local tag=$1; shift
++    echo "== SEZ-A arm=${tag} start $(date -Is)"
++    docker run --rm --device /dev/dri --group-add render --network host \
++        -v /home/pugant/llmodels:/llm:ro -v "$LOG":/out "$IMG" \
++        llama-bench -m "$LEAN" -p 512,2048 -n 128 -r 5 -t 16 -fa on -b 2048 -ub 512 -mmp 0 -o csv \
++        "$@" > "$LOG/bench-${tag}.csv" 2> "$LOG/bench-${tag}.err"
++    echo "== SEZ-A arm=${tag} done  $(date -Is) ($(wc -l < "$LOG/bench-${tag}.csv") righe csv)"
++}
++
++bench_arm off
++bench_arm on --ple-disk --ple-cache-mib 4096
++
++# ---------------- Sezione B: server MTP acceptance ----------------
++start_server () {  # $1 = tag, resto = flag extra
++    local tag=$1; shift
++    local name="t25-bench-${tag}"
++    docker rm -f "$name" >/dev/null 2>&1 || true
++    docker run -d --name "$name" --network host \
++        --device /dev/dri --group-add render \
++        -v /home/pugant/llmodels:/llm:ro \
++        --entrypoint llama-server "$IMG" \
++        -m "$LEAN" -md "$DRAFTER" --spec-type draft-mtp --spec-draft-ngl all \
++        --spec-draft-n-max 6 --spec-draft-p-min 0.75 --spec-draft-p-split 0.10 \
++        -ngl 999 -fa on --jinja -c 8192 -fit off --no-mmap \
++        --host 127.0.0.1 --port "$PORT" "$@" >/dev/null
++    # CAP 240×5s = 20 min (boot MTP: load + graph_reserve + checkpoint)
++    for i in $(seq 1 240); do
++        curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/health" 2>/dev/null | grep -q 200 && return 0
++        sleep 5
++    done
++    echo "FAIL health ${name}:"; docker logs "$name" 2>&1 | tail -20; return 1
++}
++
++bench_tok () {  # $1 = prompt → tok/s
++    curl -s "http://127.0.0.1:${PORT}/v1/chat/completions" -H 'Content-Type: application/json' \
++        -d "{\"model\":\"q\",\"max_tokens\":600,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"$1\"}]}" |
++        python3 -c "import json,sys; t=json.load(sys.stdin).get('timings',{}); print(round(t.get('predicted_per_second',0),1))" 2>/dev/null || echo "ERR"
++}
++
++server_arm () {  # $1 = tag, resto = flag extra
++    local tag=$1; shift
++    local name="t25-bench-${tag}"
++    echo "== SEZ-B arm=${tag} start $(date -Is)"
++    if start_server "$tag" "$@"; then
++        bench_tok 'Rispondi solo OK.' >/dev/null   # warm-up scartato
++        for rep in 1 2 3; do
++            local roma rin num alf
++            roma=$(bench_tok 'Scrivi un paragrafo dettagliato sulla storia di Roma.')
++            rin=$(bench_tok 'Scrivi un saggio breve sulla stampa e il Rinascimento italiano.')
++            num=$(bench_tok 'Conta da 1 a 200, un numero per riga, solo i numeri.')
++            alf=$(bench_tok 'Elenco l alfabeto inglese una lettera per riga, poi ripetilo al contrario.')
++            echo "RISULTATO TREATMENT=${tag} rep=${rep} prosa Roma=${roma} Rinascimento=${rin} det numeri=${num} alfabeto=${alf} tok/s"
++        done | tee "$LOG/server-${tag}.result"
++        docker logs "$name" > "$LOG/server-${tag}.log" 2>&1
++        grep -E 'statistics +draft-mtp|mean acceptance' "$LOG/server-${tag}.log" | tail -3 | tee -a "$LOG/server-${tag}.result"
++    else
++        echo "RISULTATO TREATMENT=${tag} SERVER FAIL"
++    fi
++    docker rm -f "$name" >/dev/null 2>&1 || true
++    echo "== SEZ-B arm=${tag} done  $(date -Is)"
++}
++
++server_arm off
++server_arm on --ple-disk --ple-cache-mib 4096
++
++echo "=== FINE T25-BENCH — gate ±3% nel post-processing (median per test) ==="
+-- 
+2.53.0
+

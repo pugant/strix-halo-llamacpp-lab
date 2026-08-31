@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-ple-store.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -734,6 +735,9 @@ struct llama_model {
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+
+    // T25: live stats of the disk-resident PLE store; zeroed when disabled
+    virtual ple_store_stats get_ple_stats() const { return {}; }
 
 protected:
     llama_model_params params;

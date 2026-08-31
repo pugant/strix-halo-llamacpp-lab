@@ -11,6 +11,7 @@
 #include "diffusion.h"
 #include "llama.h"
 #include "../../src/llama-ext.h"
+#include "../../src/llama-model.h" // t25: model_tgt->get_ple_stats() needs the full llama_model
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -2751,6 +2752,15 @@ private:
                     res->spec_route_ngram_drafts_total  = metrics.spec_route_ngram_drafts_total;
                     res->spec_route_model_drafts_total = metrics.spec_route_model_drafts_total;
 
+                    // t25: cumulative PLE disk-store stats (read from the model)
+                    const ple_store_stats ple_st = model_tgt->get_ple_stats();
+                    res->ple_hits_total        = ple_st.hits;
+                    res->ple_misses_total      = ple_st.misses;
+                    res->ple_blocks_read_total = ple_st.blocks_read;
+                    res->ple_read_bytes_total  = ple_st.bytes_read;
+                    res->ple_fetch_us_total    = ple_st.fetch_us;
+                    res->ple_fetches_total     = ple_st.fetches;
+
                     // PI F4 follow-up (29/08): speculative state reset counter
                     res->spec_state_resets_total = metrics.spec_state_resets_total;
 
@@ -5289,6 +5299,45 @@ void server_routes::init_routes() {
                 {"name",  "spec_route_model_drafts_total"},
                 {"help",  "Number of draft rounds attributed to a model drafter (MTP or DFlash)."},
                 {"value", res_task->spec_route_model_drafts_total},
+            });
+
+            // t25: PLE disk-store counters (cumulative since model load; the
+            // consumer takes the delta). Emitted unconditionally so they are
+            // present at 0 from boot even without --ple-disk (see server_metrics)
+            counter_defs.push_back({
+                {"name",  "ple_hits_total"},
+                {"help",  "Number of PLE row lookups served from the RAM cache."},
+                {"value", res_task->ple_hits_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "ple_misses_total"},
+                {"help",  "Number of PLE row lookups that required a disk read."},
+                {"value", res_task->ple_misses_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "ple_blocks_read_total"},
+                {"help",  "Number of 128-row PLE blocks read from disk."},
+                {"value", res_task->ple_blocks_read_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "ple_read_bytes_total"},
+                {"help",  "Number of bytes read from disk for the PLE table."},
+                {"value", res_task->ple_read_bytes_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "ple_fetch_us_total"},
+                {"help",  "Cumulative time spent fetching PLE rows, in microseconds."},
+                {"value", res_task->ple_fetch_us_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "ple_fetches_total"},
+                {"help",  "Number of PLE row fetch calls."},
+                {"value", res_task->ple_fetches_total},
             });
 
             // PI F4 follow-up (pi-stack 29/08): emitted unconditionally so the
