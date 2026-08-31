@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <!-- Strix Owl: geometric owl + inclined orbital halo -->
+  <defs>
+    <linearGradient id="owl" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f2b544"/>
+      <stop offset="1" stop-color="#d97a1f"/>
+    </linearGradient>
+  </defs>
+  <!-- orbital halo: inclined ellipse, broken behind the head -->
+  <g fill="none" stroke="#8a93a6" stroke-width="9" stroke-linecap="round">
+    <ellipse cx="120" cy="118" rx="104" ry="34" transform="rotate(-16 120 118)" stroke-dasharray="500 96" stroke-dashoffset="-330"/>
+  </g>
+  <!-- body -->
+  <path d="M120 52
+           C 88 52 66 74 66 106
+           L 66 150 C 66 176 78 194 96 206
+           L 96 178 C 96 170 102 164 110 164
+           L 130 164 C 138 164 144 170 144 178
+           L 144 206 C 162 194 174 176 174 150
+           L 174 106 C 174 74 152 52 120 52 Z"
+        fill="url(#owl)" stroke="#3d2b12" stroke-width="5" stroke-linejoin="round"/>
+  <!-- ear tufts -->
+  <path d="M78 66 L 70 40 L 96 54 Z" fill="url(#owl)" stroke="#3d2b12" stroke-width="5" stroke-linejoin="round"/>
+  <path d="M162 66 L 170 40 L 144 54 Z" fill="url(#owl)" stroke="#3d2b12" stroke-width="5" stroke-linejoin="round"/>
+  <!-- eyes: radial discs -->
+  <g stroke="#3d2b12" stroke-width="5">
+    <circle cx="99" cy="106" r="22" fill="#fdf6e3"/>
+    <circle cx="141" cy="106" r="22" fill="#fdf6e3"/>
+    <circle cx="99" cy="106" r="9" fill="#3d2b12" stroke="none"/>
+    <circle cx="141" cy="106" r="9" fill="#3d2b12" stroke="none"/>
+    <circle cx="103" cy="101" r="3" fill="#fdf6e3" stroke="none"/>
+    <circle cx="145" cy="101" r="3" fill="#fdf6e3" stroke="none"/>
+  </g>
+  <!-- beak -->
+  <path d="M120 118 L 112 132 L 120 148 L 128 132 Z" fill="#e8632c" stroke="#3d2b12" stroke-width="4" stroke-linejoin="round"/>
+  <!-- chest feather -->
+  <g fill="none" stroke="#3d2b12" stroke-width="4" stroke-linecap="round">
+    <path d="M104 168 q 8 8 16 0"/>
+  </g>
+</svg>
