@@ -190,7 +190,7 @@ dual-drafter routing first among them — re-runs these paths in its gate suite
 [agent-latency.md](agent-latency.md) (what these fixes do under real client
 behavior), [results-2026-08-20-drafter-routing-t1-t5.md](results-2026-08-20-drafter-routing-t1-t5.md)
 (the sacred-path gate this series became part of),
-[qwen4exp-runtime.md](qwen4exp-runtime.md) (the later hybrid the same machinery
+[qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md) (the later hybrid the same machinery
 serves). Numbers transcribed verbatim from the lab's cache-incident and gate notes
 of 2026-08-15 → 08-20.*
 

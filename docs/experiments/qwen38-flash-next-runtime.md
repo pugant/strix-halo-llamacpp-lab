@@ -1,4 +1,4 @@
-# qwen4exp runtime: from FP8 release to the PLE table on disk
+# Qwen3.8-Flash-Next (`qwen4exp`) runtime: from FP8 release to the PLE table on disk
 
 **Research note — August 2026.** Our flagship thread: Qwen3.8-Flash-Next (`qwen4exp` in
 the fork), from a day-one FP8 release to the lab's daily production model in six gated
@@ -212,7 +212,7 @@ Result: the kernel-warm gap to the in-RAM table is **−4/−9%**; the fully col
 −52/−58% on pp. Deployed to production on 2026-08-31: warm tg **30.45 tok/s** (vs ~31.5
 with the table in RAM, inside the expected band), MTP acceptance unchanged from the A/B
 (0.92 / 4.51), 43 GiB available at boot, read-through counters live on `/metrics`.
-Rollback is one flag and a restart. Guide: [`../guide/qwen4exp-ple-disk.md`](../guide/qwen4exp-ple-disk.md);
+Rollback is one flag and a restart. Guide: [`../guide/qwen38-flash-next-ple-disk.md`](../guide/qwen38-flash-next-ple-disk.md);
 implementation and A/B harness in [`../../patches/t25-ple-disk/`](../../patches/t25-ple-disk/)
 (15 patches: 12 base + 3 v2), already in the [`rocmfpx/`](../../rocmfpx/) snapshot.
 

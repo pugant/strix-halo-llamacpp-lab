@@ -20,7 +20,7 @@ a 51B-parameter PLE (per-layer embedding) n-gram table consulted early in the st
 Speculation runs an external MTP head; partial rejects are rewound through a snapshot
 ring (rollback salvage, ~7.2 GiB of buffers) instead of paying a full checkpoint
 restore. The runtime story up to that point is
-[qwen4exp-runtime.md](qwen4exp-runtime.md) §6.
+[qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md) §6.
 
 **TL;DR**
 
@@ -76,7 +76,7 @@ quantizer to the rollback path.
 
 ## 2. Root cause: one writer, K slots
 
-The rollback design (see [qwen4exp-runtime.md](qwen4exp-runtime.md) §6) is a ring of
+The rollback design (see [qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md) §6) is a ring of
 K = `n_rs_seq` + 1 snapshot slots of the recurrent state. When a verify round
 partially rejects — the target keeps the first tokens of the draft and discards R
 rows — the gather (`build_rs`) restores slot `rs_idx` = R: the snapshot taken R
@@ -180,7 +180,7 @@ measurement.
 ---
 
 *Thread index: [`README.md`](README.md); the parent thread:
-[qwen4exp-runtime.md](qwen4exp-runtime.md) §6 (rollback correctness — the ring
+[qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md) §6 (rollback correctness — the ring
 itself, the stall that preceded this bug, and the poisoning analysis this fix
 re-contextualizes). Anomaly counts, acceptance and throughput transcribed verbatim
 from the lab's fix-validation runs of 2026-08-30.*

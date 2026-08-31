@@ -203,7 +203,7 @@ are closed; the engineering ones have numbers attached.
 [2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md) (the quant
 table this protocol shares),
 [2026-08-29-pi-stack-improvement.md](2026-08-29-pi-stack-improvement.md) (the KV
-cost), [qwen4exp-runtime.md](qwen4exp-runtime.md) (the production runtime). Cross-backend
+cost), [qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md) (the production runtime). Cross-backend
 medians and the flag isolation are transcribed from the Backend section of the public
 LEAN model card; historical cells from the linked notes.*
 

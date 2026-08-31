@@ -1,0 +1,4 @@
+<!DOCTYPE html><html><head><style>body{margin:0;background:#0d1117;display:flex;align-items:center;justify-content:center;height:100vh}</style></head>
+<body><div id="wrap" style="width:1280px;height:640px"></div>
+<script>fetch('/logo.svg').then(r=>r.text()).then(t=>{const d=new DOMParser().parseFromString(t,'image/svg+xml').documentElement;d.setAttribute('width','540');d.setAttribute('height','540');document.getElementById('wrap').appendChild(d);});</script>
+</body></html>

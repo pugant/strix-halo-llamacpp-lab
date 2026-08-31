@@ -1,4 +1,4 @@
-# qwen4exp PLE disk-offload — guide
+# Qwen3.8-Flash-Next PLE disk-offload — guide (the `qwen4exp` arch)
 
 How the 98.5 GiB Qwen3.8-Flash-Next quant ([`pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF`](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF)) runs on one 128 GB Strix Halo machine with ~36 GB of RAM to spare: the biggest tensor in the model is never loaded.
 

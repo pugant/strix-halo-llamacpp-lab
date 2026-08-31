@@ -239,7 +239,7 @@ cache fix can promise at session end.
 
 *Thread index: [`README.md`](README.md); related notes:
 [spec-boundary-cache.md](spec-boundary-cache.md) (the salvage machinery that was
-recovering the aborts all along), [qwen4exp-runtime.md](qwen4exp-runtime.md) (the
+recovering the aborts all along), [qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md) (the
 production runtime), [2026-08-29-pi-stack-improvement.md](2026-08-29-pi-stack-improvement.md)
 (the agent-stack cycle this thread belongs to). Numbers transcribed verbatim from
 the lab's raw session-replay, per-phase and validation reports of 2026-08-25 →

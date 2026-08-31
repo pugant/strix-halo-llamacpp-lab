@@ -70,9 +70,9 @@ If that collaborator must be cited by name, it is **GLM by z.ai** — under that
 
 - [`docs/experiments/README.md`](docs/experiments/README.md) — narrative index over every experiment note and its raw data.
 - [`docs/guide/qwen38-27b.md`](docs/guide/qwen38-27b.md) — canonical end-to-end replication guide: BF16 GGUF → imatrix → ROCmFP4-STRIX_LEAN quant → sanitized GGUF → dual-drafter server.
-- [`docs/guide/qwen4exp-ple-disk.md`](docs/guide/qwen4exp-ple-disk.md) — running Qwen3.8-Flash-Next on 128 GB: the PLE disk-offload flags, cache budget and measured cost.
+- [`docs/guide/qwen38-flash-next-ple-disk.md`](docs/guide/qwen38-flash-next-ple-disk.md) — running Qwen3.8-Flash-Next on 128 GB: the PLE disk-offload flags, cache budget and measured cost.
 - [`PATCHES.md`](PATCHES.md) — index of every patch series in `patches/`, with upstream status.
-- Featured research note: [`docs/experiments/qwen4exp-runtime.md`](docs/experiments/qwen4exp-runtime.md).
+- Featured research note: [`docs/experiments/qwen38-flash-next-runtime.md`](docs/experiments/qwen38-flash-next-runtime.md).
 
 ## Model weights
 
@@ -109,7 +109,7 @@ For ROCm/HIP use [`docker/Dockerfile.rocm-7.2.4-rocmfpx`](docker/Dockerfile.rocm
 ## Feature guide
 
 - **Dual-drafter routing** — `--spec-type draft-mtp,draft-dflash` plus `--spec-draft-model <dflash.gguf>`, `--spec-draft-n-max 7`, `--spec-draft-p-min 0.75`; requests carrying `tools` are routed to DFlash2, the rest to MTP, with a per-request `"spec_drafter"` override. Full recipe in the replication guide ([`docs/guide/qwen38-27b.md`](docs/guide/qwen38-27b.md)).
-- **qwen4exp + PLE disk-offload** — `--ple-disk` keeps the PLE n-gram table on disk (`--ple-cache-mib N` sets the block-cache budget, default 4096); guide with the measured cost: [`docs/guide/qwen4exp-ple-disk.md`](docs/guide/qwen4exp-ple-disk.md).
+- **qwen4exp + PLE disk-offload** — `--ple-disk` keeps the PLE n-gram table on disk (`--ple-cache-mib N` sets the block-cache budget, default 4096); guide with the measured cost: [`docs/guide/qwen38-flash-next-ple-disk.md`](docs/guide/qwen38-flash-next-ple-disk.md).
 - **Reasoning-budget warn window** — `--reasoning-budget N` server-wide or `thinking_budget_tokens` per request; at 75% of the budget a mid-conversation message nudges the model to converge, and the forced end fires only if it ignores it.
 
 Minimal smoke test (image from the Build section above, LEAN model from [Model weights](#model-weights)):

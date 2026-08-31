@@ -22,7 +22,7 @@ run as real sessions, back-to-back across arms.
   relief; deliberately parked at low
   priority because the RAM margin was not yet blocking. When the pressure became real,
   the answer came from another direction: the qwen4exp PLE (per-layer embedding)
-  disk-offload ([qwen4exp-runtime.md](qwen4exp-runtime.md)). The KV cache itself never
+  disk-offload ([qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md)). The KV cache itself never
   moved to disk.
 - **T24, the matrix** — same tasks, real agent sessions, arms across quant, drafter and
   sampling. The LEAN + speculative + greedy arm showed broken thinking segments,
@@ -207,8 +207,8 @@ constant.
 *Thread index: [`README.md`](README.md); parent cycle:
 [2026-08-29-pi-stack-improvement.md](2026-08-29-pi-stack-improvement.md);
 the offload that answered the survey's question:
-[qwen4exp-runtime.md](qwen4exp-runtime.md) (guide:
-[`../guide/qwen4exp-ple-disk.md`](../guide/qwen4exp-ple-disk.md));
+[qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md) (guide:
+[`../guide/qwen38-flash-next-ple-disk.md`](../guide/qwen38-flash-next-ple-disk.md));
 the production verdict: [2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md).
 Numbers transcribed verbatim from the lab's raw notes of August 2026.*
 

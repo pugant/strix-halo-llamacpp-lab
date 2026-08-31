@@ -108,7 +108,7 @@ Timeline:
 - **Vision × MTP** — image chunks are embd-only, so the drafter-side replay is skipped while the head still sees the image through the trunk hidden state; measured acceptance on a vision request: 98.3% cumulative.
 - **RS-rollback + ring fix** — one line enables the RS ring-salvage rollback for qwen4exp; with the conv/PLE ring-slot writer fix (see [Infrastructure fixes](#infrastructure-fixes)) the stack sustains 41–44 tok/s at n=6, ~+70% over the pre-fix server.
 - **Reasoning-budget warn window** — the 75% convergence nudge (patches 0016–0020, note: [reasoning-budget-warn75.md](reasoning-budget-warn75.md)).
-- `2026-08-31` **PLE disk-offload deployed** — `--ple-disk`: the 35.76 GiB PLE table is read on demand from the GGUF itself, ~36 GB of RAM freed, output char-identical; guide: [`docs/guide/qwen4exp-ple-disk.md`](../guide/qwen4exp-ple-disk.md).
+- `2026-08-31` **PLE disk-offload deployed** — `--ple-disk`: the 35.76 GiB PLE table is read on demand from the GGUF itself, ~36 GB of RAM freed, output char-identical; guide: [`docs/guide/qwen38-flash-next-ple-disk.md`](../guide/qwen38-flash-next-ple-disk.md).
 
 ### Outcome (dedicated GPU, 98.5 GiB target + 3.85 GiB Q8_0 drafter, ctx 8192, median of 3)
 
@@ -120,7 +120,7 @@ Timeline:
 
 Draft acceptance 95.7% of tokens (mean accepted length 3.24 at n=3; still 5.20 of 6 at n=5 on deterministic text). The mechanical read: the round bottleneck is the **batched verify over the hybrid trunk** (KV + GDN + QSA index + PLE), not the drafter — deterministic work converts acceptance into speed almost 1:1, open prose decays after position 1. After the rollback-restore fix the same stack on Vulkan/RADV sustains 41–44 tok/s at n=6 on code-generation workloads (draft acceptance 0.91–0.95), and n=6 is the measured optimum (n=8 regresses to 35 tok/s: draft positions 7–8 do not pay for themselves).
 
-The flagship note for this thread is [qwen4exp-runtime.md](qwen4exp-runtime.md); the quant comparison on this model is [2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md).
+The flagship note for this thread is [qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md); the quant comparison on this model is [2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md).
 
 **What shipped:** [`patches/qwen4exp-mtp/`](../../patches/qwen4exp-mtp/) (20 commits), [`patches/t25-ple-disk/`](../../patches/t25-ple-disk/) (15 patches), the [98.5 GiB HF card](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF), and the production server running all of it since 2026-08-31.
 
