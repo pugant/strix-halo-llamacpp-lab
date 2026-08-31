@@ -1,9 +1,9 @@
-# Variante locale di Dockerfile.vulkan-rocmfpx: sorgente dal contesto (git archive
-# del branch del clone ROCmFPX) invece del clone GitHub — il fork vive su gitea
-# privato (git clone nella build fallisce: niente terminale per le credenziali).
-# Recipe: cd staging-strix-halo-llamacpp-lab/docker && \
-#   mkdir -p /tmp/vkctx/src && git -C <clone ROCmFPX> archive <branch> | tar -x -C /tmp/vkctx/src && \
-#   cp llama-grammar.patch gguf-vram-estimator.py /tmp/vkctx/ && cp Dockerfile.vulkan-rocmfpx-local /tmp/vkctx/Dockerfile && \
+# Local-source variant of Dockerfile.vulkan-rocmfpx: the fork source comes from the
+# build context (git archive of the branch) instead of a remote clone.
+# Recipe: cd <this dir> && mkdir -p /tmp/vkctx/src && \
+#   git -C <your fork checkout> archive <branch> | tar -x -C /tmp/vkctx/src && \
+#   cp llama-grammar.patch gguf-vram-estimator.py /tmp/vkctx/ && \
+#   cp Dockerfile.vulkan-rocmfpx-local /tmp/vkctx/Dockerfile && \
 #   docker build -t docker-llm-service:<tag> /tmp/vkctx
 
 # build stage

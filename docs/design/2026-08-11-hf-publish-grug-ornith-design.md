@@ -63,7 +63,7 @@ Model tree verified via HF API: `ProCreations/grug-35b-v2` cardData.base_model d
 | **Local paths embedded as GGUF metadata** | **CONFIRMED via `grep -aoE` on the whole file** (NOT via `strings` which has a minimum length threshold and missed them):<br>• grug: `quantize.imatrix.file = '/llmodels/GRUG/imatrix-grug-35b-v2.gguf'`, `quantize.imatrix.dataset = '/calibration/grug-calibration.txt'`<br>• Ornith: `quantize.imatrix.file = '/llmodels/ORNITH/imatrix_unsloth.gguf_file'`, `quantize.imatrix.dataset = 'unsloth_calibration_Ornith-1.0-35B.txt'`<br><br>No paths in the user home or HF tokens. The `/llmodels/` paths are not credentials but reveal internal conventions → **sanitization required** (see §3.1). |
 | **Wrong or generic GGUF metadata** | **CONFIRMED via Python GGUF parser**:<br>• grug: `general.name = '35B BF16'` (generic, no "grug" mention)<br>• Ornith: `general.name = 'Ornith-1.0-9B'` (**WRONG: says 9B instead of 35B**, error inherited from unsloth)<br><br>→ **sanitization required** (see §3.1). |
 | Calibration text (not published) | 140 "sensitive" keyword matches = **all false positives**: OS Python code (paramiko, marshmallow) with `password`/`api_key` attribute names + public OS authors' emails in copyright notices. No real sensitive data. |
-| HF tokens in internal scripts | Present in the scripts (`scripts/*.sh`) but NOT published (scope = Core, no scripts). |
+| HF tokens in internal scripts | Present only in pre-publish internal copies; the published scripts read `HF_TOKEN` from the environment. |
 
 ### 3.1 GGUF metadata sanitization (pre-upload, **MANDATORY**)
 
