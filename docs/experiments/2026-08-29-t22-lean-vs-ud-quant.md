@@ -79,7 +79,7 @@ the external-drafter setup requires our fork.
 
 ## Post-scriptum (2026-08-30): quality verdict from real agent sessions — production switched
 
-Back-to-back pi-agent sessions (~40 min each, coding tasks, thinking mode) gave the
+Back-to-back agent sessions (~40 min each, coding tasks, thinking mode) gave the
 quality dimension the throughput table could not: the STRIX_LEAN arm (with our MTP
 drafter enabled) produced repeated output-integrity incidents — reasoning breaking
 mid-sentence, one decoding degeneration (repeated zeros), occasional malformed tool
