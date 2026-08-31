@@ -238,7 +238,7 @@ Structure modeled on grug/Ornith, sections:
 
 ### Upload
 - `huggingface_hub` 1.22, write-mode token `~/.cache/huggingface/token` (user `pugant`).
-- Reuses `scripts/upload-to-hf.py` (adapting repo_id + file list).
+- Reused `scripts/upload-to-hf.py` (adapting repo_id + file list; the internal upload helpers were later removed from the public repo).
 - Free account: 500 GB storage, 50 GB/file. Total ~17 GB → OK.
 - Order: LICENSE/NOTICE/.gitattributes → GGUF + imatrix → README.md (live card last).
 
