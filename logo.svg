@@ -56,23 +56,23 @@
   </g>
   <!-- beak: closed diamond, v1-style -->
   <path d="M120 122 L 110 138 L 120 156 L 130 138 Z" fill="#e8632c" stroke="#3d2b12" stroke-width="4" stroke-linejoin="round"/>
-  <!-- belt + buckle + holes -->
+  <!-- belt + buckle + holes: snug around the waist -->
   <g stroke="#241708" stroke-width="4" stroke-linejoin="round">
-    <rect x="66" y="148" width="108" height="20" rx="9" fill="#4a3421"/>
+    <rect x="79" y="148" width="82" height="20" rx="9" fill="#4a3421"/>
     <rect x="104" y="143" width="32" height="30" rx="6" fill="#e8b13c"/>
     <rect x="113" y="152" width="14" height="12" rx="2" fill="#4a3421" stroke-width="3"/>
-    <circle cx="88" cy="158" r="2.6" fill="#e8b13c" stroke="none"/>
-    <circle cx="97" cy="158" r="2.6" fill="#e8b13c" stroke="none"/>
-    <circle cx="145" cy="158" r="2.6" fill="#e8b13c" stroke="none"/>
-    <circle cx="154" cy="158" r="2.6" fill="#e8b13c" stroke="none"/>
+    <circle cx="86" cy="158" r="2.5" fill="#e8b13c" stroke="none"/>
+    <circle cx="95" cy="158" r="2.5" fill="#e8b13c" stroke="none"/>
+    <circle cx="145" cy="158" r="2.5" fill="#e8b13c" stroke="none"/>
+    <circle cx="154" cy="158" r="2.5" fill="#e8b13c" stroke="none"/>
   </g>
-  <!-- tension creases: three per side, vivid orange, radiating from the belt -->
+  <!-- tension creases: three per side, vivid orange, radiating from the belt tips -->
   <g stroke="#e8632c" stroke-width="4.5" stroke-linecap="round" fill="none">
-    <path d="M63 144 l -11 -7"/>
-    <path d="M60 154 l -13 0"/>
-    <path d="M63 164 l -11 7"/>
-    <path d="M177 144 l 11 -7"/>
-    <path d="M180 154 l 13 0"/>
-    <path d="M177 164 l 11 7"/>
+    <path d="M76 144 l -11 -7"/>
+    <path d="M73 154 l -12 0"/>
+    <path d="M76 163 l -11 7"/>
+    <path d="M164 144 l 11 -7"/>
+    <path d="M167 154 l 12 0"/>
+    <path d="M164 163 l 11 7"/>
   </g>
 </svg>
