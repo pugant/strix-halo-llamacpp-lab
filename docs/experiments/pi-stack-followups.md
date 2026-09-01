@@ -1,6 +1,6 @@
 # pi-stack follow-ups: disk-KV surveyed, real-agent quality matrix (T23, T24)
 
-**Research note — August 2026.** Two follow-ups to the agent-stack improvement cycle
+**Research note — August → September 2026.** Two follow-ups to the agent-stack improvement cycle
 ([2026-08-29-pi-stack-improvement.md](2026-08-29-pi-stack-improvement.md)): a survey of
 disk-KV offload as a RAM-relief direction (T23), and a quality matrix run on real agent
 sessions instead of on benches (T24). The first closed as *right question, different
@@ -103,12 +103,12 @@ makes the KV the worst candidate. What eventually shipped
 prompt-cache library** (inspired by antirez's `ds4_kvstore`): the served state is saved
 to SSD once after a request and read back **once, sequentially, at the next boot** —
 the best shape a disk tier can hope for. After a restart, a 107k-token context restores
-in 1.57 s instead of the 920 s a cold re-prefill of the same tokens measured (64×), with
+in 1.57 s — end-to-end 14.3 s vs the 920 s a cold re-prefill of the same tokens measured (64×), with
 one honest boundary: with the MTP drafter active the restore needs a token-exact prompt
 junction, so raw verbatim replays restore and chat-template history replays silently do
 not. RAM is unchanged — the two disk moves on this model are orthogonal: the PLE table
-to disk buys RAM (this note), the prompt cache to disk buys restart latency. The
-survey's rule survives intact with one word added: move the bytes that want to be
+to disk buys RAM (§2 above), the prompt cache to disk buys restart latency. The
+survey's rule survives intact with one clause added: move the bytes that want to be
 moved *for the job you are buying*.
 
 ## 3. T24 — the quality matrix on real agent sessions
@@ -222,7 +222,7 @@ constant.
 
 *Thread index: [`README.md`](README.md); parent cycle:
 [2026-08-29-pi-stack-improvement.md](2026-08-29-pi-stack-improvement.md);
-the offload that answered the survey's question:
+the thread that answered the survey's question:
 [qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md) (guides:
 [`../guide/qwen38-flash-next-ple-disk.md`](../guide/qwen38-flash-next-ple-disk.md),
 [`../guide/qwen38-flash-next-prompt-cache-disk.md`](../guide/qwen38-flash-next-prompt-cache-disk.md));

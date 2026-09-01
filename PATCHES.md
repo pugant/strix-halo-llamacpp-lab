@@ -26,7 +26,7 @@ Apply notes — the non-obvious ones:
 | [`t10/`](patches/t10/) | fork branch `t10` | `Q2_3_ROCMFPX_MIX` 2/3-bit mixed preset family (+ V2 variant) — the round-budget compression lever | NO-GO by measurement (perplexity gate ~5×); presets kept for the record |
 | [`t11/`](patches/t11/) | fork branch `t11` | Fused draft chain + verify dispatch switch — both levers on the ~38 ms/round software residue, behind default-off flags | NO-GO by measurement — stays on branch `t11`, not in the runtime build |
 | [`t25-ple-disk/`](patches/t25-ple-disk/) | fork `main` → result `bc85fcb1d` | PLE n-gram table disk offload — `--ple-disk` reads table blocks on demand from the GGUF itself (15 patches: 12 base + 3 v2) | not submitted |
-| [`t23-kv-disk-persist/`](patches/t23-kv-disk-persist/) | fork `main` `bc85fcb1d` → result `f629365da` (the `rocmfpx/` snapshot) | Persistent cross-restart prompt-cache library — `--cache-disk-persist`: ds4-inspired entries with hit-decay eviction (6 h half-life), crash-safe commit-by-rename sidecars, boot adoption/GC, CRC verify-then-load (12 patches: 9 base + 3 multimodal save-path fixes) | not submitted |
+| [`t23-kv-disk-persist/`](patches/t23-kv-disk-persist/) | fork `main` @ `bc85fcb1d` → result `f629365da` (the `rocmfpx/` snapshot) | Persistent cross-restart prompt-cache library — `--cache-disk-persist`: ds4-inspired entries with hit-decay eviction (6 h half-life), crash-safe commit-by-rename (sidecar written last), boot adoption/GC, CRC verify-then-load (12 patches: 9 base + 3 multimodal save-path fixes) | not submitted |
 
 ## The 9-patch `spec-cache-trailing-rollback` series
 

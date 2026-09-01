@@ -32,7 +32,7 @@ Each line below is one measured claim; nothing is merged or projected.
 - Run ROCmFP4/ROCMFPX quants of Qwen3.x-class models on a 128 GB Strix Halo — the dense 27B (13.8 GiB) decodes at ~20 tok/s on free prose and 45–55 tok/s on structured text (Vulkan build, MTP n=6); Qwen3.6-35B-A3B reaches 81.6 tok/s on the same build.
 - Route each request to the drafter that fits it, on the 27B server — MTP for prose, DFlash2 for agentic/deterministic work: **+19% agentic** throughput over MTP-only (measured), prose unchanged (−0.5% to +1%). In production since 2026-08-20.
 - Run the qwen4exp 180B-class hybrid on the same 128 GB machine — with `--ple-disk`, ~36 GB of RAM stays free (see intro); output is char-identical, warm tg (token generation) costs ~3%.
-- Restart the server without re-prefilling every session — `--cache-disk-persist` keeps a ds4-inspired prompt-cache library on disk across restarts: a 107k-token context restores in 1.57 s instead of the measured 920 s cold re-prefill (**64×**), deterministically. With the MTP drafter the restore needs a token-exact boundary: raw verbatim replays restore, chat-template history replays silently do not. In production since 2026-09-01.
+- Restart the server without re-prefilling every session — `--cache-disk-persist` keeps an antirez-ds4-inspired prompt-cache library on disk across restarts: a 107k-token context restores in 1.57 s — end-to-end 14.3 s vs the measured 920 s cold re-prefill (**64×**) — deterministically. With the MTP drafter the restore needs a token-exact boundary: raw verbatim replays restore, chat-template history replays silently do not. In production since 2026-09-01.
 - More than double deterministic decode on qwen4exp with the external MTP drafter (agentionai's, qwen4exp-specific) — 22.1 → 50.2 tok/s (+127%) on a counting task at n=5; 41–44 tok/s at n=6 for code generation on the Vulkan/RADV build after the rollback-restore fix.
 - Use vision and speculative decoding together — `--mmproj` plus the MTP drafter in one server; draft acceptance measured on a vision request: 98.3% cumulative.
 - Bound the reasoning budget without a cliff — hard thinking cap plus a warn window at 75% of the budget: in a real one-hour agent session (48 requests) every request closed naturally; the single triggered warning converged in 1.3 s; none exhausted the budget.
@@ -58,6 +58,7 @@ If that collaborator must be cited by name, it is **GLM by z.ai** — under that
 - qwen4exp conv (convolution-state) and PLE ring-slot rollback fix — partial-reject rollbacks no longer restore the GDN (gated-deltanet)/PLE history from zeroed slots: acceptance 0.74 → 0.91–0.95, decode ~+70% at n=6.
 - Reasoning-budget warn window at 75% — deployed and validated on the real agent workload (48/48 requests closed naturally).
 - PLE disk-offload (`--ple-disk`) — on a real always-on agent server since 2026-08-31; rolling back is a matter of turning the flag off.
+- Persistent prompt cache (`--cache-disk-persist`) — on the same server since 2026-09-01; a restart now restores served context from the on-disk library instead of re-prefilling it.
 
 **Experimental or closed:**
 
@@ -72,6 +73,7 @@ If that collaborator must be cited by name, it is **GLM by z.ai** — under that
 - [`docs/experiments/README.md`](docs/experiments/README.md) — narrative index over every experiment note and its raw data.
 - [`docs/guide/qwen38-27b.md`](docs/guide/qwen38-27b.md) — canonical end-to-end replication guide: BF16 GGUF → imatrix → ROCmFP4-STRIX_LEAN quant → sanitized GGUF → dual-drafter server.
 - [`docs/guide/qwen38-flash-next-ple-disk.md`](docs/guide/qwen38-flash-next-ple-disk.md) — running Qwen3.8-Flash-Next on 128 GB: the PLE disk-offload flags, cache budget and measured cost.
+- [`docs/guide/qwen38-flash-next-prompt-cache-disk.md`](docs/guide/qwen38-flash-next-prompt-cache-disk.md) — the persistent prompt cache: flags, the verbatim-replay requirement, monitoring and rollback.
 - [`PATCHES.md`](PATCHES.md) — index of every patch series in `patches/`, with upstream status.
 - Featured research note: [`docs/experiments/qwen38-flash-next-runtime.md`](docs/experiments/qwen38-flash-next-runtime.md).
 
@@ -111,6 +113,7 @@ For ROCm/HIP use [`docker/Dockerfile.rocm-7.2.4-rocmfpx`](docker/Dockerfile.rocm
 
 - **Dual-drafter routing** — `--spec-type draft-mtp,draft-dflash` plus `--spec-draft-model <dflash.gguf>`, `--spec-draft-n-max 7`, `--spec-draft-p-min 0.75`; requests carrying `tools` are routed to DFlash2, the rest to MTP, with a per-request `"spec_drafter"` override. Full recipe in the replication guide ([`docs/guide/qwen38-27b.md`](docs/guide/qwen38-27b.md)).
 - **qwen4exp + PLE disk-offload** — `--ple-disk` keeps the PLE n-gram table on disk (`--ple-cache-mib N` sets the block-cache budget, default 4096); guide with the measured cost: [`docs/guide/qwen38-flash-next-ple-disk.md`](docs/guide/qwen38-flash-next-ple-disk.md).
+- **Persistent prompt cache** — `--cache-disk <dir>` plus `--cache-disk-persist` (`--cache-disk-persist-mib` budget, default 16384) keeps the prompt-cache library across restarts; guide with the token-exact boundary caveat: [`docs/guide/qwen38-flash-next-prompt-cache-disk.md`](docs/guide/qwen38-flash-next-prompt-cache-disk.md).
 - **Reasoning-budget warn window** — `--reasoning-budget N` server-wide or `thinking_budget_tokens` per request; at 75% of the budget a mid-conversation message nudges the model to converge, and the forced end fires only if it ignores it.
 
 Minimal smoke test (image from the Build section above, LEAN model from [Model weights](#model-weights)):
@@ -139,8 +142,8 @@ This lab adds a thin layer on top of giants' work.
 - **kingjones777** — reference tg/pp numbers on Strix Halo that we cross-checked our own measurements against.
 - **antirez / Salvatore Sanfilippo** — the ds4 README pattern this page follows, the
   disk-resident model state of his dwarstar (the direct inspiration for our PLE
-  disk-offload, `--ple-disk`), and his `ds4_kvstore`: the cross-restart on-disk library
-  with hit-decay eviction (6 h half-life) and little-endian sidecar records that our
+  disk-offload, `--ple-disk`), and his `ds4_kvstore` — the cross-restart on-disk library
+  with hit-decay eviction (6 h half-life) and little-endian sidecar records — which our
   persistent prompt cache (`--cache-disk-persist`) is modeled on.
 
 If we forgot anyone: it is an omission, not intentional — open an issue and we will credit you.

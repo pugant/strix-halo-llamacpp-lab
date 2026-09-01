@@ -4,8 +4,8 @@
 (`qwen4exp` in the fork), from a day-one FP8 release to the lab's daily production model
 in seven gated steps (2026-08-27 → 09-01) — quant pipeline, runtime port, external MTP
 drafter, vision × speculation, rollback correctness, the model's biggest tensor leaving
-RAM, and the prompt cache learning to survive a restart. Mostly a chain of YESes, with
-two instructive detours and a close we believe is underused: serving a huge read-only
+RAM, and the prompt cache surviving restarts. Mostly a chain of YESes, with
+two instructive detours and a closing move we believe is underused: serving a huge read-only
 lookup table straight from the model file, and remembering context across restarts
 instead of recomputing it.
 
@@ -24,11 +24,12 @@ window, temp 0, ctx 8192, medians of 2–3 runs, warm-up discarded — point mea
 - **The thread** — pipeline (T15) → runtime port (T16) → external MTP drafter (T17) →
   vision × MTP (T18) → rollback correctness (T19) → PLE disk-offload (T25) → persistent
   prompt cache (T23).
-- **The outcome** — in production since 2026-08-31/09-01: +108/+127% (n=3/n=5)
+- **The outcome** — in production since 2026-08-31 and 09-01: +108/+127% (n=3/n=5)
   deterministic decode with the drafter, vision and speculation coexisting,
   `--ple-disk` keeping the 35.76 GiB PLE table on disk (char-identical, +36 GB RAM back,
   ~3% warm cost), and `--cache-disk-persist` restoring a 107k-token context after a
-  restart in 1.57 s — 64× faster than the re-prefill it replaces.
+  restart — state load 1.57 s, end-to-end 14.3 s vs the 920 s cold re-prefill it
+  replaces (64×).
 
 ---
 
@@ -227,33 +228,41 @@ T25 left one serving cost untouched: every deploy, crash or OOM restarts the ser
 with it every client session goes cold — a ~107k-position agent context re-prefilled
 from zero, measured at 920 s on this machine. The fork already had an SSD prompt cache
 for mid-session reuse, but its metadata lived in RAM and was wiped at boot: **per-run**.
-Restart the process, lose the library.
+Restart the process, lose the cache.
 
 `--cache-disk-persist` makes the library outlive the process. The design is inspired by
 **antirez's [`ds4_kvstore`](https://github.com/antirez/ds4)** — the same lineage as the
 PLE offload's dwarstar, applied to a different tensor and a different job. Entries live
-under `<cache-dir>/persist/entry-<id>/`: a target-state payload (plus the drafter's,
-when speculation is on) and an 88-byte little-endian sidecar carrying the config
-fingerprint, token ids, hit count, timestamps and CRC-32s. What transferred from ds4:
-**hit-decay eviction** (score half-life 6 h — an entry no session revisits ages itself
-out), a **disk budget enforced at boot**, and a **crash-safe commit** — an entry exists
-iff its sidecar does, and the sidecar is written last (payloads → fsync → temp sidecar →
-fsync → rename), so a crash mid-write leaves only nameless temporaries that the next
-boot discards. A single server holds an exclusive lock on the library; entries from
-another configuration are kept aside and garbage-collected oldest-first.
+under `<cache-dir>/.llama-prompt-cache-v1/persist/entry-<id>/`: a target-state payload
+(plus the drafter's, when speculation is on) and a sidecar — an 88-byte little-endian
+header (configuration fingerprint, hit count, timestamps, CRC-32s) followed by the
+token-id array. What transferred from ds4: **hit-decay eviction** (6 h half-life — an
+entry no session revisits ages itself out), a **disk budget enforced at boot**, and a
+**crash-safe commit** — an entry exists iff its sidecar does, and the sidecar is written
+last (payloads → fsync → temp sidecar → fsync → rename → fsync dir), so a crash
+mid-write leaves only nameless temporaries that the next boot discards. A single server
+holds an exclusive lock on the library; entries from another configuration are set
+aside and garbage-collected oldest-first.
 
 | Gate | Result |
 |---|---|
 | OFF-path unchanged (flags default off; round-trip identical to the pre-feature cache) | **PASS** |
-| Unit: sidecar round-trip bit-exact, CRC check-value, score fixtures — reviewer mutation testing caught 4/4 | **PASS** |
-| Boot: corrupted sidecar → discard + remove; other-config entries → GC oldest-first; budget eviction (victim = min score, older on ties) | **PASS** — eviction caught live on GPU |
-| Cross-restart restore, verbatim replay of a 107,283-token context | **PASS** — `restored=107283 prefilled=31`, state load 1.36–1.57 s |
-| Determinism: library rebuilt in an independent boot, same request re-served | **PASS** — char-identical, 111/111 |
-| End-to-end vs cold re-prefill, same 107,314-token prompt | **14.3 s vs 920 s — 64×** |
+| Unit: sidecar round-trip bit-exact, CRC check-value, score fixtures — reviewer-run mutation testing caught 4/4 injected faults | **PASS** |
+| Boot: corrupted sidecar → discard + remove; other-config entries → GC oldest-first; budget eviction (victim = min score, older on ties) | **PASS** — eviction observed live on GPU |
+| Cross-restart restore, verbatim replay of a 107,283-token context | **PASS** — `restored=107283 prefilled=31`, state load 1.28–1.57 s |
+| Determinism: library rebuilt in an independent boot, same request re-served | **PASS** — char-identical (111/111 characters) |
+| End-to-end vs cold re-prefill, the same prompt in both arms (107,314 tokens) | **14.3 s vs 920 s — 64×** |
+
+Two rows close **in substance**, with the cause recorded rather than hidden: the
+in-RAM reference restore is not bit-comparable across a restart (its checkpoints never
+reach disk), so the disk path is gated by its own cross-restart determinism instead of
+by a reference diff; and in one gate run the metrics endpoint was not enabled, making
+the gauge check unreachable — the quoted log marker is the equivalent evidence.
 
 **The structural limit, found before deploy and kept honest:** with the MTP drafter
 active, a restore is only valid at an **exact token boundary** — the drafter state is
-consistent only where `lcp == cached_tokens`, and the trailing-rollback salvage that
+consistent only where the longest common prefix (`lcp`) equals the cached token count,
+and the trailing-rollback salvage that
 absorbs small deltas mid-session does not apply across a restart. A chat-template client
 that replays its history re-renders the assistant turns, and a rendering is not
 token-identical to what the model generated (an unfinished generation is unclosed
@@ -271,8 +280,9 @@ wrong answer for *every* prompt (nothing was saved), then crashed twice on token
 paths that trusted the same flag. The fix that closed the family asserts on the
 prompt's **actual media cells**, not the slot-born flag. First real production save
 after the fix: a 1,449-token multimodal prompt, 133 MB on disk, 0.42 s. RAM is
-unchanged (42 GiB available — T23 buys latency, not memory; the RAM win is T25's).
-Twelve `persist_*` counters and gauges on `/metrics`; rollback is removing the flags.
+unchanged (40 GiB available — T23 buys latency, not memory; the RAM win is T25's).
+Twelve `persist_*` counters and gauges on `/metrics`; rolling back means removing the
+flags and restarting.
 
 Guide: [`../guide/qwen38-flash-next-prompt-cache-disk.md`](../guide/qwen38-flash-next-prompt-cache-disk.md);
 implementation in [`../../patches/t23-kv-disk-persist/`](../../patches/t23-kv-disk-persist/)
@@ -283,8 +293,8 @@ implementation in [`../../patches/t23-kv-disk-persist/`](../../patches/t23-kv-di
 - **The verbatim client**: the 64× restore materializes only for clients that replay
   their prompts token-exactly. Whether that holds for the agent workloads this server
   serves (and where their history re-rendering diverges) is being verified with the
-  agent's authors — the honest reading of today's production benefit is "raw-completion
-  flows restore; chat-replay flows do not, yet silently".
+  agent's authors — the honest reading of today's production benefit is "raw verbatim
+  replays restore; chat-template history replays silently do not".
 - **The warm-cache gap** (−4/−9% tg; cold pp −52/−58%): the deferred lever is a `pread`
   thread-pool, and it is *conditional* — worth building only if a `drop_caches` A/B
   shows the readahead submission insufficient, or once the store has parallel consumers.
@@ -318,7 +328,7 @@ implementation in [`../../patches/t23-kv-disk-persist/`](../../patches/t23-kv-di
    the format. No journal, no replay: the next boot just sweeps the nameless files.
 7. **A flag that is born set and never recomputed will lie to the first feature that
    asks.** The multimodal slot flag predated T23 and was harmless until the save path
-   trusted it; three crashes later, the assertion moved to the actual media cells.
+   trusted it; three fixes later, the assertion moved to the actual media cells.
    When you add a consumer of an old invariant, check the invariant, not the flag.
 
 ---
@@ -326,8 +336,8 @@ implementation in [`../../patches/t23-kv-disk-persist/`](../../patches/t23-kv-di
 *Thread index: [`README.md`](README.md); related notes:
 [2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md) (quant quality),
 [2026-08-29-pi-stack-improvement.md](2026-08-29-pi-stack-improvement.md) (agent stack),
-[pi-stack-followups.md](pi-stack-followups.md) (the disk-KV survey that §8 answers from
-a different angle).
+[pi-stack-followups.md](pi-stack-followups.md) (the disk-KV survey whose question §8
+answers from a different angle).
 Numbers transcribed verbatim from the lab's raw notes of 2026-08-27 → 09-01.*
 
 *Attribution: GLM by z.ai.*
