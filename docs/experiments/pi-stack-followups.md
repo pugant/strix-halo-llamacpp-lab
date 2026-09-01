@@ -23,7 +23,8 @@ run as real sessions, back-to-back across arms.
   priority because the RAM margin was not yet blocking. When the pressure became real,
   the answer came from another direction: the qwen4exp PLE (per-layer embedding)
   disk-offload ([qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md)). The KV cache itself never
-  moved to disk.
+  moved to disk — for RAM. A day later it did move, for restart latency instead
+  (addendum in §2).
 - **T24, the matrix** — same tasks, real agent sessions, arms across quant, drafter and
   sampling. The LEAN + speculative + greedy arm showed broken thinking segments,
   zero-degeneration episodes and truncated writes; the plain-quant arm ran the same work
@@ -94,6 +95,21 @@ reimplement. When the pressure arrived, the bytes that *wanted* to be moved were
 the bytes the survey catalogued. The survey still paid for itself: the budget
 arithmetic it produced is what made the PLE decision a one-day closure instead of a
 fresh investigation.
+
+**Addendum (September 1).** The cache did move to disk in the end — for a different
+job. The survey had priced a disk tier as *RAM relief*, where per-token random access
+makes the KV the worst candidate. What eventually shipped
+([qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md) §8) is a **persistent
+prompt-cache library** (inspired by antirez's `ds4_kvstore`): the served state is saved
+to SSD once after a request and read back **once, sequentially, at the next boot** —
+the best shape a disk tier can hope for. After a restart, a 107k-token context restores
+in 1.57 s instead of the 920 s a cold re-prefill of the same tokens measured (64×), with
+one honest boundary: with the MTP drafter active the restore needs a token-exact prompt
+junction, so raw verbatim replays restore and chat-template history replays silently do
+not. RAM is unchanged — the two disk moves on this model are orthogonal: the PLE table
+to disk buys RAM (this note), the prompt cache to disk buys restart latency. The
+survey's rule survives intact with one word added: move the bytes that want to be
+moved *for the job you are buying*.
 
 ## 3. T24 — the quality matrix on real agent sessions
 
@@ -207,9 +223,10 @@ constant.
 *Thread index: [`README.md`](README.md); parent cycle:
 [2026-08-29-pi-stack-improvement.md](2026-08-29-pi-stack-improvement.md);
 the offload that answered the survey's question:
-[qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md) (guide:
-[`../guide/qwen38-flash-next-ple-disk.md`](../guide/qwen38-flash-next-ple-disk.md));
+[qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md) (guides:
+[`../guide/qwen38-flash-next-ple-disk.md`](../guide/qwen38-flash-next-ple-disk.md),
+[`../guide/qwen38-flash-next-prompt-cache-disk.md`](../guide/qwen38-flash-next-prompt-cache-disk.md));
 the production verdict: [2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md).
-Numbers transcribed verbatim from the lab's raw notes of August 2026.*
+Numbers transcribed verbatim from the lab's raw notes of August → September 2026.*
 
 *Attribution: GLM by z.ai.*

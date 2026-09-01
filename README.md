@@ -32,6 +32,7 @@ Each line below is one measured claim; nothing is merged or projected.
 - Run ROCmFP4/ROCMFPX quants of Qwen3.x-class models on a 128 GB Strix Halo — the dense 27B (13.8 GiB) decodes at ~20 tok/s on free prose and 45–55 tok/s on structured text (Vulkan build, MTP n=6); Qwen3.6-35B-A3B reaches 81.6 tok/s on the same build.
 - Route each request to the drafter that fits it, on the 27B server — MTP for prose, DFlash2 for agentic/deterministic work: **+19% agentic** throughput over MTP-only (measured), prose unchanged (−0.5% to +1%). In production since 2026-08-20.
 - Run the qwen4exp 180B-class hybrid on the same 128 GB machine — with `--ple-disk`, ~36 GB of RAM stays free (see intro); output is char-identical, warm tg (token generation) costs ~3%.
+- Restart the server without re-prefilling every session — `--cache-disk-persist` keeps a ds4-inspired prompt-cache library on disk across restarts: a 107k-token context restores in 1.57 s instead of the measured 920 s cold re-prefill (**64×**), deterministically. With the MTP drafter the restore needs a token-exact boundary: raw verbatim replays restore, chat-template history replays silently do not. In production since 2026-09-01.
 - More than double deterministic decode on qwen4exp with the external MTP drafter (agentionai's, qwen4exp-specific) — 22.1 → 50.2 tok/s (+127%) on a counting task at n=5; 41–44 tok/s at n=6 for code generation on the Vulkan/RADV build after the rollback-restore fix.
 - Use vision and speculative decoding together — `--mmproj` plus the MTP drafter in one server; draft acceptance measured on a vision request: 98.3% cumulative.
 - Bound the reasoning budget without a cliff — hard thinking cap plus a warn window at 75% of the budget: in a real one-hour agent session (48 requests) every request closed naturally; the single triggered warning converged in 1.3 s; none exhausted the budget.
@@ -136,9 +137,11 @@ This lab adds a thin layer on top of giants' work.
 - **Unsloth** — the UD quantization family and the Flash-Next reference material; our pipeline builds on their published BF16 GGUFs and write-ups.
 - **agentionai** — author of the external MTP drafter that pairs with our qwen4exp quant.
 - **kingjones777** — reference tg/pp numbers on Strix Halo that we cross-checked our own measurements against.
-- **antirez / Salvatore Sanfilippo** — the ds4 README pattern this page follows, and
-  the disk-resident model state of his dwarstar, the direct inspiration for our PLE
-  disk-offload (`--ple-disk`).
+- **antirez / Salvatore Sanfilippo** — the ds4 README pattern this page follows, the
+  disk-resident model state of his dwarstar (the direct inspiration for our PLE
+  disk-offload, `--ple-disk`), and his `ds4_kvstore`: the cross-restart on-disk library
+  with hit-decay eviction (6 h half-life) and little-endian sidecar records that our
+  persistent prompt cache (`--cache-disk-persist`) is modeled on.
 
 If we forgot anyone: it is an omission, not intentional — open an issue and we will credit you.
 

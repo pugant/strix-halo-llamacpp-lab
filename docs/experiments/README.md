@@ -98,7 +98,7 @@ The routing feature shipped only after these gates passed ([`results-2026-08-20-
 
 ## qwen4exp runtime
 
-The flagship line. Qwen3.8-Flash-Next (`qwen4exp`) is a 180B-class hybrid — gated-deltanet linear attention, QSA indexer attention with a third KV stream, a 51B-parameter PLE n-gram table, 4-stream low-rank hyper-connections — and the thread walked it from a quant, to a runtime, to the lab's daily production model: pipeline quant (98.5 GiB HF card) → architecture port onto the fork → external MTP drafter driven by its own GGUF → vision working together with MTP → rollback-restore correctness → and finally the PLE table leaving RAM entirely (`--ple-disk`, deployed 2026-08-31).
+The flagship line. Qwen3.8-Flash-Next (`qwen4exp`) is a 180B-class hybrid — gated-deltanet linear attention, QSA indexer attention with a third KV stream, a 51B-parameter PLE n-gram table, 4-stream low-rank hyper-connections — and the thread walked it from a quant, to a runtime, to the lab's daily production model: pipeline quant (98.5 GiB HF card) → architecture port onto the fork → external MTP drafter driven by its own GGUF → vision working together with MTP → rollback-restore correctness → the PLE table leaving RAM entirely (`--ple-disk`, deployed 2026-08-31) → and finally the prompt cache surviving restarts (`--cache-disk-persist`, deployed 2026-09-01: a 107k-token context restored in 1.57 s after a restart, 64× the re-prefill it replaces).
 
 Timeline:
 
@@ -109,6 +109,7 @@ Timeline:
 - **RS-rollback + ring fix** — one line enables the RS ring-salvage rollback for qwen4exp; with the conv/PLE ring-slot writer fix (see [Infrastructure fixes](#infrastructure-fixes)) the stack sustains 41–44 tok/s at n=6, ~+70% over the pre-fix server.
 - **Reasoning-budget warn window** — the 75% convergence nudge (patches 0016–0020, note: [reasoning-budget-warn75.md](reasoning-budget-warn75.md)).
 - `2026-08-31` **PLE disk-offload deployed** — `--ple-disk`: the 35.76 GiB PLE table is read on demand from the GGUF itself, ~36 GB of RAM freed, output char-identical; guide: [`docs/guide/qwen38-flash-next-ple-disk.md`](../guide/qwen38-flash-next-ple-disk.md).
+- `2026-09-01` **Persistent prompt cache deployed** — `--cache-disk-persist` (ds4-inspired): the on-SSD prompt library outlives the process; after a restart a 107k-token context restores in 1.57 s vs 920 s of cold re-prefill (**64×**), deterministically (char-identical 111/111). Structural limit kept honest: with the MTP drafter the restore needs a token-exact boundary — raw verbatim replays restore, chat-template history replays do not; guide: [`docs/guide/qwen38-flash-next-prompt-cache-disk.md`](../guide/qwen38-flash-next-prompt-cache-disk.md).
 
 ### Outcome (dedicated GPU, 98.5 GiB target + 3.85 GiB Q8_0 drafter, ctx 8192, median of 3)
 
@@ -122,7 +123,7 @@ Draft acceptance 95.7% of tokens (mean accepted length 3.24 at n=3; still 5.20 o
 
 The flagship note for this thread is [qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md); the quant comparison on this model is [2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md).
 
-**What shipped:** [`patches/qwen4exp-mtp/`](../../patches/qwen4exp-mtp/) (20 commits), [`patches/t25-ple-disk/`](../../patches/t25-ple-disk/) (15 patches), the [98.5 GiB HF card](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF), and the production server running all of it since 2026-08-31.
+**What shipped:** [`patches/qwen4exp-mtp/`](../../patches/qwen4exp-mtp/) (20 commits), [`patches/t25-ple-disk/`](../../patches/t25-ple-disk/) (15 patches), [`patches/t23-kv-disk-persist/`](../../patches/t23-kv-disk-persist/) (12 patches), the [98.5 GiB HF card](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF), and the production server running all of it since 2026-08-31.
 
 ## pi-stack
 
