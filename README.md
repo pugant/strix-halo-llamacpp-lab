@@ -1,6 +1,6 @@
 <p align="center"><img src="logo.svg" alt="Strix Lean — the lab's mascot" width="220"></p>
 
-This is a llama.cpp laboratory for one machine class: AMD Strix Halo (Ryzen AI MAX+ 395, 128 GB unified memory) — the Strix Owl above is this lab's mascot. The headline is the **qwen4exp** line — Qwen3.8-Flash-Next, the 180B-class hybrid mixing gated-deltanet linear attention, 4-stream low-rank hyper-connections and a 51B-parameter PLE n-gram table. Our ROCmFP4 quant of it is 98.5 GiB and, with `--ple-disk`, runs on the same 128 GB machine **with ~36 GB of RAM to spare**: the PLE table is never loaded — its blocks are read on demand straight from the GGUF on disk, the output stays char-identical, and warm token generation costs ~3%.
+This is a llama.cpp laboratory for one machine class: AMD Strix Halo (Ryzen AI MAX+ 395, 128 GB unified memory) — the owl above is **Strix Lean**, this lab's mascot. The headline is the **qwen4exp** line — Qwen3.8-Flash-Next, the 180B-class hybrid mixing gated-deltanet linear attention, 4-stream low-rank hyper-connections and a 51B-parameter PLE n-gram table. Our ROCmFP4 quant of it is 98.5 GiB and, with `--ple-disk`, runs on the same 128 GB machine **with ~36 GB of RAM to spare**: the PLE table is never loaded — its blocks are read on demand straight from the GGUF on disk, the output stays char-identical, and warm token generation costs ~3%.
 
 Around that model runs a small production stack, every piece of it measured on this hardware: one `llama-server` holding two speculative drafters — the target's built-in MTP (multi-token prediction) layer and an external DFlash2 block-diffusion drafter — with routing that picks the drafter that fits each request; vision input working *together with* MTP speculation; a reasoning budget with a warn window at 75% instead of a hard cliff; and, behind all of it, the full ROCmFP4-STRIX_LEAN quantization pipeline (imatrix → quantize → sanitize → publish).
 
@@ -125,7 +125,7 @@ docker run -d --name owl --network host --device /dev/dri --group-add render \
   -ngl 999 --jinja -c 16384 --no-mmap --ple-disk --metrics --port 1234
 
 curl http://localhost:1234/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Who is the Strix Owl?"}]}'
+  -d '{"messages":[{"role":"user","content":"Who is Strix Lean?"}]}'
 ```
 
 # Credits 🙏
