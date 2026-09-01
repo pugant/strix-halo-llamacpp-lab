@@ -1,0 +1,35 @@
+From 2b4f55a1deca0f5f5bc5f64f366f4c42d4cde33c Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 1 Sep 2026 13:02:46 +0200
+Subject: [PATCH] t23: save_disk text-token view for mtmd-flagged prompts
+
+get_tokens() asserts on prompts flagged has_mtmd, which every slot of a
+multimodal server is born with (mctx != nullptr) even for pure-text
+prompts - the newly unblocked disk save crashed there on production.
+The media gate above guarantees no media chunks, so the text-only view
+is exact.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-task.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 18488a477..c378b70d4 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -3051,7 +3051,10 @@ bool server_prompt_cache::save_disk(
+         return false;
+     }
+ 
+-    const auto & tokens = prompt.tokens.get_tokens();
++    // T23: get_tokens() asserts on mtmd-flagged prompts, and slots of multimodal
++    // servers are born has_mtmd = true even for pure-text prompts. The media gate
++    // above guarantees no media chunks here, so the text-only view is exact.
++    const llama_tokens tokens = prompt.tokens.get_text_tokens();
+     const size_t token_bytes = tokens.size()*sizeof(llama_token);
+     const size_t file_overhead = 3*sizeof(uint32_t) + token_bytes;
+     const size_t state_size_main = llama_state_seq_get_size_ext(ctx_main, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+-- 
+2.53.0
+

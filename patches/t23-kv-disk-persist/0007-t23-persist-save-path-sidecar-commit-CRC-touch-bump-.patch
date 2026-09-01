@@ -1,0 +1,381 @@
+From a73e226d49a2697609cc11d4add679b93572186b Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 1 Sep 2026 01:41:15 +0200
+Subject: [PATCH] t23: persist save path (sidecar commit, CRC, touch-bump,
+ prefix reclaim)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-task.cpp | 235 +++++++++++++++++++++++++++++++----
+ tools/server/server-task.h   |   7 ++
+ 2 files changed, 221 insertions(+), 21 deletions(-)
+
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 58884f411..5f0d682b3 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -2519,9 +2519,12 @@ void server_prompt_cache::boot_persist(const std::string & cache_root_utf8, cons
+             std::error_code rm_ec;
+             fs::remove_all(entry.path(), rm_ec);
+             if (rm_ec) {
++                // not removed: keep the distinct "pending" wording only, so an
++                // operator grepping the plain marker sees real removals
+                 SRV_WRN("persist boot discard pending: entry=%s reason=%s error=%s\n", name.c_str(), reason, rm_ec.message().c_str());
++            } else {
++                SRV_WRN("persist boot discard: entry=%s reason=%s\n", name.c_str(), reason);
+             }
+-            SRV_WRN("persist boot discard: entry=%s reason=%s\n", name.c_str(), reason);
+         };
+ 
+         const std::string stem = "state-" + std::to_string(id);
+@@ -2594,6 +2597,12 @@ void server_prompt_cache::boot_persist(const std::string & cache_root_utf8, cons
+ 
+         adopted.push_back(std::move(state));
+     }
++    if (ec) {
++        // a surviving error here means the iterator itself failed to construct
++        // or advance: the library was (partially) not scanned, say so instead
++        // of silently starting from an empty library
++        SRV_WRN("persist boot scan failed: %s\n", ec.message().c_str());
++    }
+     ec.clear();
+ 
+     // 5. oldest first (list order is the LRU order everywhere else in this
+@@ -2703,6 +2712,70 @@ std::list<server_prompt_disk_state>::iterator server_prompt_cache::persist_pick_
+     return best;
+ }
+ 
++bool server_prompt_cache::persist_write_meta(const server_prompt_disk_state & state) {
++    const fs::path entry_dir     = fs::u8path(persist_path) / ("entry-" + std::to_string(state.id));
++    const fs::path path_meta_tmp = entry_dir / "meta.tmp";
++    const fs::path path_meta     = entry_dir / "meta";
++    const std::string path_meta_tmp_utf8 = server_prompt_cache_disk_path_utf8(path_meta_tmp);
++    const std::string path_meta_utf8     = server_prompt_cache_disk_path_utf8(path_meta);
++
++    llama_persist_meta meta;
++    memcpy(meta.fingerprint, persist_fingerprint, sizeof(persist_fingerprint));
++    meta.drafter    = (uint32_t) state.drafter;
++    meta.size_main  = state.size_main;
++    meta.size_drft  = state.size_drft;
++    meta.crc_main   = state.crc_main;
++    meta.crc_drft   = state.crc_drft;
++    meta.hits       = state.hits;
++    meta.created_at = state.created_at;
++    meta.last_used  = state.last_used;
++    meta.tokens     = state.tokens.get_tokens();
++    meta.spec       = state.spec;
++
++    std::vector<uint8_t> blob;
++    if (!llama_persist_meta_serialize(meta, blob)) {
++        SRV_ERR("persist meta serialize failed: entry=%" PRIu64 " path=%s\n", state.id, path_meta_utf8.c_str());
++        return false;
++    }
++
++    {
++        std::ofstream file(path_meta_tmp, std::ios::binary | std::ios::trunc);
++        file.write(reinterpret_cast<const char *>(blob.data()), (std::streamsize) blob.size());
++        file.flush();
++        if (!file.good()) {
++            SRV_ERR("persist meta write failed: entry=%" PRIu64 " path=%s\n", state.id, path_meta_tmp_utf8.c_str());
++            server_prompt_cache_disk_remove_file(path_meta_tmp_utf8);
++            return false;
++        }
++    }
++
++    std::error_code ec;
++    fs::permissions(path_meta_tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
++    if (ec) {
++        SRV_ERR("persist meta permissions failed: entry=%" PRIu64 " path=%s error=%s\n",
++                state.id, path_meta_tmp_utf8.c_str(), ec.message().c_str());
++        server_prompt_cache_disk_remove_file(path_meta_tmp_utf8);
++        return false;
++    }
++
++    // durable before the rename (durable=true fsyncs and drops the pages)
++    if (!server_prompt_cache_disk_flush_and_drop(path_meta_tmp_utf8, true)) {
++        server_prompt_cache_disk_remove_file(path_meta_tmp_utf8);
++        return false;
++    }
++
++    // THE entry commit: only now does boot adopt see a complete entry
++    ec.clear();
++    fs::rename(path_meta_tmp, path_meta, ec);
++    if (ec) {
++        SRV_ERR("persist meta rename failed: entry=%" PRIu64 " path=%s error=%s\n",
++                state.id, path_meta_utf8.c_str(), ec.message().c_str());
++        server_prompt_cache_disk_remove_file(path_meta_tmp_utf8);
++        return false;
++    }
++    return true;
++}
++
+ server_prompt_cache::~server_prompt_cache() {
+     if (!persist_path.empty()) {
+         // T23: the persistent library deliberately survives this run; only the
+@@ -2786,6 +2859,10 @@ size_t server_prompt_cache::disk_n_tokens() const {
+ 
+ void server_prompt_cache::disable_disk_saves(const char * reason, const std::string & path) {
+     disk_save_failures++;
++    if (!persist_path.empty()) {
++        // T23: with the persistent library active every save IS a persist save
++        persist_save_failures++;
++    }
+     if (disk_save_disabled) {
+         return;
+     }
+@@ -2859,6 +2936,17 @@ bool server_prompt_cache::save_disk(
+         return false;
+     }
+ 
++    // T23: with the persistent library active every save goes to its own
++    // entry directory below the library; the per-run path is byte-identical
++    // to before otherwise
++    const bool persist_on = !persist_path.empty();
++
++    if (persist_on && prompt.tokens.size() < (size_t) persist_min_tokens) {
++        SRV_INF("persist save skip: reason=min-tokens tokens=%zu min=%d\n",
++                prompt.tokens.size(), persist_min_tokens);
++        return false;
++    }
++
+     // If a usable cached prompt already contains the current stateless prompt,
+     // retain the more useful state without rewriting the SSD. Stateful MTP
+     // blobs are valid only at their exact token boundary, so they may touch an
+@@ -2907,6 +2995,21 @@ bool server_prompt_cache::save_disk(
+             SRV_INF("prompt cache disk touch: entry=%" PRIu64 " lcp=%d tokens=%zu exact=%s stateful=%s safe_to_clear=true path=%s\n",
+                     id, lcp, prompt.tokens.size(), exact_tokens ? "true" : "false",
+                     state_spec.empty() ? "false" : "true", disk_owned_path.c_str());
++            if (persist_on) {
++                // T23: usage bookkeeping for the persistent library. The sidecar
++                // rewrite is best-effort: on failure the previous on-disk
++                // hits/last_used survive (the entry itself is intact), so this
++                // is NOT a save failure.
++                it->hits++;
++                it->last_used = (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(
++                    std::chrono::system_clock::now().time_since_epoch()).count();
++                persist_touches++;
++                if (persist_write_meta(*it)) {
++                    SRV_INF("persist touch: entry=%" PRIu64 " hits=%u\n", id, it->hits);
++                } else {
++                    SRV_WRN("persist touch meta rewrite failed: entry=%" PRIu64 " hits=%u\n", id, it->hits);
++                }
++            }
+             return true;
+         }
+     }
+@@ -2933,7 +3036,23 @@ bool server_prompt_cache::save_disk(
+     }
+ 
+     const uint64_t entry_id = disk_next_id++;
+-    const fs::path owned = fs::u8path(disk_owned_path);
++    // T23: persist saves live in their own entry dir (entry-<id>/) below the
++    // persistent library; per-run saves keep using the run directory. The
++    // tmp -> fsync -> chmod -> rename discipline below is shared unchanged.
++    const fs::path owned = persist_on
++        ? fs::u8path(persist_path) / ("entry-" + std::to_string(entry_id))
++        : fs::u8path(disk_owned_path);
++    const std::string owned_utf8 = server_prompt_cache_disk_path_utf8(owned);
++    if (persist_on) {
++        std::error_code mk_ec;
++        fs::create_directories(owned, mk_ec);
++        if (mk_ec || !fs::is_directory(owned)) {
++            SRV_ERR("persist entry create failed: entry=%" PRIu64 " path=%s error=%s\n",
++                    entry_id, owned_utf8.c_str(), mk_ec.message().c_str());
++            disable_disk_saves("entry-dir-create", owned_utf8);
++            return false;
++        }
++    }
+     const std::string stem = "state-" + std::to_string(entry_id);
+     const fs::path path_main_tmp = owned / (stem + "-target.bin.tmp");
+     const fs::path path_main     = owned / (stem + "-target.bin");
+@@ -2960,6 +3079,12 @@ bool server_prompt_cache::save_disk(
+ 
+     const int64_t t_start = ggml_time_us();
+ 
++    // T23: CRC of the persisted bytes, computed on the durable tmp file BEFORE
++    // the rename; an unreadable/short/long file right after writing it means
++    // the storage is broken - a save failure like any other
++    uint32_t crc_main = 0;
++    uint32_t crc_drft = 0;
++
+     const size_t n_main = llama_state_seq_save_file(
+         ctx_main, path_main_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size());
+     size_t actual_main = 0;
+@@ -2970,6 +3095,11 @@ bool server_prompt_cache::save_disk(
+                 entry_id, path_main_tmp_utf8.c_str());
+         return fail_io("target-save", path_main_tmp_utf8);
+     }
++    if (persist_on && !llama_persist_crc32_file(path_main_tmp_utf8.c_str(), (uint64_t) n_main, &crc_main)) {
++        SRV_ERR("persist crc failed: entry=%" PRIu64 " component=target bytes=%zu path=%s\n",
++                entry_id, n_main, path_main_tmp_utf8.c_str());
++        return fail_io("target-crc", path_main_tmp_utf8);
++    }
+ 
+     size_t n_drft = 0;
+     if (ctx_drft) {
+@@ -2983,6 +3113,11 @@ bool server_prompt_cache::save_disk(
+                     entry_id, path_drft_tmp_utf8.c_str());
+             return fail_io("draft-save", path_drft_tmp_utf8);
+         }
++        if (persist_on && !llama_persist_crc32_file(path_drft_tmp_utf8.c_str(), (uint64_t) n_drft, &crc_drft)) {
++            SRV_ERR("persist crc failed: entry=%" PRIu64 " component=draft bytes=%zu path=%s\n",
++                    entry_id, n_drft, path_drft_tmp_utf8.c_str());
++            return fail_io("draft-crc", path_drft_tmp_utf8);
++        }
+     }
+ 
+     const size_t actual_total = n_main + n_drft;
+@@ -3040,18 +3175,6 @@ bool server_prompt_cache::save_disk(
+         }
+     }
+ 
+-    if (!server_prompt_cache_disk_sync_dir(disk_owned_path) ||
+-        !server_prompt_cache_disk_flush_and_drop(path_main_utf8, false) ||
+-        (ctx_drft && !server_prompt_cache_disk_flush_and_drop(path_drft_utf8, false))) {
+-        const bool main_cleanup_ok = server_prompt_cache_disk_remove_file(path_main_utf8);
+-        const bool drft_cleanup_ok = server_prompt_cache_disk_remove_file(path_drft_utf8);
+-        disable_disk_saves("commit-sync", disk_owned_path);
+-        if (!main_cleanup_ok || !drft_cleanup_ok) {
+-            disable_disk_saves("commit-sync-cleanup", disk_owned_path);
+-        }
+-        return false;
+-    }
+-
+     server_prompt_disk_state state;
+     state.tokens    = prompt.tokens.clone();
+     state.path_main = path_main_utf8;
+@@ -3067,10 +3190,60 @@ bool server_prompt_cache::save_disk(
+         state.checkpoints.push_back({ckpt.n_tokens, ckpt.pos_min, ckpt.pos_max});
+     }
+ 
++    // T23: the sidecar is committed LAST. Until the meta rename lands, the
++    // entry is invisible to boot adoption (a crashed save leaves only tmp or
++    // bin files, which the next boot discards); after it, the bins + sidecar
++    // form one atomic entry. fsync order: data files -> meta.tmp fsync ->
++    // meta rename -> entry-dir fsync (below).
++    if (persist_on) {
++        const auto now_s = (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(
++            std::chrono::system_clock::now().time_since_epoch()).count();
++        state.hits       = 0;
++        state.created_at = now_s;
++        state.last_used  = now_s;
++        state.crc_main   = crc_main;
++        state.crc_drft   = crc_drft;
++
++        if (!persist_write_meta(state)) {
++            std::error_code rm_ec;
++            fs::remove_all(owned, rm_ec);
++            disable_disk_saves("meta-commit", owned_utf8);
++            if (rm_ec) {
++                disable_disk_saves("meta-commit-cleanup", owned_utf8);
++            }
++            return false;
++        }
++    }
++
++    if (!server_prompt_cache_disk_sync_dir(owned_utf8) ||
++        !server_prompt_cache_disk_flush_and_drop(path_main_utf8, false) ||
++        (ctx_drft && !server_prompt_cache_disk_flush_and_drop(path_drft_utf8, false))) {
++        disable_disk_saves("commit-sync", owned_utf8);
++        if (persist_on) {
++            // uncommitted (no sidecar survived): drop the whole entry dir
++            std::error_code rm_ec;
++            fs::remove_all(owned, rm_ec);
++            if (rm_ec) {
++                disable_disk_saves("commit-sync-cleanup", owned_utf8);
++            }
++        } else {
++            const bool main_cleanup_ok = server_prompt_cache_disk_remove_file(path_main_utf8);
++            const bool drft_cleanup_ok = server_prompt_cache_disk_remove_file(path_drft_utf8);
++            if (!main_cleanup_ok || !drft_cleanup_ok) {
++                disable_disk_saves("commit-sync-cleanup", disk_owned_path);
++            }
++        }
++        return false;
++    }
++
+     disk_states.push_back(std::move(state));
+     disk_size_total    += actual_total;
+     disk_saves++;
+     disk_bytes_written += actual_total;
++    if (persist_on) {
++        persist_saves++;
++        persist_bytes_written += actual_total;
++    }
+ 
+     auto new_entry = std::prev(disk_states.end());
+     bool reclaim_ok = true;
+@@ -3095,6 +3268,8 @@ bool server_prompt_cache::save_disk(
+         }
+     }
+ 
++    // B4: victim selection - with the persistent library active this loop must
++    // erase via persist_pick_victim (decayed-hit score), not list-front order
+     while (reclaim_ok && disk_size_total > disk_limit_size) {
+         if (disk_states.begin() == new_entry) {
+             SRV_ERR("prompt cache disk reclaim failed: entry=%" PRIu64 " reason=no-old-victim accounted_bytes=%zu limit_bytes=%zu path=%s\n",
+@@ -3118,6 +3293,10 @@ bool server_prompt_cache::save_disk(
+     const double t_ms = (ggml_time_us() - t_start)/1000.0;
+     SRV_INF("prompt cache disk save: entry=%" PRIu64 " tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu save_ms=%.2f path=%s\n",
+             entry_id, tokens.size(), prompt.checkpoints.size(), n_main, n_drft, state_spec.size(), actual_total, t_ms, disk_owned_path.c_str());
++    if (persist_on) {
++        SRV_INF("persist save: entry=%" PRIu64 " tokens=%zu bytes=%zu save_ms=%.1f\n",
++                entry_id, tokens.size(), actual_total, t_ms);
++    }
+     log_disk_state();
+ 
+     return true;
+@@ -3362,13 +3541,27 @@ bool server_prompt_cache::erase_disk_state(
+     // Quarantine before touching either component. If only one unlink works,
+     // retain the full conservative accounting and metadata for a later retry.
+     it->usable = false;
+-    const bool main_ok = server_prompt_cache_disk_remove_file(path_main);
+-    const bool drft_ok = server_prompt_cache_disk_remove_file(path_drft);
+-    if (!main_ok || !drft_ok) {
+-        SRV_ERR("prompt cache disk removal failed: entry=%" PRIu64 " reason=%s target_removed=%s draft_removed=%s accounted_bytes=%zu path=%s\n",
+-                entry_id, reason, main_ok ? "true" : "false", drft_ok ? "true" : "false",
+-                disk_size_total, disk_owned_path.c_str());
+-        return false;
++    if (!persist_path.empty()) {
++        // T23: a library entry owns a whole entry-<id>/ directory (bins +
++        // sidecar): remove it entire so no meta-only husk survives on disk
++        const fs::path entry_dir = fs::u8path(persist_path) / ("entry-" + std::to_string(entry_id));
++        const std::string entry_dir_utf8 = server_prompt_cache_disk_path_utf8(entry_dir);
++        std::error_code rm_ec;
++        fs::remove_all(entry_dir, rm_ec);
++        if (rm_ec) {
++            SRV_ERR("persist removal failed: entry=%" PRIu64 " reason=%s accounted_bytes=%zu path=%s error=%s\n",
++                    entry_id, reason, disk_size_total, entry_dir_utf8.c_str(), rm_ec.message().c_str());
++            return false;
++        }
++    } else {
++        const bool main_ok = server_prompt_cache_disk_remove_file(path_main);
++        const bool drft_ok = server_prompt_cache_disk_remove_file(path_drft);
++        if (!main_ok || !drft_ok) {
++            SRV_ERR("prompt cache disk removal failed: entry=%" PRIu64 " reason=%s target_removed=%s draft_removed=%s accounted_bytes=%zu path=%s\n",
++                    entry_id, reason, main_ok ? "true" : "false", drft_ok ? "true" : "false",
++                    disk_size_total, disk_owned_path.c_str());
++            return false;
++        }
+     }
+ 
+     if (total_bytes > disk_size_total) {
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index d4737b56c..1e1c84e6e 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -868,4 +868,11 @@ private:
+     // hit score; ties break to the older last_used, then the smaller id.
+     // Returns end() when nothing is eligible. exclude_id = 0 excludes nothing.
+     std::list<server_prompt_disk_state>::iterator persist_pick_victim(uint64_t exclude_id);
++
++    // T23: write (or rewrite) an entry's metadata sidecar: serialize -> meta.tmp
++    // -> fsync -> atomic rename to meta. The meta rename is the entry's commit
++    // point (before it, a crashed save leaves only tmp/partial files which the
++    // next boot discards). Returns false on any IO failure; the caller decides
++    // the severity (save-time = failure, touch-time = best-effort).
++    bool persist_write_meta(const server_prompt_disk_state & state);
+ };
+-- 
+2.53.0
+

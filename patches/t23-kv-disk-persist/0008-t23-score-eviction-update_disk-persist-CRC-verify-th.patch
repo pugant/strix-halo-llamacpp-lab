@@ -1,0 +1,302 @@
+From 9e91108640b798c5735debf7d2663afbdbffe6b9 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 1 Sep 2026 02:19:42 +0200
+Subject: [PATCH] t23: score eviction + update_disk persist + CRC
+ verify-then-load + hit bump
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-task.cpp | 160 +++++++++++++++++++++++++++++++++--
+ tools/server/server-task.h   |  22 ++++-
+ 2 files changed, 175 insertions(+), 7 deletions(-)
+
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 5f0d682b3..4d7c246d6 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -2549,6 +2549,12 @@ void server_prompt_cache::boot_persist(const std::string & cache_root_utf8, cons
+             continue;
+         }
+ 
++        // T23: the sidecar drafter tag must name a real drafter - a value
++        // outside the enum is a corrupt/mutated sidecar, not "another config"
++        if (meta.drafter >= (uint32_t) COMMON_SPECULATIVE_TYPE_COUNT) {
++            discard("meta-invalid-drafter");
++            continue;
++        }
+         if (meta.size_main == 0 ||
+             meta.size_main > (uint64_t) std::numeric_limits<size_t>::max() ||
+             meta.size_drft > (uint64_t) std::numeric_limits<size_t>::max()) {
+@@ -3268,9 +3274,31 @@ bool server_prompt_cache::save_disk(
+         }
+     }
+ 
+-    // B4: victim selection - with the persistent library active this loop must
+-    // erase via persist_pick_victim (decayed-hit score), not list-front order
++    // T23: with the persistent library active the victim is chosen by decayed
++    // hit score (never the just-committed entry); the per-run cache keeps the
++    // strict list-front (LRU) order as before
+     while (reclaim_ok && disk_size_total > disk_limit_size) {
++        if (persist_on) {
++            const auto victim = persist_pick_victim(entry_id);
++            if (victim == disk_states.end()) {
++                // the only library entry is the one just committed: keep it and
++                // accept the transient staging headroom (spec t23 par. 4) -
++                // removing the new entry or disabling saves would defeat the
++                // library's purpose for no benefit
++                SRV_WRN("persist over-budget: entry=%" PRIu64 " bytes=%zu limit_bytes=%zu reason=no-victim\n",
++                        entry_id, disk_size_total, disk_limit_size);
++                break;
++            }
++            const uint64_t victim_id = victim->id;
++            if (!erase_disk_state(victim, true, "save-limit")) {
++                disable_disk_saves("persist-reclaim", disk_owned_path);
++                reclaim_ok = false;
++                break;
++            }
++            persist_evictions++;
++            SRV_INF("persist evict: entry=%" PRIu64 " reason=save-limit\n", victim_id);
++            continue;
++        }
+         if (disk_states.begin() == new_entry) {
+             SRV_ERR("prompt cache disk reclaim failed: entry=%" PRIu64 " reason=no-old-victim accounted_bytes=%zu limit_bytes=%zu path=%s\n",
+                     entry_id, disk_size_total, disk_limit_size, disk_owned_path.c_str());
+@@ -3411,13 +3439,21 @@ bool server_prompt_cache::load_disk(
+               size_t   lcp,
+             uint64_t * entry_id_out,
+         common_speculative_type drafter_active,
+-              bool * tag_mismatch) {
++              bool * tag_mismatch,
++              double * load_ms_out,
++              size_t * n_tokens_main_out) {
+     if (entry_id_out != nullptr) {
+         *entry_id_out = 0;
+     }
+     if (tag_mismatch != nullptr) {
+         *tag_mismatch = false;
+     }
++    if (load_ms_out != nullptr) {
++        *load_ms_out = 0.0;
++    }
++    if (n_tokens_main_out != nullptr) {
++        *n_tokens_main_out = 0;
++    }
+ 
+     // spec-route: an entry tagged with a different (concrete) drafter still has
+     // a perfectly valid target payload - only its draft file belongs to another
+@@ -3468,6 +3504,28 @@ bool server_prompt_cache::load_disk(
+         return reject_entry("missing-draft-file");
+     }
+ 
++    // T23: verify-then-load. A persisted entry is fed into the contexts only
++    // when its payload still matches the sidecar CRC; a mismatch - or an
++    // unreadable file, which counts as one - is corruption, so the whole entry
++    // is discarded instead. The draft is verified only when it is about to be
++    // loaded (a tag mismatch skips its restoration by design).
++    if (!persist_path.empty()) {
++        const uint32_t crc_main_expected = it->crc_main;
++        const uint32_t crc_drft_expected = it->crc_drft;
++        uint32_t crc = 0;
++        if (!llama_persist_crc32_file(path_main.c_str(), (uint64_t) target_bytes, &crc) || crc != crc_main_expected) {
++            SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-target\n", entry_id);
++            return reject_entry("crc-mismatch-target");
++        }
++        if (!path_drft.empty() && tag_match) {
++            crc = 0;
++            if (!llama_persist_crc32_file(path_drft.c_str(), (uint64_t) draft_bytes, &crc) || crc != crc_drft_expected) {
++                SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-draft\n", entry_id);
++                return reject_entry("crc-mismatch-draft");
++            }
++        }
++    }
++
+     const int64_t t_start = ggml_time_us();
+ 
+     llama_tokens tokens_main(n_tokens_expected);
+@@ -3513,6 +3571,11 @@ bool server_prompt_cache::load_disk(
+     prompt = std::move(restored);
+ 
+     disk_bytes_read += nread_main + nread_drft;
++    if (!persist_path.empty()) {
++        // T23: payload bytes actually read from the persistent library (counted
++        // once per successful restore, here where the read happens)
++        persist_bytes_read += nread_main + nread_drft;
++    }
+ 
+     const double t_ms = (ggml_time_us() - t_start)/1000.0;
+     SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu load_ms=%.2f path=%s\n",
+@@ -3522,6 +3585,12 @@ bool server_prompt_cache::load_disk(
+     if (entry_id_out != nullptr) {
+         *entry_id_out = entry_id;
+     }
++    if (load_ms_out != nullptr) {
++        *load_ms_out = t_ms;
++    }
++    if (n_tokens_main_out != nullptr) {
++        *n_tokens_main_out = n_tokens_main;
++    }
+     return true;
+ }
+ 
+@@ -3590,6 +3659,12 @@ void server_prompt_cache::accept_disk_load(uint64_t entry_id) {
+         return;
+     }
+ 
++    // T23: take ownership of the pending stash now - it describes THIS restore
++    // (the caller hands back the id load_disk reported), and a later, unrelated
++    // accept must never be able to match stale numbers
++    const auto pending = !persist_path.empty() ? pending_load : decltype(pending_load){};
++    pending_load = {};
++
+     for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
+         if (it->id != entry_id || !it->usable) {
+             continue;
+@@ -3599,6 +3674,31 @@ void server_prompt_cache::accept_disk_load(uint64_t entry_id) {
+         disk_states.splice(disk_states.end(), disk_states, it);
+         SRV_INF("prompt cache disk load accepted: entry=%" PRIu64 " reusable=true path=%s\n",
+                 entry_id, disk_owned_path.c_str());
++
++        // T23: cross-restart hit bookkeeping. The sidecar rewrite is best-effort
++        // (same discipline as the save-time touch: on failure the previous
++        // on-disk hits/last_used survive, the entry itself is intact). The
++        // gauges and the marker report the stashed measurements of this
++        // restore, never numbers recomputed here.
++        if (pending.valid && pending.entry_id == entry_id) {
++            it->hits++;
++            it->last_used = (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(
++                std::chrono::system_clock::now().time_since_epoch()).count();
++            if (persist_write_meta(*it)) {
++                SRV_INF("persist hit: entry=%" PRIu64 " hits=%u\n", entry_id, it->hits);
++            } else {
++                SRV_WRN("persist hit meta rewrite failed: entry=%" PRIu64 " hits=%u\n", entry_id, it->hits);
++            }
++
++            persist_loads++;
++            persist_hits++;
++            persist_last_restore_ms       = pending.load_ms;
++            persist_last_tokens_restored  = pending.lcp;
++            persist_last_tokens_prefilled = pending.prompt_tokens_total > pending.lcp
++                ? pending.prompt_tokens_total - pending.lcp : 0;
++            SRV_INF("persist load: entry=%" PRIu64 " restored=%zu prefilled=%zu ms=%.1f\n",
++                    entry_id, persist_last_tokens_restored, persist_last_tokens_prefilled, pending.load_ms);
++        }
+         log_disk_state();
+         return;
+     }
+@@ -3609,6 +3709,16 @@ void server_prompt_cache::reject_disk_load(uint64_t entry_id, const char * reaso
+         return;
+     }
+ 
++    if (!persist_path.empty()) {
++        // T23: a restore the speculative state refused is no hit - neither the
++        // gauges nor the hit counters may count it, and a pending stash for
++        // this entry must not survive into a later accept
++        if (pending_load.valid && pending_load.entry_id == entry_id) {
++            pending_load = {};
++        }
++        SRV_WRN("persist reject: entry=%" PRIu64 " reason=%s\n", entry_id, reason);
++    }
++
+     for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
+         if (it->id != entry_id) {
+             continue;
+@@ -3626,7 +3736,29 @@ void server_prompt_cache::reject_disk_load(uint64_t entry_id, const char * reaso
+ }
+ 
+ void server_prompt_cache::update_disk() {
++    const bool persist_on = !persist_path.empty();
++
+     while (!disk_states.empty() && disk_size_total > disk_limit_size) {
++        if (persist_on) {
++            // T23: same decayed-hit-score victim choice as the save path -
++            // nothing is excluded here, every library entry is evictable
++            const auto victim = persist_pick_victim(0);
++            if (victim == disk_states.end()) {
++                // nothing eligible left: keep what remains and accept the
++                // transient headroom (spec t23 par. 4)
++                SRV_WRN("persist over-budget: entry=0 bytes=%zu limit_bytes=%zu reason=no-victim\n",
++                        disk_size_total, disk_limit_size);
++                break;
++            }
++            const uint64_t victim_id = victim->id;
++            if (!erase_disk_state(victim, true, "update-limit")) {
++                disable_disk_saves("persist-update-reclaim", disk_owned_path);
++                break;
++            }
++            persist_evictions++;
++            SRV_INF("persist evict: entry=%" PRIu64 " reason=update-limit\n", victim_id);
++            continue;
++        }
+         if (!erase_disk_state(disk_states.begin(), true, "lru-update-limit")) {
+             disable_disk_saves("update-limit-removal", disk_owned_path);
+             break;
+@@ -3804,9 +3936,25 @@ bool server_prompt_cache::load(
+     if (it_best_disk != disk_states.end()) {
+         SRV_INF(" - found better disk prompt with f_keep = %.3f, sim = %.3f, lcp = %zu\n",
+                 f_keep_best, sim_best, lcp_selected);
+-        const bool loaded = load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, disk_entry_id, drafter_active, tag_mismatch);
+-        if (loaded && cache_hit != nullptr) {
+-            *cache_hit = true;
++        double load_ms = 0.0;
++        size_t n_tokens_main = 0;
++        const bool loaded = load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, disk_entry_id, drafter_active, tag_mismatch, &load_ms, &n_tokens_main);
++        if (loaded) {
++            if (cache_hit != nullptr) {
++                *cache_hit = true;
++            }
++            if (!persist_path.empty()) {
++                // T23: stash the restore measurements here - this is the only
++                // place that knows the full new-prompt token count; the caller
++                // hands the entry id back to accept_disk_load/reject_disk_load,
++                // which consume the stash on this same thread
++                pending_load.entry_id            = disk_entry_id != nullptr ? *disk_entry_id : 0;
++                pending_load.load_ms             = load_ms;
++                pending_load.n_tokens_main       = n_tokens_main;
++                pending_load.lcp                 = lcp_selected;
++                pending_load.prompt_tokens_total = tokens_new.size();
++                pending_load.valid               = true;
++            }
+         }
+         return loaded;
+     }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 1e1c84e6e..a89384827 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -844,7 +844,10 @@ private:
+               size_t   lcp,
+             uint64_t * entry_id_out,
+         common_speculative_type drafter_active,
+-              bool * tag_mismatch);
++              bool * tag_mismatch,
++            // T23: restore measurements for the pending-load stash (see below)
++              double * load_ms_out,
++              size_t * n_tokens_main_out);
+ 
+     bool erase_disk_state(std::list<server_prompt_disk_state>::iterator it, bool eviction, const char * reason);
+ 
+@@ -875,4 +878,21 @@ private:
+     // next boot discards). Returns false on any IO failure; the caller decides
+     // the severity (save-time = failure, touch-time = best-effort).
+     bool persist_write_meta(const server_prompt_disk_state & state);
++
++    // T23: measurements of the in-flight disk restore. load_disk is the only
++    // place that measures it (load_ms, tokens restored) and load() the only one
++    // that knows the full new-prompt token count - the stash carries both to
++    // accept_disk_load/reject_disk_load, which the caller invokes on the same
++    // main-loop thread right after the load. The restore gauges and the
++    // persist-load marker report these stashed numbers, never recomputed ones.
++    struct persist_pending_load {
++        uint64_t entry_id            = 0;
++        double   load_ms             = 0.0;
++        size_t   n_tokens_main       = 0;  // tokens the entry restored
++        size_t   lcp                 = 0;  // of those, the prefix the new prompt reuses
++        size_t   prompt_tokens_total = 0;  // full length of the new prompt
++        bool     valid               = false;
++    };
++
++    persist_pending_load pending_load = {};
+ };
+-- 
+2.53.0
+

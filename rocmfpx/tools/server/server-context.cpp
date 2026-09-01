@@ -12,6 +12,7 @@
 #include "llama.h"
 #include "../../src/llama-ext.h"
 #include "../../src/llama-model.h" // t25: model_tgt->get_ple_stats() needs the full llama_model
+#include "../../src/llama-persist-meta.h" // t23: persistent prompt-cache fingerprint
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1490,6 +1491,38 @@ private:
 
         const bool cache_disk_enabled = !params_base.cache_disk_path.empty() && params_base.cache_disk_limit_mib > 0;
 
+        // T23: the persistent library is keyed by the model/drafter/KV-type
+        // identity; entries written by a different config are never adopted
+        // (they stay on disk as orphans, subject only to budget-driven GC)
+        const bool cache_persist_enabled = cache_disk_enabled && params_base.cache_disk_persist;
+        uint8_t cache_persist_fingerprint[16] = {0};
+        if (cache_persist_enabled) {
+            std::error_code fs_ec;
+            uint64_t model_size = 0;
+            if (!params_base.model.path.empty()) {
+                model_size = std::filesystem::file_size(params_base.model.path, fs_ec);
+                if (fs_ec) {
+                    model_size = 0;
+                    fs_ec.clear();
+                }
+            }
+            const std::string & drafter_path = params_base.speculative.draft.mparams.path;
+            uint64_t drafter_size = 0;
+            if (!drafter_path.empty()) {
+                drafter_size = std::filesystem::file_size(drafter_path, fs_ec);
+                if (fs_ec) {
+                    drafter_size = 0;
+                    fs_ec.clear();
+                }
+            }
+            const std::string cache_kv = std::string(ggml_type_name(params_base.cache_type_k)) + "/" +
+                ggml_type_name(params_base.cache_type_v);
+            llama_persist_fingerprint(params_base.model.path.c_str(), model_size,
+                                      drafter_path.empty() ? nullptr : drafter_path.c_str(),
+                                      drafter_size, cache_kv.c_str(), LLAMA_STATE_SEQ_VERSION,
+                                      cache_persist_fingerprint);
+        }
+
         if (params_base.cache_ram_mib != 0 || cache_disk_enabled) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_INF("prompt cache RAM enabled: limit=%s\n", "unlimited");
@@ -1508,7 +1541,10 @@ private:
                 params_base.cache_ram_mib,
                 n_ctx,
                 params_base.cache_disk_path,
-                params_base.cache_disk_limit_mib);
+                params_base.cache_disk_limit_mib,
+                cache_persist_enabled ? cache_persist_fingerprint : nullptr,
+                cache_persist_enabled ? params_base.cache_disk_persist_mib : 0,
+                cache_persist_enabled ? params_base.cache_disk_persist_min_tokens : 0);
         } else {
             SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` or `--cache-disk PATH` to enable it\n");
         }
@@ -2760,6 +2796,24 @@ private:
                     res->ple_read_bytes_total  = ple_st.bytes_read;
                     res->ple_fetch_us_total    = ple_st.fetch_us;
                     res->ple_fetches_total     = ple_st.fetches;
+
+                    // t23: persistent library stats - the prompt cache is absent
+                    // when neither --cache-ram nor --cache-disk is set, in which
+                    // case the metrics are emitted at zero
+                    const persist_stats persist_st = prompt_cache ? prompt_cache->get_persist_stats() : persist_stats{};
+                    res->persist_saves_total         = persist_st.saves;
+                    res->persist_loads_total         = persist_st.loads;
+                    res->persist_hits_total          = persist_st.hits;
+                    res->persist_touches_total       = persist_st.touches;
+                    res->persist_evictions_total     = persist_st.evictions;
+                    res->persist_gc_orphans_total    = persist_st.gc_orphans;
+                    res->persist_bytes_written_total = persist_st.bytes_written;
+                    res->persist_bytes_read_total    = persist_st.bytes_read;
+                    res->persist_save_failures_total = persist_st.save_failures;
+
+                    res->persist_last_restore_ms       = persist_st.last_restore_ms;
+                    res->persist_last_tokens_restored  = persist_st.last_tokens_restored;
+                    res->persist_last_tokens_prefilled = persist_st.last_tokens_prefilled;
 
                     // PI F4 follow-up (29/08): speculative state reset counter
                     res->spec_state_resets_total = metrics.spec_state_resets_total;
@@ -5340,6 +5394,65 @@ void server_routes::init_routes() {
                 {"value", res_task->ple_fetches_total},
             });
 
+            // t23: persistent library counters (subset of the disk_* counters:
+            // with --cache-disk-persist every persist save/load/eviction also
+            // bumps the disk_ ones, so a dashboard watching only persist_* sees
+            // no double counting). Emitted unconditionally so they are present
+            // at 0 from boot even without --cache-disk-persist (see server_metrics)
+            counter_defs.push_back({
+                {"name",  "persist_saves_total"},
+                {"help",  "Number of prompt-cache states saved to the persistent library (--cache-disk-persist subset of disk saves)."},
+                {"value", res_task->persist_saves_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "persist_loads_total"},
+                {"help",  "Number of prompt-cache states restored from the persistent library (subset of disk loads)."},
+                {"value", res_task->persist_loads_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "persist_hits_total"},
+                {"help",  "Number of prompt-cache lookups served by a persistent library entry (prefix reused cross-restart)."},
+                {"value", res_task->persist_hits_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "persist_touches_total"},
+                {"help",  "Number of persistent library entries whose recency/hit metadata was refreshed on reuse."},
+                {"value", res_task->persist_touches_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "persist_evictions_total"},
+                {"help",  "Number of persistent library entries evicted to stay under --cache-disk-persist-mib (subset of disk evictions)."},
+                {"value", res_task->persist_evictions_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "persist_gc_orphans_total"},
+                {"help",  "Number of foreign/orphan directories removed from the persistent library at boot."},
+                {"value", res_task->persist_gc_orphans_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "persist_bytes_written_total"},
+                {"help",  "Number of bytes written to the persistent library (subset of disk bytes written)."},
+                {"value", res_task->persist_bytes_written_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "persist_bytes_read_total"},
+                {"help",  "Number of bytes read from the persistent library (subset of disk bytes read)."},
+                {"value", res_task->persist_bytes_read_total},
+            });
+
+            counter_defs.push_back({
+                {"name",  "persist_save_failures_total"},
+                {"help",  "Number of failed saves into the persistent library (IO/commit errors)."},
+                {"value", res_task->persist_save_failures_total},
+            });
+
             // PI F4 follow-up (pi-stack 29/08): emitted unconditionally so the
             // counter is present at 0 from boot (see server_metrics)
             counter_defs.push_back({
@@ -5356,6 +5469,31 @@ void server_routes::init_routes() {
                     {"value",  count},
                 });
             }
+        }
+
+        // t23: persistent library gauges - measurements of the last cross-restart
+        // restore (zeros until one happened). Same unconditional emission as the
+        // persist_* counters above
+        {
+            auto & gauge_defs = all_metrics_def["gauge"];
+
+            gauge_defs.push_back({
+                {"name",  "persist_last_restore_ms"},
+                {"help",  "Wall time of the last persistent-library restore, in milliseconds (0 until one happened)."},
+                {"value", res_task->persist_last_restore_ms},
+            });
+
+            gauge_defs.push_back({
+                {"name",  "persist_last_tokens_restored"},
+                {"help",  "Tokens the last persistent-library restore served from the library instead of prefill."},
+                {"value", res_task->persist_last_tokens_restored},
+            });
+
+            gauge_defs.push_back({
+                {"name",  "persist_last_tokens_prefilled"},
+                {"help",  "Tokens the last persistent-library restore still had to prefill (the non-common suffix)."},
+                {"value", res_task->persist_last_tokens_prefilled},
+            });
         }
 
         std::stringstream prometheus;

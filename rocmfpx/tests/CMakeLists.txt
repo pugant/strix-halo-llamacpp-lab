@@ -242,6 +242,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-ple-store.cpp)
+llama_build_and_test(test-persist-meta.cpp)
 llama_build_and_test(test-ple-dequant-parity.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 

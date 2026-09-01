@@ -395,7 +395,10 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
 }
 
 const llama_tokens & server_tokens::get_tokens() const {
-    GGML_ASSERT(!has_mtmd);
+    // T23: the slot-born flag (every prompt of a multimodal server is born
+    // has_mtmd = mctx != nullptr) does not imply media cells are present:
+    // the token list is safe to expose exactly when no media chunks are.
+    GGML_ASSERT(!has_mtmd || map_idx_to_media.empty());
     return tokens;
 }
 
@@ -411,7 +414,9 @@ llama_tokens server_tokens::get_text_tokens() const {
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    // T23: same rationale as get_tokens() - the slot-born multimodal flag alone
+    // must not block text-only prompts (see get_tokens).
+    GGML_ASSERT(!has_mtmd || map_idx_to_media.empty()); // no media cells allowed
     tokens[pos] = id;
 }
 

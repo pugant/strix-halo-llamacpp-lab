@@ -566,6 +566,24 @@ struct server_task_result_metrics : server_task_result {
     uint64_t ple_fetch_us_total    = 0;
     uint64_t ple_fetches_total     = 0;
 
+    // t23: persistent library counters (cumulative since model load; all zero
+    // without --cache-disk-persist). The persist_* family is the persist subset
+    // of the disk_* counters - see persist_stats.
+    uint64_t persist_saves_total         = 0;
+    uint64_t persist_loads_total         = 0;
+    uint64_t persist_hits_total          = 0;
+    uint64_t persist_touches_total       = 0;
+    uint64_t persist_evictions_total     = 0;
+    uint64_t persist_gc_orphans_total    = 0;
+    uint64_t persist_bytes_written_total = 0;
+    uint64_t persist_bytes_read_total    = 0;
+    uint64_t persist_save_failures_total = 0;
+
+    // t23: gauges of the last cross-restart restore
+    double   persist_last_restore_ms       = 0.0;
+    uint64_t persist_last_tokens_restored  = 0;
+    uint64_t persist_last_tokens_prefilled = 0;
+
     // PI F4 follow-up (29/08): speculative drafter state resets (the partial-reject
     // reset window), exported as spec_state_resets_total
     uint64_t spec_state_resets_total = 0;
@@ -684,6 +702,14 @@ struct server_prompt_disk_state {
     uint64_t id = 0;
     bool usable = true;
 
+    // T23 persistent library bookkeeping (persist only). Neutral defaults keep
+    // the per-run path byte-for-byte untouched.
+    uint32_t hits       = 0;
+    uint64_t created_at = 0;
+    uint64_t last_used  = 0;
+    uint32_t crc_main   = 0;
+    uint32_t crc_drft   = 0;
+
     size_t size() const {
         return size_main + size_drft;
     }
@@ -709,12 +735,35 @@ static inline bool spec_route_same_drafter(common_speculative_type a, common_spe
     return a == b;
 }
 
+// t23: live stats of the persistent library; zeroed when persist is disabled.
+// The persist_* values are a strict subset of the disk_* counters (every persist
+// save/load/eviction bumps both), so a dashboard watching only persist_* sees no
+// double counting.
+struct persist_stats {
+    uint64_t saves         = 0;
+    uint64_t loads         = 0;
+    uint64_t hits          = 0;
+    uint64_t touches       = 0;
+    uint64_t evictions     = 0;
+    uint64_t gc_orphans    = 0;
+    uint64_t bytes_written = 0;
+    uint64_t bytes_read    = 0;
+    uint64_t save_failures = 0;
+
+    double   last_restore_ms       = 0.0; // wall time of the last cross-restart restore
+    uint64_t last_tokens_restored  = 0;   // of it, the tokens served from the library
+    uint64_t last_tokens_prefilled = 0;   // of it, the tokens still prefilled by the model
+};
+
 struct server_prompt_cache {
     server_prompt_cache(
             int32_t limit_size_mib,
              size_t limit_tokens,
         const std::string & disk_base_path = {},
-            int32_t disk_limit_size_mib = 0);
+            int32_t disk_limit_size_mib = 0,
+        const uint8_t    fingerprint[16] = {},
+            int32_t persist_mib = 0,
+            int32_t persist_min_tokens = 1024);
 
     ~server_prompt_cache();
 
@@ -753,6 +802,21 @@ struct server_prompt_cache {
     // created for this server process.
     bool disk_save_disabled = false;
 
+    // T23 persistent library (all inert when persist_path is empty)
+    std::string persist_path;                 // <base>/<ns>/persist
+    size_t      persist_limit_size = 0;
+    int         persist_min_tokens = 1024;
+    uint8_t     persist_fingerprint[16] = {0};
+    uint64_t    persist_saves = 0, persist_loads = 0, persist_hits = 0;
+    uint64_t    persist_touches = 0, persist_evictions = 0, persist_gc_orphans = 0;
+    uint64_t    persist_bytes_written = 0, persist_bytes_read = 0;
+    uint64_t    persist_save_failures = 0;
+    double      persist_last_restore_ms = 0.0;   // last cross-restart restore
+    uint64_t    persist_last_tokens_restored = 0, persist_last_tokens_prefilled = 0;
+
+    // advisory lock on persist_path, held for the whole server lifetime
+    int persist_lock_fd = -1;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -760,6 +824,10 @@ struct server_prompt_cache {
     size_t disk_size() const;
 
     size_t disk_n_tokens() const;
+
+    // t23: copy-out of the persistent library counters/gauges (zeros when the
+    // persist library is disabled); read from the metrics task like get_ple_stats
+    persist_stats get_persist_stats() const;
 
     bool save(
         const server_prompt & prompt,
@@ -818,7 +886,10 @@ private:
               size_t   lcp,
             uint64_t * entry_id_out,
         common_speculative_type drafter_active,
-              bool * tag_mismatch);
+              bool * tag_mismatch,
+            // T23: restore measurements for the pending-load stash (see below)
+              double * load_ms_out,
+              size_t * n_tokens_main_out);
 
     bool erase_disk_state(std::list<server_prompt_disk_state>::iterator it, bool eviction, const char * reason);
 
@@ -827,4 +898,43 @@ private:
     void update_disk();
 
     void log_disk_state() const;
+
+    // T23: adopt the cross-restart persistent library at boot (persist only).
+    // Deterministic fixed order: create persist/, take the exclusive advisory
+    // lock, copy the identity fingerprint, scan entry-* directories, rebuild
+    // disk_states oldest-first, evict by decayed-hit score down to the library
+    // budget, GC foreign (orphan) entries only under budget pressure, then
+    // publish the next entry id. Fail-safe: never throws (the run-dir lock is
+    // already held); every failure disables persist only (persist_path cleared)
+    // and leaves the per-run cache fully working.
+    void boot_persist(const std::string & cache_root_utf8, const uint8_t * fingerprint);
+
+    // T23: eviction-victim choice for the persistent library - minimum decayed
+    // hit score; ties break to the older last_used, then the smaller id.
+    // Returns end() when nothing is eligible. exclude_id = 0 excludes nothing.
+    std::list<server_prompt_disk_state>::iterator persist_pick_victim(uint64_t exclude_id);
+
+    // T23: write (or rewrite) an entry's metadata sidecar: serialize -> meta.tmp
+    // -> fsync -> atomic rename to meta. The meta rename is the entry's commit
+    // point (before it, a crashed save leaves only tmp/partial files which the
+    // next boot discards). Returns false on any IO failure; the caller decides
+    // the severity (save-time = failure, touch-time = best-effort).
+    bool persist_write_meta(const server_prompt_disk_state & state);
+
+    // T23: measurements of the in-flight disk restore. load_disk is the only
+    // place that measures it (load_ms, tokens restored) and load() the only one
+    // that knows the full new-prompt token count - the stash carries both to
+    // accept_disk_load/reject_disk_load, which the caller invokes on the same
+    // main-loop thread right after the load. The restore gauges and the
+    // persist-load marker report these stashed numbers, never recomputed ones.
+    struct persist_pending_load {
+        uint64_t entry_id            = 0;
+        double   load_ms             = 0.0;
+        size_t   n_tokens_main       = 0;  // tokens the entry restored
+        size_t   lcp                 = 0;  // of those, the prefix the new prompt reuses
+        size_t   prompt_tokens_total = 0;  // full length of the new prompt
+        bool     valid               = false;
+    };
+
+    persist_pending_load pending_load = {};
 };

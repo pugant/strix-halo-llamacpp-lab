@@ -1,0 +1,544 @@
+From 20c09cbfefabeb4a8a024d835d648860978b6f0b Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 1 Sep 2026 00:57:36 +0200
+Subject: [PATCH] t23: boot-adopt + .persist.lock + orphan GC (server)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp |  38 +++-
+ tools/server/server-task.cpp    | 354 +++++++++++++++++++++++++++++++-
+ tools/server/server-task.h      |  43 +++-
+ 3 files changed, 432 insertions(+), 3 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index da4f52b5a..c0e6b2d83 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -12,6 +12,7 @@
+ #include "llama.h"
+ #include "../../src/llama-ext.h"
+ #include "../../src/llama-model.h" // t25: model_tgt->get_ple_stats() needs the full llama_model
++#include "../../src/llama-persist-meta.h" // t23: persistent prompt-cache fingerprint
+ #include "log.h"
+ #include "sampling.h"
+ #include "speculative.h"
+@@ -1490,6 +1491,38 @@ private:
+ 
+         const bool cache_disk_enabled = !params_base.cache_disk_path.empty() && params_base.cache_disk_limit_mib > 0;
+ 
++        // T23: the persistent library is keyed by the model/drafter/KV-type
++        // identity; entries written by a different config are never adopted
++        // (they stay on disk as orphans, subject only to budget-driven GC)
++        const bool cache_persist_enabled = cache_disk_enabled && params_base.cache_disk_persist;
++        uint8_t cache_persist_fingerprint[16] = {0};
++        if (cache_persist_enabled) {
++            std::error_code fs_ec;
++            uint64_t model_size = 0;
++            if (!params_base.model.path.empty()) {
++                model_size = std::filesystem::file_size(params_base.model.path, fs_ec);
++                if (fs_ec) {
++                    model_size = 0;
++                    fs_ec.clear();
++                }
++            }
++            const std::string & drafter_path = params_base.speculative.draft.mparams.path;
++            uint64_t drafter_size = 0;
++            if (!drafter_path.empty()) {
++                drafter_size = std::filesystem::file_size(drafter_path, fs_ec);
++                if (fs_ec) {
++                    drafter_size = 0;
++                    fs_ec.clear();
++                }
++            }
++            const std::string cache_kv = std::string(ggml_type_name(params_base.cache_type_k)) + "/" +
++                ggml_type_name(params_base.cache_type_v);
++            llama_persist_fingerprint(params_base.model.path.c_str(), model_size,
++                                      drafter_path.empty() ? nullptr : drafter_path.c_str(),
++                                      drafter_size, cache_kv.c_str(), LLAMA_STATE_SEQ_VERSION,
++                                      cache_persist_fingerprint);
++        }
++
+         if (params_base.cache_ram_mib != 0 || cache_disk_enabled) {
+             if (params_base.cache_ram_mib < 0) {
+                 SRV_INF("prompt cache RAM enabled: limit=%s\n", "unlimited");
+@@ -1508,7 +1541,10 @@ private:
+                 params_base.cache_ram_mib,
+                 n_ctx,
+                 params_base.cache_disk_path,
+-                params_base.cache_disk_limit_mib);
++                params_base.cache_disk_limit_mib,
++                cache_persist_enabled ? cache_persist_fingerprint : nullptr,
++                cache_persist_enabled ? params_base.cache_disk_persist_mib : 0,
++                cache_persist_enabled ? params_base.cache_disk_persist_min_tokens : 0);
+         } else {
+             SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` or `--cache-disk PATH` to enable it\n");
+         }
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 76aaba56e..58884f411 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -6,10 +6,12 @@
+ #include "common.h"
+ #include "json-schema-to-grammar.h"
+ #include "llama.h"
++#include "../../src/llama-persist-meta.h"
+ #include "sampling.h"
+ #include "speculative.h"
+ #include "server-common.h"
+ 
++#include <algorithm>
+ #include <cerrno>
+ #include <cinttypes>
+ #include <chrono>
+@@ -2134,6 +2136,35 @@ static bool server_prompt_cache_disk_size_exact(
+     return (size_t) actual == expected;
+ }
+ 
++// T23: corruption guard for the persist sidecar - a real sidecar is header +
++// 4 bytes/token + the spec blob, so anything past this cap is garbage
++constexpr size_t SERVER_PROMPT_CACHE_PERSIST_META_MAX = 64ull << 20;
++
++// T23: read a whole small file (persist sidecar metadata) into a buffer. A
++// missing file, any IO error, or a file larger than max_size returns false.
++static bool server_prompt_cache_disk_read_file(const fs::path & path, size_t max_size, std::vector<uint8_t> & out) {
++    std::error_code ec;
++    const auto size = fs::file_size(path, ec);
++    if (ec || size > max_size) {
++        return false;
++    }
++
++    std::ifstream file(path, std::ios::binary);
++    if (!file.good()) {
++        return false;
++    }
++
++    out.resize((size_t) size);
++    if (size > 0) {
++        file.read(reinterpret_cast<char *>(out.data()), (std::streamsize) size);
++        if (!file.good()) {
++            out.clear();
++            return false;
++        }
++    }
++    return true;
++}
++
+ // llama_state_seq_save_file() closes the file before returning. Reopen it to
+ // force dirty pages to stable storage and immediately mark the cold state as
+ // reclaimable. This avoids replacing anonymous cache pressure with several GiB
+@@ -2205,7 +2236,10 @@ server_prompt_cache::server_prompt_cache(
+         int32_t limit_size_mib,
+          size_t limit_tokens,
+     const std::string & disk_base_path,
+-        int32_t disk_limit_size_mib) {
++        int32_t disk_limit_size_mib,
++   const uint8_t        fingerprint[16],
++        int32_t persist_mib,
++        int32_t persist_min_tokens) {
+     ram_enabled       = limit_size_mib != 0;
+     limit_size        = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+     this->limit_tokens = limit_tokens;
+@@ -2364,9 +2398,327 @@ server_prompt_cache::server_prompt_cache(
+ 
+     SRV_INF("prompt cache disk enabled: path=%s owned_path=%s limit_mib=%d\n",
+             this->disk_base_path.c_str(), this->disk_owned_path.c_str(), disk_limit_size_mib);
++
++    if (persist_mib > 0) {
++        // T23: the library budget is computed here; boot_persist points every
++        // existing size check at it only once the library lock is held
++        this->persist_limit_size = 1024ull*1024ull*(uint64_t) persist_mib;
++        this->persist_min_tokens = persist_min_tokens < 0 ? 0 : persist_min_tokens;
++        boot_persist(server_prompt_cache_disk_path_utf8(cache_root), fingerprint);
++    }
++}
++
++void server_prompt_cache::boot_persist(const std::string & cache_root_utf8, const uint8_t * fingerprint) {
++    const auto disable = [this]() {
++#if !defined(_WIN32)
++        if (persist_lock_fd >= 0) {
++            flock(persist_lock_fd, LOCK_UN);
++            close(persist_lock_fd);
++            persist_lock_fd = -1;
++        }
++#endif
++        persist_path.clear();
++    };
++
++    // 1. persistent library directory, never removed by any run
++    std::error_code ec;
++    const fs::path persist_dir = fs::u8path(cache_root_utf8) / "persist";
++    fs::create_directories(persist_dir, ec);
++    if (ec || !fs::is_directory(persist_dir, ec)) {
++        ec.clear();
++        disable();
++        SRV_WRN("persist disabled: reason=persist-dir-create-failed path=%s\n", server_prompt_cache_disk_path_utf8(persist_dir).c_str());
++        return;
++    }
++    ec.clear();
++    fs::permissions(persist_dir, fs::perms::owner_all, fs::perm_options::replace, ec);
++    if (ec) {
++        ec.clear();
++        disable();
++        SRV_WRN("persist disabled: reason=persist-dir-secure-failed path=%s\n", server_prompt_cache_disk_path_utf8(persist_dir).c_str());
++        return;
++    }
++
++    // 2. one library per server, held for the whole process lifetime: two
++    //    servers must never share (and concurrently write) the same library
++#if !defined(_WIN32)
++    const fs::path persist_lock_path = persist_dir / ".persist.lock";
++    persist_lock_fd = open(persist_lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
++    if (persist_lock_fd < 0 || flock(persist_lock_fd, LOCK_EX | LOCK_NB) != 0) {
++        disable();
++        SRV_WRN("%s", "persist disabled: library already locked by another server\n");
++        return;
++    }
++#else
++    {
++        std::ofstream lock(persist_dir / ".persist.lock", std::ios::out | std::ios::trunc);
++        if (!lock.good()) {
++            disable();
++            SRV_WRN("persist disabled: reason=persist-lock-create-failed\n");
++            return;
++        }
++    }
++#endif
++
++    // 3. identity fingerprint + budget: from here on every existing size check
++    //    governs the persistent library
++    if (fingerprint == nullptr) {
++        disable();
++        SRV_WRN("%s", "persist disabled: reason=missing-identity-fingerprint\n");
++        return;
++    }
++    persist_path = server_prompt_cache_disk_path_utf8(persist_dir);
++    memcpy(persist_fingerprint, fingerprint, sizeof(persist_fingerprint));
++    disk_limit_size = persist_limit_size;
++
++    // 4. scan the library. Entry layout mirrors the per-run save naming:
++    //      entry-<id>/state-<id>-target.bin | state-<id>-draft.bin | meta
++    //    A crashed save leaves tmp files and no meta - that is the discard path.
++    struct persist_orphan {
++        uint64_t    id;
++        uint64_t    last_used;
++        uint64_t    bytes;
++        std::string name;   // entry dir name, e.g. "entry-7"
++    };
++    std::vector<persist_orphan> orphans;
++    std::vector<server_prompt_disk_state> adopted;
++    uint64_t max_scanned_id = 0;
++
++    for (const auto & entry : fs::directory_iterator(persist_dir, ec)) {
++        if (ec) {
++            break;
++        }
++        const auto name = server_prompt_cache_disk_path_utf8(entry.path().filename());
++        const bool is_dir = entry.is_directory(ec);
++        if (ec) {
++            ec.clear();
++            continue;
++        }
++        if (!is_dir || name.rfind("entry-", 0) != 0) {
++            continue;
++        }
++
++        const std::string id_str = name.substr(sizeof("entry-") - 1);
++        bool id_ok = !id_str.empty();
++        uint64_t id = 0;
++        for (const char c : id_str) {
++            if (c < '0' || c > '9' || id > (UINT64_MAX - (uint64_t) (c - '0')) / 10) {
++                id_ok = false;
++                break;
++            }
++            id = id*10 + (uint64_t) (c - '0');
++        }
++        if (!id_ok || id == 0) {
++            // not our naming: leave it untouched (another version's data)
++            SRV_WRN("persist boot skip: entry=%s reason=unparsed-id\n", name.c_str());
++            continue;
++        }
++        max_scanned_id = std::max(max_scanned_id, id);
++
++        const auto discard = [&](const char * reason) {
++            std::error_code rm_ec;
++            fs::remove_all(entry.path(), rm_ec);
++            if (rm_ec) {
++                SRV_WRN("persist boot discard pending: entry=%s reason=%s error=%s\n", name.c_str(), reason, rm_ec.message().c_str());
++            }
++            SRV_WRN("persist boot discard: entry=%s reason=%s\n", name.c_str(), reason);
++        };
++
++        const std::string stem = "state-" + std::to_string(id);
++        const std::string path_target = server_prompt_cache_disk_path_utf8(entry.path() / (stem + "-target.bin"));
++        const std::string path_draft  = server_prompt_cache_disk_path_utf8(entry.path() / (stem + "-draft.bin"));
++
++        std::vector<uint8_t> meta_data;
++        if (!server_prompt_cache_disk_read_file(entry.path() / "meta", SERVER_PROMPT_CACHE_PERSIST_META_MAX, meta_data)) {
++            discard("meta-missing-or-oversize");
++            continue;
++        }
++        llama_persist_meta meta;
++        if (!llama_persist_meta_parse(meta_data.data(), meta_data.size(), meta)) {
++            discard("meta-parse-failed");
++            continue;
++        }
++        if (memcmp(meta.fingerprint, persist_fingerprint, sizeof(persist_fingerprint)) != 0) {
++            // another config's data: kept on disk - only the budget-driven GC
++            // in step 7 may ever remove it
++            SRV_WRN("persist boot orphan: entry=%s (fingerprint mismatch, kept on disk)\n", name.c_str());
++            orphans.push_back({id, meta.last_used, meta.size_main + meta.size_drft, name});
++            continue;
++        }
++
++        if (meta.size_main == 0 ||
++            meta.size_main > (uint64_t) std::numeric_limits<size_t>::max() ||
++            meta.size_drft > (uint64_t) std::numeric_limits<size_t>::max()) {
++            discard("meta-invalid-size");
++            continue;
++        }
++        size_t actual = 0;
++        if (!server_prompt_cache_disk_size_exact(path_target, (size_t) meta.size_main, &actual)) {
++            discard("target-missing-or-size-mismatch");
++            continue;
++        }
++        std::string adopted_path_drft;
++        if (meta.size_drft > 0) {
++            if (!server_prompt_cache_disk_size_exact(path_draft, (size_t) meta.size_drft, &actual)) {
++                discard("draft-missing-or-size-mismatch");
++                continue;
++            }
++            adopted_path_drft = path_draft;
++        } else {
++            // draft may be absent (declared size 0); a stray non-empty one is a mismatch
++            std::error_code draft_ec;
++            const auto draft_actual = fs::file_size(fs::u8path(path_draft), draft_ec);
++            if (!draft_ec && draft_actual != 0) {
++                discard("draft-size-mismatch");
++                continue;
++            }
++        }
++
++        server_prompt_disk_state state;
++        state.tokens     = server_tokens(meta.tokens, /*has_mtmd=*/false);
++        state.spec       = std::move(meta.spec);
++        state.drafter    = (common_speculative_type) meta.drafter;
++        state.path_main  = path_target;
++        state.path_drft  = adopted_path_drft;
++        state.size_main  = (size_t) meta.size_main;
++        state.size_drft  = (size_t) meta.size_drft;
++        state.id         = id;
++        state.usable     = true;
++        state.hits       = meta.hits;
++        state.created_at = meta.created_at;
++        state.last_used  = meta.last_used;
++        state.crc_main   = meta.crc_main;
++        state.crc_drft   = meta.crc_drft;
++        // checkpoints are deliberately not restored: the sidecar retains only
++        // their small positions, which the live run recreates as it continues
++
++        adopted.push_back(std::move(state));
++    }
++    ec.clear();
++
++    // 5. oldest first (list order is the LRU order everywhere else in this
++    //    class); rebuild the list to keep the ordering splice-safe
++    std::stable_sort(adopted.begin(), adopted.end(),
++        [](const server_prompt_disk_state & a, const server_prompt_disk_state & b) {
++            if (a.last_used != b.last_used) {
++                return a.last_used < b.last_used;
++            }
++            return a.id < b.id;
++        });
++    disk_states.clear();
++    for (auto & state : adopted) {
++        disk_size_total += state.size();
++        disk_states.push_back(std::move(state));
++    }
++
++    // 6. evict by decayed-hit score until the adopted library is under budget
++    while (disk_size_total > persist_limit_size) {
++        const auto victim = persist_pick_victim(0);
++        if (victim == disk_states.end()) {
++            break;
++        }
++        const uint64_t victim_id    = victim->id;
++        const size_t   victim_bytes = victim->size();
++        std::error_code rm_ec;
++        fs::remove_all(fs::u8path(persist_path) / ("entry-" + std::to_string(victim_id)), rm_ec);
++        if (rm_ec) {
++            SRV_ERR("persist evict failed: entry=%" PRIu64 " error=%s\n", victim_id, rm_ec.message().c_str());
++            break;
++        }
++        disk_states.erase(victim);
++        disk_size_total -= victim_bytes;
++        persist_evictions++;
++        // keep the class-wide eviction bookkeeping consistent with erase_disk_state
++        disk_evictions++;
++        disk_bytes_evicted += victim_bytes;
++        SRV_INF("persist evict: entry=%" PRIu64 " reason=boot-limit bytes=%zu remaining_bytes=%zu\n",
++                victim_id, victim_bytes, disk_size_total);
++    }
++
++    // 7. orphan GC: another config's data, removed only under budget pressure,
++    //    oldest first
++    {
++        uint64_t orphan_bytes = 0;
++        for (const auto & orphan : orphans) {
++            orphan_bytes += orphan.bytes;
++        }
++        if (disk_size_total + orphan_bytes > persist_limit_size) {
++            std::sort(orphans.begin(), orphans.end(),
++                [](const persist_orphan & a, const persist_orphan & b) {
++                    if (a.last_used != b.last_used) {
++                        return a.last_used < b.last_used;
++                    }
++                    return a.id < b.id;
++                });
++            while (!orphans.empty() && disk_size_total + orphan_bytes > persist_limit_size) {
++                const persist_orphan gc = std::move(orphans.front());
++                orphans.erase(orphans.begin());
++                std::error_code rm_ec;
++                fs::remove_all(fs::u8path(persist_path) / gc.name, rm_ec);
++                if (rm_ec) {
++                    // not freed: keep it accounted and try the next orphan
++                    SRV_ERR("persist gc orphan failed: entry=%s error=%s\n", gc.name.c_str(), rm_ec.message().c_str());
++                    continue;
++                }
++                orphan_bytes -= gc.bytes;
++                persist_gc_orphans++;
++                SRV_INF("persist gc orphan: entry=%s last_used=%" PRIu64 " bytes=%" PRIu64 "\n",
++                        gc.name.c_str(), gc.last_used, gc.bytes);
++            }
++        }
++    }
++
++    // 8. next id beyond EVERY scanned entry (adopted, orphan and discarded
++    //    alike) so a future persist save can never collide with an existing
++    //    entry directory; empty library -> 1
++    disk_next_id = max_scanned_id + 1;
++
++    SRV_INF("persist boot adopt: entries=%zu orphans=%zu gc=%" PRIu64 " bytes=%zu budget_bytes=%zu\n",
++            disk_states.size(), orphans.size(), persist_gc_orphans, disk_size_total, persist_limit_size);
++}
++
++std::list<server_prompt_disk_state>::iterator server_prompt_cache::persist_pick_victim(uint64_t exclude_id) {
++    const auto now_s = (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(
++        std::chrono::system_clock::now().time_since_epoch()).count();
++
++    auto best = disk_states.end();
++    double best_score = 0.0;
++
++    for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
++        if (it->id == exclude_id) {
++            continue;
++        }
++
++        const double score = llama_persist_eviction_score(it->hits, it->last_used, now_s);
++        const bool better = best == disk_states.end() ||
++            score < best_score ||
++            (score == best_score && (it->last_used < best->last_used ||
++                (it->last_used == best->last_used && it->id < best->id)));
++        if (better) {
++            best = it;
++            best_score = score;
++        }
++    }
++
++    return best;
+ }
+ 
+ server_prompt_cache::~server_prompt_cache() {
++    if (!persist_path.empty()) {
++        // T23: the persistent library deliberately survives this run; only the
++        // summary is logged and the library lock released
++        SRV_INF("prompt cache persist shutdown: path=%s entries=%zu bytes=%zu saves=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 " gc_orphans=%" PRIu64 "\n",
++                persist_path.c_str(), disk_states.size(), disk_size_total,
++                persist_saves, persist_loads, persist_evictions, persist_gc_orphans);
++#if !defined(_WIN32)
++        if (persist_lock_fd >= 0) {
++            flock(persist_lock_fd, LOCK_UN);
++            close(persist_lock_fd);
++            persist_lock_fd = -1;
++        }
++#endif
++    }
++
+     if (disk_owned_path.empty()) {
+         return;
+     }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 496109100..d4737b56c 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -684,6 +684,14 @@ struct server_prompt_disk_state {
+     uint64_t id = 0;
+     bool usable = true;
+ 
++    // T23 persistent library bookkeeping (persist only). Neutral defaults keep
++    // the per-run path byte-for-byte untouched.
++    uint32_t hits       = 0;
++    uint64_t created_at = 0;
++    uint64_t last_used  = 0;
++    uint32_t crc_main   = 0;
++    uint32_t crc_drft   = 0;
++
+     size_t size() const {
+         return size_main + size_drft;
+     }
+@@ -714,7 +722,10 @@ struct server_prompt_cache {
+             int32_t limit_size_mib,
+              size_t limit_tokens,
+         const std::string & disk_base_path = {},
+-            int32_t disk_limit_size_mib = 0);
++            int32_t disk_limit_size_mib = 0,
++        const uint8_t    fingerprint[16] = {},
++            int32_t persist_mib = 0,
++            int32_t persist_min_tokens = 1024);
+ 
+     ~server_prompt_cache();
+ 
+@@ -753,6 +764,21 @@ struct server_prompt_cache {
+     // created for this server process.
+     bool disk_save_disabled = false;
+ 
++    // T23 persistent library (all inert when persist_path is empty)
++    std::string persist_path;                 // <base>/<ns>/persist
++    size_t      persist_limit_size = 0;
++    int         persist_min_tokens = 1024;
++    uint8_t     persist_fingerprint[16] = {0};
++    uint64_t    persist_saves = 0, persist_loads = 0, persist_hits = 0;
++    uint64_t    persist_touches = 0, persist_evictions = 0, persist_gc_orphans = 0;
++    uint64_t    persist_bytes_written = 0, persist_bytes_read = 0;
++    uint64_t    persist_save_failures = 0;
++    double      persist_last_restore_ms = 0.0;   // last cross-restart restore
++    uint64_t    persist_last_tokens_restored = 0, persist_last_tokens_prefilled = 0;
++
++    // advisory lock on persist_path, held for the whole server lifetime
++    int persist_lock_fd = -1;
++
+     size_t size() const;
+ 
+     size_t n_tokens() const;
+@@ -827,4 +853,19 @@ private:
+     void update_disk();
+ 
+     void log_disk_state() const;
++
++    // T23: adopt the cross-restart persistent library at boot (persist only).
++    // Deterministic fixed order: create persist/, take the exclusive advisory
++    // lock, copy the identity fingerprint, scan entry-* directories, rebuild
++    // disk_states oldest-first, evict by decayed-hit score down to the library
++    // budget, GC foreign (orphan) entries only under budget pressure, then
++    // publish the next entry id. Fail-safe: never throws (the run-dir lock is
++    // already held); every failure disables persist only (persist_path cleared)
++    // and leaves the per-run cache fully working.
++    void boot_persist(const std::string & cache_root_utf8, const uint8_t * fingerprint);
++
++    // T23: eviction-victim choice for the persistent library - minimum decayed
++    // hit score; ties break to the older last_used, then the smaller id.
++    // Returns end() when nothing is eligible. exclude_id = 0 excludes nothing.
++    std::list<server_prompt_disk_state>::iterator persist_pick_victim(uint64_t exclude_id);
+ };
+-- 
+2.53.0
+

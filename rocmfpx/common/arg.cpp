@@ -636,6 +636,17 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
+    if (params.cache_disk_persist) {
+        if (params.cache_disk_path.empty()) {
+            throw std::invalid_argument("--cache-disk-persist requires --cache-disk PATH");
+        }
+        // the disk prompt cache is gated on a positive limit in the server; without it the
+        // persistent library would stay silently dead, so fail fast at boot instead
+        if (params.cache_disk_limit_mib <= 0) {
+            throw std::invalid_argument("--cache-disk-persist requires --cache-disk-limit > 0");
+        }
+    }
+
     // handle model and download
     if (!skip_model_download) {
         common_params_handle_models(params, ctx_arg.ex);
@@ -1398,6 +1409,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_disk_limit_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-persist"}, {"--no-cache-disk-persist"},
+        string_format("persist disk prompt-cache entries across restarts into a reusable library (default: %s)",
+            params.cache_disk_persist ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.cache_disk_persist = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PERSIST").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-persist-mib"}, "N",
+        string_format("persistent prompt-cache library budget in MiB (default: %d, minimum: 1024)",
+            params.cache_disk_persist_mib),
+        [](common_params & params, int value) {
+            if (value < 1024) {
+                throw std::invalid_argument("persistent prompt-cache budget must be at least 1024 MiB");
+            }
+            params.cache_disk_persist_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PERSIST_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-persist-min-tokens"}, "N",
+        string_format("do not save prompts shorter than N tokens to the persistent library (default: %d)",
+            params.cache_disk_persist_min_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("persistent prompt-cache min-tokens must be non-negative");
+            }
+            params.cache_disk_persist_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PERSIST_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

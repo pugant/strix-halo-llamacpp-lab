@@ -1,0 +1,87 @@
+From 0850dc240112d65766399f1702243478ce58ebe2 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 1 Sep 2026 00:33:24 +0200
+Subject: [PATCH] t23: review follow-ups (heap CRC buffer, NULL-safe cache_kv,
+ width static_assert)
+
+- crc32_file: 1 MiB buffer moved off the stack (runs on server task threads)
+- fingerprint: cache_kv NULL treated as absent, like the drafter
+- serialize: loud asserts on u32 count truncation; static_assert llama_token==4B
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/llama-persist-meta.cpp  | 16 ++++++++++++----
+ tests/test-persist-meta.cpp |  5 +++++
+ 2 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-persist-meta.cpp b/src/llama-persist-meta.cpp
+index a093803f1..792945878 100644
+--- a/src/llama-persist-meta.cpp
++++ b/src/llama-persist-meta.cpp
+@@ -13,6 +13,9 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ 
++// the sidecar layout spells llama_token as a fixed 4-byte i32 LE
++static_assert(sizeof(llama_token) == 4, "llama_token must be int32_t");
++
+ // ---------------------------------------------------------------------------
+ // little-endian put/get (ds4_kvstore-style): the sidecar never depends on the
+ // host byte order, every field is spelled out byte by byte
+@@ -71,11 +74,15 @@ enum : size_t {
+ // ---------------------------------------------------------------------------
+ 
+ bool llama_persist_meta_serialize(const llama_persist_meta & m, std::vector<uint8_t> & out) {
++    // loud rather than silently truncating into the u32 header fields
++    assert(m.tokens.size() <= UINT32_MAX);
++    assert(m.spec.size()   <= UINT32_MAX);
++
+     const uint32_t n_tokens = (uint32_t) m.tokens.size();
+     const uint32_t n_spec   = (uint32_t) m.spec.size();
+ 
+     const size_t payload = (size_t) LLAMA_PERSIST_META_HEADER
+-                         + m.tokens.size() * sizeof(int32_t)
++                         + m.tokens.size() * 4  // llama_token i32 LE (static_assert above)
+                          + m.spec.size();
+ 
+     out.clear();
+@@ -200,8 +207,9 @@ bool llama_persist_crc32_file(const char * path, uint64_t expected_size, uint32_
+     }
+ 
+     // read the WHOLE file in 1 MiB blocks; it must contain exactly
+-    // expected_size bytes - shorter OR longer means corruption
+-    std::array<uint8_t, 1 << 20> buf;
++    // expected_size bytes - shorter OR longer means corruption.
++    // heap buffer: this runs on server task threads, keep the stack flat
++    std::vector<uint8_t> buf(1 << 20);
+     uint32_t    c     = 0xFFFFFFFFu;
+     uint64_t    total = 0;
+     bool        ok    = true;
+@@ -299,7 +307,7 @@ void llama_persist_fingerprint(const char * model_path, uint64_t model_size,
+     fnv1a_update_u64(p, model_size);
+     fnv1a_update_str(p, llama_persist_basename(drafter_path)); // NULL -> "" (absent)
+     fnv1a_update_u64(p, drafter_size);
+-    fnv1a_update_str(p, cache_kv);
++    fnv1a_update_str(p, cache_kv ? cache_kv : ""); // NULL -> "" (absent), like the drafter
+     fnv1a_update_u32(p, state_version);
+ 
+     llama_persist_le_put64(out + 0, p.h0);
+diff --git a/tests/test-persist-meta.cpp b/tests/test-persist-meta.cpp
+index 28cf75eb5..5d72d7b6b 100644
+--- a/tests/test-persist-meta.cpp
++++ b/tests/test-persist-meta.cpp
+@@ -176,6 +176,11 @@ int main() {
+         llama_persist_fingerprint("/a/b/model.gguf", 123456ull, "",       0ull, "q8_0/q8_0", 2u, fp_empty);
+         CHECK(memcmp(fp_null, fp_empty, 16) == 0, "drafter NULL and \"\" hash identically (absent semantics)");
+ 
++        uint8_t fp_kv_null[16], fp_kv_empty[16];
++        llama_persist_fingerprint("/a/b/model.gguf", 123456ull, "/x/y/drafter.gguf", 789ull, nullptr, 2u, fp_kv_null);
++        llama_persist_fingerprint("/a/b/model.gguf", 123456ull, "/x/y/drafter.gguf", 789ull, "",       2u, fp_kv_empty);
++        CHECK(memcmp(fp_kv_null, fp_kv_empty, 16) == 0, "cache_kv NULL and \"\" hash identically (absent semantics)");
++
+         CHECK(strcmp(llama_persist_basename("/a/b/model.gguf"), "model.gguf") == 0, "basename strips directories");
+         CHECK(strcmp(llama_persist_basename(nullptr), "") == 0, "basename NULL -> empty string");
+     }
+-- 
+2.53.0
+

@@ -1,0 +1,243 @@
+From ec81f7e3cf2a1fe6e429e4f8057d44340067732f Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 1 Sep 2026 02:40:13 +0200
+Subject: [PATCH] t23: persist_* metrics on /metrics (counters + restore
+ gauges)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-context.cpp | 102 ++++++++++++++++++++++++++++++++
+ tools/server/server-task.cpp    |  22 +++++++
+ tools/server/server-task.h      |  42 +++++++++++++
+ 3 files changed, 166 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c0e6b2d83..88c10f473 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2797,6 +2797,24 @@ private:
+                     res->ple_fetch_us_total    = ple_st.fetch_us;
+                     res->ple_fetches_total     = ple_st.fetches;
+ 
++                    // t23: persistent library stats - the prompt cache is absent
++                    // when neither --cache-ram nor --cache-disk is set, in which
++                    // case the metrics are emitted at zero
++                    const persist_stats persist_st = prompt_cache ? prompt_cache->get_persist_stats() : persist_stats{};
++                    res->persist_saves_total         = persist_st.saves;
++                    res->persist_loads_total         = persist_st.loads;
++                    res->persist_hits_total          = persist_st.hits;
++                    res->persist_touches_total       = persist_st.touches;
++                    res->persist_evictions_total     = persist_st.evictions;
++                    res->persist_gc_orphans_total    = persist_st.gc_orphans;
++                    res->persist_bytes_written_total = persist_st.bytes_written;
++                    res->persist_bytes_read_total    = persist_st.bytes_read;
++                    res->persist_save_failures_total = persist_st.save_failures;
++
++                    res->persist_last_restore_ms       = persist_st.last_restore_ms;
++                    res->persist_last_tokens_restored  = persist_st.last_tokens_restored;
++                    res->persist_last_tokens_prefilled = persist_st.last_tokens_prefilled;
++
+                     // PI F4 follow-up (29/08): speculative state reset counter
+                     res->spec_state_resets_total = metrics.spec_state_resets_total;
+ 
+@@ -5376,6 +5394,65 @@ void server_routes::init_routes() {
+                 {"value", res_task->ple_fetches_total},
+             });
+ 
++            // t23: persistent library counters (subset of the disk_* counters:
++            // with --cache-disk-persist every persist save/load/eviction also
++            // bumps the disk_ ones, so a dashboard watching only persist_* sees
++            // no double counting). Emitted unconditionally so they are present
++            // at 0 from boot even without --cache-disk-persist (see server_metrics)
++            counter_defs.push_back({
++                {"name",  "persist_saves_total"},
++                {"help",  "Number of prompt-cache states saved to the persistent library (--cache-disk-persist subset of disk saves)."},
++                {"value", res_task->persist_saves_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "persist_loads_total"},
++                {"help",  "Number of prompt-cache states restored from the persistent library (subset of disk loads)."},
++                {"value", res_task->persist_loads_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "persist_hits_total"},
++                {"help",  "Number of prompt-cache lookups served by a persistent library entry (prefix reused cross-restart)."},
++                {"value", res_task->persist_hits_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "persist_touches_total"},
++                {"help",  "Number of persistent library entries whose recency/hit metadata was refreshed on reuse."},
++                {"value", res_task->persist_touches_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "persist_evictions_total"},
++                {"help",  "Number of persistent library entries evicted to stay under --cache-disk-persist-mib (subset of disk evictions)."},
++                {"value", res_task->persist_evictions_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "persist_gc_orphans_total"},
++                {"help",  "Number of foreign/orphan directories removed from the persistent library at boot."},
++                {"value", res_task->persist_gc_orphans_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "persist_bytes_written_total"},
++                {"help",  "Number of bytes written to the persistent library (subset of disk bytes written)."},
++                {"value", res_task->persist_bytes_written_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "persist_bytes_read_total"},
++                {"help",  "Number of bytes read from the persistent library (subset of disk bytes read)."},
++                {"value", res_task->persist_bytes_read_total},
++            });
++
++            counter_defs.push_back({
++                {"name",  "persist_save_failures_total"},
++                {"help",  "Number of failed saves into the persistent library (IO/commit errors)."},
++                {"value", res_task->persist_save_failures_total},
++            });
++
+             // PI F4 follow-up (pi-stack 29/08): emitted unconditionally so the
+             // counter is present at 0 from boot (see server_metrics)
+             counter_defs.push_back({
+@@ -5394,6 +5471,31 @@ void server_routes::init_routes() {
+             }
+         }
+ 
++        // t23: persistent library gauges - measurements of the last cross-restart
++        // restore (zeros until one happened). Same unconditional emission as the
++        // persist_* counters above
++        {
++            auto & gauge_defs = all_metrics_def["gauge"];
++
++            gauge_defs.push_back({
++                {"name",  "persist_last_restore_ms"},
++                {"help",  "Wall time of the last persistent-library restore, in milliseconds (0 until one happened)."},
++                {"value", res_task->persist_last_restore_ms},
++            });
++
++            gauge_defs.push_back({
++                {"name",  "persist_last_tokens_restored"},
++                {"help",  "Tokens the last persistent-library restore served from the library instead of prefill."},
++                {"value", res_task->persist_last_tokens_restored},
++            });
++
++            gauge_defs.push_back({
++                {"name",  "persist_last_tokens_prefilled"},
++                {"help",  "Tokens the last persistent-library restore still had to prefill (the non-common suffix)."},
++                {"value", res_task->persist_last_tokens_prefilled},
++            });
++        }
++
+         std::stringstream prometheus;
+ 
+         // a labeled family spans several entries - its HELP/TYPE lines must be
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 4d7c246d6..dddb1d65a 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -2863,6 +2863,28 @@ size_t server_prompt_cache::disk_n_tokens() const {
+     return res;
+ }
+ 
++// t23: plain copy-out - the caller (metrics task) runs on the same thread as
++// every mutation site (main loop / boot), same contract as get_ple_stats
++persist_stats server_prompt_cache::get_persist_stats() const {
++    persist_stats res;
++
++    res.saves         = persist_saves;
++    res.loads         = persist_loads;
++    res.hits          = persist_hits;
++    res.touches       = persist_touches;
++    res.evictions     = persist_evictions;
++    res.gc_orphans    = persist_gc_orphans;
++    res.bytes_written = persist_bytes_written;
++    res.bytes_read    = persist_bytes_read;
++    res.save_failures = persist_save_failures;
++
++    res.last_restore_ms       = persist_last_restore_ms;
++    res.last_tokens_restored  = persist_last_tokens_restored;
++    res.last_tokens_prefilled = persist_last_tokens_prefilled;
++
++    return res;
++}
++
+ void server_prompt_cache::disable_disk_saves(const char * reason, const std::string & path) {
+     disk_save_failures++;
+     if (!persist_path.empty()) {
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index a89384827..29a6122c8 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -566,6 +566,24 @@ struct server_task_result_metrics : server_task_result {
+     uint64_t ple_fetch_us_total    = 0;
+     uint64_t ple_fetches_total     = 0;
+ 
++    // t23: persistent library counters (cumulative since model load; all zero
++    // without --cache-disk-persist). The persist_* family is the persist subset
++    // of the disk_* counters - see persist_stats.
++    uint64_t persist_saves_total         = 0;
++    uint64_t persist_loads_total         = 0;
++    uint64_t persist_hits_total          = 0;
++    uint64_t persist_touches_total       = 0;
++    uint64_t persist_evictions_total     = 0;
++    uint64_t persist_gc_orphans_total    = 0;
++    uint64_t persist_bytes_written_total = 0;
++    uint64_t persist_bytes_read_total    = 0;
++    uint64_t persist_save_failures_total = 0;
++
++    // t23: gauges of the last cross-restart restore
++    double   persist_last_restore_ms       = 0.0;
++    uint64_t persist_last_tokens_restored  = 0;
++    uint64_t persist_last_tokens_prefilled = 0;
++
+     // PI F4 follow-up (29/08): speculative drafter state resets (the partial-reject
+     // reset window), exported as spec_state_resets_total
+     uint64_t spec_state_resets_total = 0;
+@@ -717,6 +735,26 @@ static inline bool spec_route_same_drafter(common_speculative_type a, common_spe
+     return a == b;
+ }
+ 
++// t23: live stats of the persistent library; zeroed when persist is disabled.
++// The persist_* values are a strict subset of the disk_* counters (every persist
++// save/load/eviction bumps both), so a dashboard watching only persist_* sees no
++// double counting.
++struct persist_stats {
++    uint64_t saves         = 0;
++    uint64_t loads         = 0;
++    uint64_t hits          = 0;
++    uint64_t touches       = 0;
++    uint64_t evictions     = 0;
++    uint64_t gc_orphans    = 0;
++    uint64_t bytes_written = 0;
++    uint64_t bytes_read    = 0;
++    uint64_t save_failures = 0;
++
++    double   last_restore_ms       = 0.0; // wall time of the last cross-restart restore
++    uint64_t last_tokens_restored  = 0;   // of it, the tokens served from the library
++    uint64_t last_tokens_prefilled = 0;   // of it, the tokens still prefilled by the model
++};
++
+ struct server_prompt_cache {
+     server_prompt_cache(
+             int32_t limit_size_mib,
+@@ -787,6 +825,10 @@ struct server_prompt_cache {
+ 
+     size_t disk_n_tokens() const;
+ 
++    // t23: copy-out of the persistent library counters/gauges (zeros when the
++    // persist library is disabled); read from the metrics task like get_ple_stats
++    persist_stats get_persist_stats() const;
++
+     bool save(
+         const server_prompt & prompt,
+               llama_context * ctx_main,
+-- 
+2.53.0
+

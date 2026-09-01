@@ -1,0 +1,328 @@
+// T23: implementation of the persistent prompt-cache metadata sidecar.
+// Pure functions only - no server, no llama_context, no logging. See
+// llama-persist-meta.h for the on-disk layout contract.
+
+#include "llama-persist-meta.h"
+
+#include <array>
+#include <cassert>
+#include <cerrno>
+#include <cmath>
+#include <cstring>
+
+#include <fcntl.h>
+#include <unistd.h>
+
+// the sidecar layout spells llama_token as a fixed 4-byte i32 LE
+static_assert(sizeof(llama_token) == 4, "llama_token must be int32_t");
+
+// ---------------------------------------------------------------------------
+// little-endian put/get (ds4_kvstore-style): the sidecar never depends on the
+// host byte order, every field is spelled out byte by byte
+// ---------------------------------------------------------------------------
+
+static void llama_persist_le_put32(uint8_t * p, uint32_t v) {
+    p[0] = (uint8_t) (v);
+    p[1] = (uint8_t) (v >> 8);
+    p[2] = (uint8_t) (v >> 16);
+    p[3] = (uint8_t) (v >> 24);
+}
+
+static uint32_t llama_persist_le_get32(const uint8_t * p) {
+    return (uint32_t) p[0]
+         | ((uint32_t) p[1] << 8)
+         | ((uint32_t) p[2] << 16)
+         | ((uint32_t) p[3] << 24);
+}
+
+static void llama_persist_le_put64(uint8_t * p, uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+        p[i] = (uint8_t) (v >> (8 * i));
+    }
+}
+
+static uint64_t llama_persist_le_get64(const uint8_t * p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) {
+        v |= (uint64_t) p[i] << (8 * i);
+    }
+    return v;
+}
+
+// header field offsets (see layout comment in llama-persist-meta.h; the u64
+// fields are intentionally NOT 8-byte aligned - serialized byte-wise, never
+// cast to a struct, so alignment is irrelevant)
+enum : size_t {
+    OFF_MAGIC      = 0,
+    OFF_VERSION    = 4,
+    OFF_FINGERPRINT= 8,   // 16 bytes
+    OFF_DRAFTER    = 24,
+    OFF_N_TOKENS   = 28,
+    OFF_SIZE_MAIN  = 32,
+    OFF_SIZE_DRFT  = 40,
+    OFF_CRC_MAIN   = 48,
+    OFF_CRC_DRFT   = 52,
+    OFF_HITS       = 56,
+    OFF_CREATED_AT = 60,
+    OFF_LAST_USED  = 68,
+    OFF_N_SPEC     = 76,
+    OFF_PAD        = 80,  // 8 bytes, must be 0
+};
+
+// ---------------------------------------------------------------------------
+// serialize / parse
+// ---------------------------------------------------------------------------
+
+bool llama_persist_meta_serialize(const llama_persist_meta & m, std::vector<uint8_t> & out) {
+    // loud rather than silently truncating into the u32 header fields
+    assert(m.tokens.size() <= UINT32_MAX);
+    assert(m.spec.size()   <= UINT32_MAX);
+
+    const uint32_t n_tokens = (uint32_t) m.tokens.size();
+    const uint32_t n_spec   = (uint32_t) m.spec.size();
+
+    const size_t payload = (size_t) LLAMA_PERSIST_META_HEADER
+                         + m.tokens.size() * 4  // llama_token i32 LE (static_assert above)
+                         + m.spec.size();
+
+    out.clear();
+    out.reserve(payload);
+    out.resize((size_t) LLAMA_PERSIST_META_HEADER, 0);
+
+    llama_persist_le_put32(out.data() + OFF_MAGIC,       LLAMA_PERSIST_META_MAGIC);
+    llama_persist_le_put32(out.data() + OFF_VERSION,     LLAMA_PERSIST_META_VERSION);
+    memcpy(out.data() + OFF_FINGERPRINT, m.fingerprint, 16);
+    llama_persist_le_put32(out.data() + OFF_DRAFTER,     m.drafter);
+    llama_persist_le_put32(out.data() + OFF_N_TOKENS,    n_tokens);
+    llama_persist_le_put64(out.data() + OFF_SIZE_MAIN,   m.size_main);
+    llama_persist_le_put64(out.data() + OFF_SIZE_DRFT,   m.size_drft);
+    llama_persist_le_put32(out.data() + OFF_CRC_MAIN,    m.crc_main);
+    llama_persist_le_put32(out.data() + OFF_CRC_DRFT,    m.crc_drft);
+    llama_persist_le_put32(out.data() + OFF_HITS,        m.hits);
+    llama_persist_le_put64(out.data() + OFF_CREATED_AT,  m.created_at);
+    llama_persist_le_put64(out.data() + OFF_LAST_USED,   m.last_used);
+    llama_persist_le_put32(out.data() + OFF_N_SPEC,      n_spec);
+    llama_persist_le_put64(out.data() + OFF_PAD,         0); // reserved, must stay 0
+
+    // tokens: llama_token is int32_t (include/llama.h) -> i32 LE each
+    const size_t tokens_off = out.size();
+    out.resize(tokens_off + m.tokens.size() * 4);
+    for (size_t i = 0; i < m.tokens.size(); i++) {
+        llama_persist_le_put32(out.data() + tokens_off + i * 4, (uint32_t) m.tokens[i]);
+    }
+
+    out.insert(out.end(), m.spec.begin(), m.spec.end());
+
+    assert(out.size() == payload);
+    return true;
+}
+
+bool llama_persist_meta_parse(const uint8_t * data, size_t size, llama_persist_meta & out) {
+    if (size < (size_t) LLAMA_PERSIST_META_HEADER) {
+        return false;
+    }
+    if (llama_persist_le_get32(data + OFF_MAGIC) != LLAMA_PERSIST_META_MAGIC) {
+        return false;
+    }
+    if (llama_persist_le_get32(data + OFF_VERSION) != LLAMA_PERSIST_META_VERSION) {
+        return false;
+    }
+    if (llama_persist_le_get64(data + OFF_PAD) != 0) {
+        return false;
+    }
+
+    const uint32_t n_tokens = llama_persist_le_get32(data + OFF_N_TOKENS);
+    const uint32_t n_spec   = llama_persist_le_get32(data + OFF_N_SPEC);
+
+    // overflow check BEFORE the multiply: a corrupted n_tokens must not wrap
+    // the size_t arithmetic below into accepting a truncated buffer
+    if ((size_t) n_tokens > (SIZE_MAX - (size_t) LLAMA_PERSIST_META_HEADER - (size_t) n_spec) / 4) {
+        return false;
+    }
+    // exact length: no truncated arrays, no extra trailing bytes
+    if (size != (size_t) LLAMA_PERSIST_META_HEADER + (size_t) n_tokens * 4 + (size_t) n_spec) {
+        return false;
+    }
+
+    llama_persist_meta m;
+    memcpy(m.fingerprint, data + OFF_FINGERPRINT, 16);
+    m.drafter    = llama_persist_le_get32(data + OFF_DRAFTER);
+    m.size_main  = llama_persist_le_get64(data + OFF_SIZE_MAIN);
+    m.size_drft  = llama_persist_le_get64(data + OFF_SIZE_DRFT);
+    m.crc_main   = llama_persist_le_get32(data + OFF_CRC_MAIN);
+    m.crc_drft   = llama_persist_le_get32(data + OFF_CRC_DRFT);
+    m.hits       = llama_persist_le_get32(data + OFF_HITS);
+    m.created_at = llama_persist_le_get64(data + OFF_CREATED_AT);
+    m.last_used  = llama_persist_le_get64(data + OFF_LAST_USED);
+
+    const uint8_t * tokens_data = data + (size_t) LLAMA_PERSIST_META_HEADER;
+    m.tokens.resize(n_tokens);
+    for (size_t i = 0; i < m.tokens.size(); i++) {
+        m.tokens[i] = (llama_token) llama_persist_le_get32(tokens_data + i * 4);
+    }
+
+    m.spec.assign(tokens_data + m.tokens.size() * 4, data + size);
+
+    out = std::move(m);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320)
+// ---------------------------------------------------------------------------
+
+// magic-static initialization: thread-safe even if called from server task threads
+static const std::array<uint32_t, 256> & crc32_table() {
+    static const auto table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) {
+                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            t[i] = c;
+        }
+        return t;
+    }();
+    return table;
+}
+
+static uint32_t crc32_update(uint32_t c, const uint8_t * data, size_t size) {
+    const auto & table = crc32_table();
+    for (size_t i = 0; i < size; i++) {
+        c = table[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
+    }
+    return c;
+}
+
+// sanity check-value (CRC-32 IEEE): "123456789" -> 0xCBF43926
+uint32_t llama_persist_crc32(const uint8_t * data, size_t size) {
+    return crc32_update(0xFFFFFFFFu, data, size) ^ 0xFFFFFFFFu;
+}
+
+bool llama_persist_crc32_file(const char * path, uint64_t expected_size, uint32_t * crc_out) {
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+
+    // read the WHOLE file in 1 MiB blocks; it must contain exactly
+    // expected_size bytes - shorter OR longer means corruption.
+    // heap buffer: this runs on server task threads, keep the stack flat
+    std::vector<uint8_t> buf(1 << 20);
+    uint32_t    c     = 0xFFFFFFFFu;
+    uint64_t    total = 0;
+    bool        ok    = true;
+
+    for (;;) {
+        ssize_t n;
+        do {
+            n = read(fd, buf.data(), buf.size());
+        } while (n < 0 && errno == EINTR);
+        if (n < 0) {
+            ok = false; // IO error
+            break;
+        }
+        if (n == 0) {
+            break; // EOF
+        }
+        c = crc32_update(c, buf.data(), (size_t) n);
+        total += (uint64_t) n;
+        if (total > expected_size) {
+            ok = false; // longer than declared: stop early instead of streaming a bad file
+            break;
+        }
+    }
+
+    // drop what we just streamed from the page cache (pattern: llama-mmap.cpp,
+    // llama-ple-store.cpp) - a CRC check must not evict hot cache pages
+    (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+
+    if (!ok || total != expected_size) {
+        return false; // crc_out untouched on failure
+    }
+    *crc_out = c ^ 0xFFFFFFFFu;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// eviction score
+// ---------------------------------------------------------------------------
+
+double llama_persist_eviction_score(uint32_t hits, uint64_t last_used, uint64_t now_s) {
+    if (now_s <= last_used) return (double) hits;          // clock skew guard
+    const double age = (double)(now_s - last_used);
+    return (double) hits * std::exp2(-age / (double) LLAMA_PERSIST_HALF_LIFE_S);
+}
+
+// ---------------------------------------------------------------------------
+// config fingerprint: FNV-1a 64 with two seeds (not cryptographic - a config
+// disambiguation guard, so the seeds just halve the collision odds of one hash)
+// ---------------------------------------------------------------------------
+
+static const uint64_t FNV1A_PRIME   = 0x100000001b3ull;        // 1099511628211
+static const uint64_t FNV1A_SEED_A  = 0xcbf29ce484222325ull;   // FNV-1a offset basis
+static const uint64_t FNV1A_SEED_B  = 0x9E3779B97F4A7C15ull;   // golden-ratio constant
+
+struct fnv1a_pair {
+    uint64_t h0 = FNV1A_SEED_A;
+    uint64_t h1 = FNV1A_SEED_B;
+};
+
+static void fnv1a_update(fnv1a_pair & p, uint8_t b) {
+    p.h0 = (p.h0 ^ (uint64_t) b) * FNV1A_PRIME;
+    p.h1 = (p.h1 ^ (uint64_t) b) * FNV1A_PRIME;
+}
+
+static void fnv1a_update_u32(fnv1a_pair & p, uint32_t v) {
+    uint8_t b[4];
+    llama_persist_le_put32(b, v);
+    for (int i = 0; i < 4; i++) fnv1a_update(p, b[i]);
+}
+
+static void fnv1a_update_u64(fnv1a_pair & p, uint64_t v) {
+    uint8_t b[8];
+    llama_persist_le_put64(b, v);
+    for (int i = 0; i < 8; i++) fnv1a_update(p, b[i]);
+}
+
+// variable-length string + one trailing NUL: without the terminator the
+// boundary between a basename and the fixed-size field that follows it would
+// be ambiguous ("ab" + u32(0x63...) == "abc" + u32(0x...))
+static void fnv1a_update_str(fnv1a_pair & p, const char * s) {
+    for (const char * c = s; *c != '\0'; c++) {
+        fnv1a_update(p, (uint8_t) *c);
+    }
+    fnv1a_update(p, 0);
+}
+
+void llama_persist_fingerprint(const char * model_path, uint64_t model_size,
+                               const char * drafter_path, uint64_t drafter_size,
+                               const char * cache_kv, uint32_t state_version,
+                               uint8_t out[16]) {
+    fnv1a_pair p;
+
+    fnv1a_update_str(p, llama_persist_basename(model_path));
+    fnv1a_update_u64(p, model_size);
+    fnv1a_update_str(p, llama_persist_basename(drafter_path)); // NULL -> "" (absent)
+    fnv1a_update_u64(p, drafter_size);
+    fnv1a_update_str(p, cache_kv ? cache_kv : ""); // NULL -> "" (absent), like the drafter
+    fnv1a_update_u32(p, state_version);
+
+    llama_persist_le_put64(out + 0, p.h0);
+    llama_persist_le_put64(out + 8, p.h1);
+}
+
+const char * llama_persist_basename(const char * path) {
+    if (path == nullptr) {
+        return "";
+    }
+    const char * base = path;
+    for (const char * c = path; *c != '\0'; c++) {
+        if (*c == '/' || *c == '\\') {
+            base = c + 1;
+        }
+    }
+    return base;
+}

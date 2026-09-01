@@ -1,0 +1,48 @@
+From f629365da22434af65ca82bc0628427490b5c7b9 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 1 Sep 2026 13:09:30 +0200
+Subject: [PATCH] t23: token access asserts on real media cells, not slot-born
+ flag
+
+Every prompt of a multimodal server is born has_mtmd = (mctx != nullptr),
+so get_tokens()/set_token() asserted (and aborted the server) even for
+pure-text prompts the moment the disk-cache paths reached them. Assert on
+the actual media-cell presence instead: the token list is exposed exactly
+when no media chunks are in it - the upstream protection against NULL
+media cells is preserved.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-common.cpp | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 62ad2e359..3d75cec52 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -395,7 +395,10 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
+ }
+ 
+ const llama_tokens & server_tokens::get_tokens() const {
+-    GGML_ASSERT(!has_mtmd);
++    // T23: the slot-born flag (every prompt of a multimodal server is born
++    // has_mtmd = mctx != nullptr) does not imply media cells are present:
++    // the token list is safe to expose exactly when no media chunks are.
++    GGML_ASSERT(!has_mtmd || map_idx_to_media.empty());
+     return tokens;
+ }
+ 
+@@ -411,7 +414,9 @@ llama_tokens server_tokens::get_text_tokens() const {
+ }
+ 
+ void server_tokens::set_token(llama_pos pos, llama_token id) {
+-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
++    // T23: same rationale as get_tokens() - the slot-born multimodal flag alone
++    // must not block text-only prompts (see get_tokens).
++    GGML_ASSERT(!has_mtmd || map_idx_to_media.empty()); // no media cells allowed
+     tokens[pos] = id;
+ }
+ 
+-- 
+2.53.0
+

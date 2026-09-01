@@ -203,6 +203,11 @@ public:
 
     bool empty() const { return tokens.empty(); }
 
+    // T23: does this prompt actually carry media chunks? Distinct from has_mtmd,
+    // which is also set at slot creation on multimodal servers (mctx != nullptr)
+    // even for pure-text prompts - the disk cache must only skip real media.
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     void clear() {
         map_idx_to_media.clear();
         tokens.clear();

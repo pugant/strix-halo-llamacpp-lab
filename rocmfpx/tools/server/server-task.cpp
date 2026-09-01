@@ -6,10 +6,12 @@
 #include "common.h"
 #include "json-schema-to-grammar.h"
 #include "llama.h"
+#include "../../src/llama-persist-meta.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <chrono>
@@ -2134,6 +2136,35 @@ static bool server_prompt_cache_disk_size_exact(
     return (size_t) actual == expected;
 }
 
+// T23: corruption guard for the persist sidecar - a real sidecar is header +
+// 4 bytes/token + the spec blob, so anything past this cap is garbage
+constexpr size_t SERVER_PROMPT_CACHE_PERSIST_META_MAX = 64ull << 20;
+
+// T23: read a whole small file (persist sidecar metadata) into a buffer. A
+// missing file, any IO error, or a file larger than max_size returns false.
+static bool server_prompt_cache_disk_read_file(const fs::path & path, size_t max_size, std::vector<uint8_t> & out) {
+    std::error_code ec;
+    const auto size = fs::file_size(path, ec);
+    if (ec || size > max_size) {
+        return false;
+    }
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file.good()) {
+        return false;
+    }
+
+    out.resize((size_t) size);
+    if (size > 0) {
+        file.read(reinterpret_cast<char *>(out.data()), (std::streamsize) size);
+        if (!file.good()) {
+            out.clear();
+            return false;
+        }
+    }
+    return true;
+}
+
 // llama_state_seq_save_file() closes the file before returning. Reopen it to
 // force dirty pages to stable storage and immediately mark the cold state as
 // reclaimable. This avoids replacing anonymous cache pressure with several GiB
@@ -2205,7 +2236,10 @@ server_prompt_cache::server_prompt_cache(
         int32_t limit_size_mib,
          size_t limit_tokens,
     const std::string & disk_base_path,
-        int32_t disk_limit_size_mib) {
+        int32_t disk_limit_size_mib,
+   const uint8_t        fingerprint[16],
+        int32_t persist_mib,
+        int32_t persist_min_tokens) {
     ram_enabled       = limit_size_mib != 0;
     limit_size        = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
     this->limit_tokens = limit_tokens;
@@ -2364,9 +2398,406 @@ server_prompt_cache::server_prompt_cache(
 
     SRV_INF("prompt cache disk enabled: path=%s owned_path=%s limit_mib=%d\n",
             this->disk_base_path.c_str(), this->disk_owned_path.c_str(), disk_limit_size_mib);
+
+    if (persist_mib > 0) {
+        // T23: the library budget is computed here; boot_persist points every
+        // existing size check at it only once the library lock is held
+        this->persist_limit_size = 1024ull*1024ull*(uint64_t) persist_mib;
+        this->persist_min_tokens = persist_min_tokens < 0 ? 0 : persist_min_tokens;
+        boot_persist(server_prompt_cache_disk_path_utf8(cache_root), fingerprint);
+    }
+}
+
+void server_prompt_cache::boot_persist(const std::string & cache_root_utf8, const uint8_t * fingerprint) {
+    const auto disable = [this]() {
+#if !defined(_WIN32)
+        if (persist_lock_fd >= 0) {
+            flock(persist_lock_fd, LOCK_UN);
+            close(persist_lock_fd);
+            persist_lock_fd = -1;
+        }
+#endif
+        persist_path.clear();
+    };
+
+    // 1. persistent library directory, never removed by any run
+    std::error_code ec;
+    const fs::path persist_dir = fs::u8path(cache_root_utf8) / "persist";
+    fs::create_directories(persist_dir, ec);
+    if (ec || !fs::is_directory(persist_dir, ec)) {
+        ec.clear();
+        disable();
+        SRV_WRN("persist disabled: reason=persist-dir-create-failed path=%s\n", server_prompt_cache_disk_path_utf8(persist_dir).c_str());
+        return;
+    }
+    ec.clear();
+    fs::permissions(persist_dir, fs::perms::owner_all, fs::perm_options::replace, ec);
+    if (ec) {
+        ec.clear();
+        disable();
+        SRV_WRN("persist disabled: reason=persist-dir-secure-failed path=%s\n", server_prompt_cache_disk_path_utf8(persist_dir).c_str());
+        return;
+    }
+
+    // 2. one library per server, held for the whole process lifetime: two
+    //    servers must never share (and concurrently write) the same library
+#if !defined(_WIN32)
+    const fs::path persist_lock_path = persist_dir / ".persist.lock";
+    persist_lock_fd = open(persist_lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (persist_lock_fd < 0 || flock(persist_lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        disable();
+        SRV_WRN("%s", "persist disabled: library already locked by another server\n");
+        return;
+    }
+#else
+    {
+        std::ofstream lock(persist_dir / ".persist.lock", std::ios::out | std::ios::trunc);
+        if (!lock.good()) {
+            disable();
+            SRV_WRN("persist disabled: reason=persist-lock-create-failed\n");
+            return;
+        }
+    }
+#endif
+
+    // 3. identity fingerprint + budget: from here on every existing size check
+    //    governs the persistent library
+    if (fingerprint == nullptr) {
+        disable();
+        SRV_WRN("%s", "persist disabled: reason=missing-identity-fingerprint\n");
+        return;
+    }
+    persist_path = server_prompt_cache_disk_path_utf8(persist_dir);
+    memcpy(persist_fingerprint, fingerprint, sizeof(persist_fingerprint));
+    disk_limit_size = persist_limit_size;
+
+    // 4. scan the library. Entry layout mirrors the per-run save naming:
+    //      entry-<id>/state-<id>-target.bin | state-<id>-draft.bin | meta
+    //    A crashed save leaves tmp files and no meta - that is the discard path.
+    struct persist_orphan {
+        uint64_t    id;
+        uint64_t    last_used;
+        uint64_t    bytes;
+        std::string name;   // entry dir name, e.g. "entry-7"
+    };
+    std::vector<persist_orphan> orphans;
+    std::vector<server_prompt_disk_state> adopted;
+    uint64_t max_scanned_id = 0;
+
+    for (const auto & entry : fs::directory_iterator(persist_dir, ec)) {
+        if (ec) {
+            break;
+        }
+        const auto name = server_prompt_cache_disk_path_utf8(entry.path().filename());
+        const bool is_dir = entry.is_directory(ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        if (!is_dir || name.rfind("entry-", 0) != 0) {
+            continue;
+        }
+
+        const std::string id_str = name.substr(sizeof("entry-") - 1);
+        bool id_ok = !id_str.empty();
+        uint64_t id = 0;
+        for (const char c : id_str) {
+            if (c < '0' || c > '9' || id > (UINT64_MAX - (uint64_t) (c - '0')) / 10) {
+                id_ok = false;
+                break;
+            }
+            id = id*10 + (uint64_t) (c - '0');
+        }
+        if (!id_ok || id == 0) {
+            // not our naming: leave it untouched (another version's data)
+            SRV_WRN("persist boot skip: entry=%s reason=unparsed-id\n", name.c_str());
+            continue;
+        }
+        max_scanned_id = std::max(max_scanned_id, id);
+
+        const auto discard = [&](const char * reason) {
+            std::error_code rm_ec;
+            fs::remove_all(entry.path(), rm_ec);
+            if (rm_ec) {
+                // not removed: keep the distinct "pending" wording only, so an
+                // operator grepping the plain marker sees real removals
+                SRV_WRN("persist boot discard pending: entry=%s reason=%s error=%s\n", name.c_str(), reason, rm_ec.message().c_str());
+            } else {
+                SRV_WRN("persist boot discard: entry=%s reason=%s\n", name.c_str(), reason);
+            }
+        };
+
+        const std::string stem = "state-" + std::to_string(id);
+        const std::string path_target = server_prompt_cache_disk_path_utf8(entry.path() / (stem + "-target.bin"));
+        const std::string path_draft  = server_prompt_cache_disk_path_utf8(entry.path() / (stem + "-draft.bin"));
+
+        std::vector<uint8_t> meta_data;
+        if (!server_prompt_cache_disk_read_file(entry.path() / "meta", SERVER_PROMPT_CACHE_PERSIST_META_MAX, meta_data)) {
+            discard("meta-missing-or-oversize");
+            continue;
+        }
+        llama_persist_meta meta;
+        if (!llama_persist_meta_parse(meta_data.data(), meta_data.size(), meta)) {
+            discard("meta-parse-failed");
+            continue;
+        }
+        if (memcmp(meta.fingerprint, persist_fingerprint, sizeof(persist_fingerprint)) != 0) {
+            // another config's data: kept on disk - only the budget-driven GC
+            // in step 7 may ever remove it
+            SRV_WRN("persist boot orphan: entry=%s (fingerprint mismatch, kept on disk)\n", name.c_str());
+            orphans.push_back({id, meta.last_used, meta.size_main + meta.size_drft, name});
+            continue;
+        }
+
+        // T23: the sidecar drafter tag must name a real drafter - a value
+        // outside the enum is a corrupt/mutated sidecar, not "another config"
+        if (meta.drafter >= (uint32_t) COMMON_SPECULATIVE_TYPE_COUNT) {
+            discard("meta-invalid-drafter");
+            continue;
+        }
+        if (meta.size_main == 0 ||
+            meta.size_main > (uint64_t) std::numeric_limits<size_t>::max() ||
+            meta.size_drft > (uint64_t) std::numeric_limits<size_t>::max()) {
+            discard("meta-invalid-size");
+            continue;
+        }
+        size_t actual = 0;
+        if (!server_prompt_cache_disk_size_exact(path_target, (size_t) meta.size_main, &actual)) {
+            discard("target-missing-or-size-mismatch");
+            continue;
+        }
+        std::string adopted_path_drft;
+        if (meta.size_drft > 0) {
+            if (!server_prompt_cache_disk_size_exact(path_draft, (size_t) meta.size_drft, &actual)) {
+                discard("draft-missing-or-size-mismatch");
+                continue;
+            }
+            adopted_path_drft = path_draft;
+        } else {
+            // draft may be absent (declared size 0); a stray non-empty one is a mismatch
+            std::error_code draft_ec;
+            const auto draft_actual = fs::file_size(fs::u8path(path_draft), draft_ec);
+            if (!draft_ec && draft_actual != 0) {
+                discard("draft-size-mismatch");
+                continue;
+            }
+        }
+
+        server_prompt_disk_state state;
+        state.tokens     = server_tokens(meta.tokens, /*has_mtmd=*/false);
+        state.spec       = std::move(meta.spec);
+        state.drafter    = (common_speculative_type) meta.drafter;
+        state.path_main  = path_target;
+        state.path_drft  = adopted_path_drft;
+        state.size_main  = (size_t) meta.size_main;
+        state.size_drft  = (size_t) meta.size_drft;
+        state.id         = id;
+        state.usable     = true;
+        state.hits       = meta.hits;
+        state.created_at = meta.created_at;
+        state.last_used  = meta.last_used;
+        state.crc_main   = meta.crc_main;
+        state.crc_drft   = meta.crc_drft;
+        // checkpoints are deliberately not restored: the sidecar retains only
+        // their small positions, which the live run recreates as it continues
+
+        adopted.push_back(std::move(state));
+    }
+    if (ec) {
+        // a surviving error here means the iterator itself failed to construct
+        // or advance: the library was (partially) not scanned, say so instead
+        // of silently starting from an empty library
+        SRV_WRN("persist boot scan failed: %s\n", ec.message().c_str());
+    }
+    ec.clear();
+
+    // 5. oldest first (list order is the LRU order everywhere else in this
+    //    class); rebuild the list to keep the ordering splice-safe
+    std::stable_sort(adopted.begin(), adopted.end(),
+        [](const server_prompt_disk_state & a, const server_prompt_disk_state & b) {
+            if (a.last_used != b.last_used) {
+                return a.last_used < b.last_used;
+            }
+            return a.id < b.id;
+        });
+    disk_states.clear();
+    for (auto & state : adopted) {
+        disk_size_total += state.size();
+        disk_states.push_back(std::move(state));
+    }
+
+    // 6. evict by decayed-hit score until the adopted library is under budget
+    while (disk_size_total > persist_limit_size) {
+        const auto victim = persist_pick_victim(0);
+        if (victim == disk_states.end()) {
+            break;
+        }
+        const uint64_t victim_id    = victim->id;
+        const size_t   victim_bytes = victim->size();
+        std::error_code rm_ec;
+        fs::remove_all(fs::u8path(persist_path) / ("entry-" + std::to_string(victim_id)), rm_ec);
+        if (rm_ec) {
+            SRV_ERR("persist evict failed: entry=%" PRIu64 " error=%s\n", victim_id, rm_ec.message().c_str());
+            break;
+        }
+        disk_states.erase(victim);
+        disk_size_total -= victim_bytes;
+        persist_evictions++;
+        // keep the class-wide eviction bookkeeping consistent with erase_disk_state
+        disk_evictions++;
+        disk_bytes_evicted += victim_bytes;
+        SRV_INF("persist evict: entry=%" PRIu64 " reason=boot-limit bytes=%zu remaining_bytes=%zu\n",
+                victim_id, victim_bytes, disk_size_total);
+    }
+
+    // 7. orphan GC: another config's data, removed only under budget pressure,
+    //    oldest first
+    {
+        uint64_t orphan_bytes = 0;
+        for (const auto & orphan : orphans) {
+            orphan_bytes += orphan.bytes;
+        }
+        if (disk_size_total + orphan_bytes > persist_limit_size) {
+            std::sort(orphans.begin(), orphans.end(),
+                [](const persist_orphan & a, const persist_orphan & b) {
+                    if (a.last_used != b.last_used) {
+                        return a.last_used < b.last_used;
+                    }
+                    return a.id < b.id;
+                });
+            while (!orphans.empty() && disk_size_total + orphan_bytes > persist_limit_size) {
+                const persist_orphan gc = std::move(orphans.front());
+                orphans.erase(orphans.begin());
+                std::error_code rm_ec;
+                fs::remove_all(fs::u8path(persist_path) / gc.name, rm_ec);
+                if (rm_ec) {
+                    // not freed: keep it accounted and try the next orphan
+                    SRV_ERR("persist gc orphan failed: entry=%s error=%s\n", gc.name.c_str(), rm_ec.message().c_str());
+                    continue;
+                }
+                orphan_bytes -= gc.bytes;
+                persist_gc_orphans++;
+                SRV_INF("persist gc orphan: entry=%s last_used=%" PRIu64 " bytes=%" PRIu64 "\n",
+                        gc.name.c_str(), gc.last_used, gc.bytes);
+            }
+        }
+    }
+
+    // 8. next id beyond EVERY scanned entry (adopted, orphan and discarded
+    //    alike) so a future persist save can never collide with an existing
+    //    entry directory; empty library -> 1
+    disk_next_id = max_scanned_id + 1;
+
+    SRV_INF("persist boot adopt: entries=%zu orphans=%zu gc=%" PRIu64 " bytes=%zu budget_bytes=%zu\n",
+            disk_states.size(), orphans.size(), persist_gc_orphans, disk_size_total, persist_limit_size);
+}
+
+std::list<server_prompt_disk_state>::iterator server_prompt_cache::persist_pick_victim(uint64_t exclude_id) {
+    const auto now_s = (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto best = disk_states.end();
+    double best_score = 0.0;
+
+    for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
+        if (it->id == exclude_id) {
+            continue;
+        }
+
+        const double score = llama_persist_eviction_score(it->hits, it->last_used, now_s);
+        const bool better = best == disk_states.end() ||
+            score < best_score ||
+            (score == best_score && (it->last_used < best->last_used ||
+                (it->last_used == best->last_used && it->id < best->id)));
+        if (better) {
+            best = it;
+            best_score = score;
+        }
+    }
+
+    return best;
+}
+
+bool server_prompt_cache::persist_write_meta(const server_prompt_disk_state & state) {
+    const fs::path entry_dir     = fs::u8path(persist_path) / ("entry-" + std::to_string(state.id));
+    const fs::path path_meta_tmp = entry_dir / "meta.tmp";
+    const fs::path path_meta     = entry_dir / "meta";
+    const std::string path_meta_tmp_utf8 = server_prompt_cache_disk_path_utf8(path_meta_tmp);
+    const std::string path_meta_utf8     = server_prompt_cache_disk_path_utf8(path_meta);
+
+    llama_persist_meta meta;
+    memcpy(meta.fingerprint, persist_fingerprint, sizeof(persist_fingerprint));
+    meta.drafter    = (uint32_t) state.drafter;
+    meta.size_main  = state.size_main;
+    meta.size_drft  = state.size_drft;
+    meta.crc_main   = state.crc_main;
+    meta.crc_drft   = state.crc_drft;
+    meta.hits       = state.hits;
+    meta.created_at = state.created_at;
+    meta.last_used  = state.last_used;
+    meta.tokens     = state.tokens.get_tokens();
+    meta.spec       = state.spec;
+
+    std::vector<uint8_t> blob;
+    if (!llama_persist_meta_serialize(meta, blob)) {
+        SRV_ERR("persist meta serialize failed: entry=%" PRIu64 " path=%s\n", state.id, path_meta_utf8.c_str());
+        return false;
+    }
+
+    {
+        std::ofstream file(path_meta_tmp, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char *>(blob.data()), (std::streamsize) blob.size());
+        file.flush();
+        if (!file.good()) {
+            SRV_ERR("persist meta write failed: entry=%" PRIu64 " path=%s\n", state.id, path_meta_tmp_utf8.c_str());
+            server_prompt_cache_disk_remove_file(path_meta_tmp_utf8);
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    fs::permissions(path_meta_tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+    if (ec) {
+        SRV_ERR("persist meta permissions failed: entry=%" PRIu64 " path=%s error=%s\n",
+                state.id, path_meta_tmp_utf8.c_str(), ec.message().c_str());
+        server_prompt_cache_disk_remove_file(path_meta_tmp_utf8);
+        return false;
+    }
+
+    // durable before the rename (durable=true fsyncs and drops the pages)
+    if (!server_prompt_cache_disk_flush_and_drop(path_meta_tmp_utf8, true)) {
+        server_prompt_cache_disk_remove_file(path_meta_tmp_utf8);
+        return false;
+    }
+
+    // THE entry commit: only now does boot adopt see a complete entry
+    ec.clear();
+    fs::rename(path_meta_tmp, path_meta, ec);
+    if (ec) {
+        SRV_ERR("persist meta rename failed: entry=%" PRIu64 " path=%s error=%s\n",
+                state.id, path_meta_utf8.c_str(), ec.message().c_str());
+        server_prompt_cache_disk_remove_file(path_meta_tmp_utf8);
+        return false;
+    }
+    return true;
 }
 
 server_prompt_cache::~server_prompt_cache() {
+    if (!persist_path.empty()) {
+        // T23: the persistent library deliberately survives this run; only the
+        // summary is logged and the library lock released
+        SRV_INF("prompt cache persist shutdown: path=%s entries=%zu bytes=%zu saves=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 " gc_orphans=%" PRIu64 "\n",
+                persist_path.c_str(), disk_states.size(), disk_size_total,
+                persist_saves, persist_loads, persist_evictions, persist_gc_orphans);
+#if !defined(_WIN32)
+        if (persist_lock_fd >= 0) {
+            flock(persist_lock_fd, LOCK_UN);
+            close(persist_lock_fd);
+            persist_lock_fd = -1;
+        }
+#endif
+    }
+
     if (disk_owned_path.empty()) {
         return;
     }
@@ -2432,8 +2863,34 @@ size_t server_prompt_cache::disk_n_tokens() const {
     return res;
 }
 
+// t23: plain copy-out - the caller (metrics task) runs on the same thread as
+// every mutation site (main loop / boot), same contract as get_ple_stats
+persist_stats server_prompt_cache::get_persist_stats() const {
+    persist_stats res;
+
+    res.saves         = persist_saves;
+    res.loads         = persist_loads;
+    res.hits          = persist_hits;
+    res.touches       = persist_touches;
+    res.evictions     = persist_evictions;
+    res.gc_orphans    = persist_gc_orphans;
+    res.bytes_written = persist_bytes_written;
+    res.bytes_read    = persist_bytes_read;
+    res.save_failures = persist_save_failures;
+
+    res.last_restore_ms       = persist_last_restore_ms;
+    res.last_tokens_restored  = persist_last_tokens_restored;
+    res.last_tokens_prefilled = persist_last_tokens_prefilled;
+
+    return res;
+}
+
 void server_prompt_cache::disable_disk_saves(const char * reason, const std::string & path) {
     disk_save_failures++;
+    if (!persist_path.empty()) {
+        // T23: with the persistent library active every save IS a persist save
+        persist_save_failures++;
+    }
     if (disk_save_disabled) {
         return;
     }
@@ -2501,9 +2958,23 @@ bool server_prompt_cache::save_disk(
         return false;
     }
 
-    if (prompt.tokens.has_mtmd) {
+    // T23: skip only prompts that actually carry media chunks. The old check
+    // (has_mtmd alone) disabled every disk save on multimodal servers because
+    // slots are born with has_mtmd = (mctx != nullptr) even for pure-text prompts.
+    if (prompt.tokens.has_media()) {
         SRV_WRN("prompt cache disk skip: reason=multimodal tokens=%zu path=%s\n",
                 prompt.tokens.size(), disk_owned_path.c_str());
+        return false;
+    }
+
+    // T23: with the persistent library active every save goes to its own
+    // entry directory below the library; the per-run path is byte-identical
+    // to before otherwise
+    const bool persist_on = !persist_path.empty();
+
+    if (persist_on && prompt.tokens.size() < (size_t) persist_min_tokens) {
+        SRV_INF("persist save skip: reason=min-tokens tokens=%zu min=%d\n",
+                prompt.tokens.size(), persist_min_tokens);
         return false;
     }
 
@@ -2555,6 +3026,21 @@ bool server_prompt_cache::save_disk(
             SRV_INF("prompt cache disk touch: entry=%" PRIu64 " lcp=%d tokens=%zu exact=%s stateful=%s safe_to_clear=true path=%s\n",
                     id, lcp, prompt.tokens.size(), exact_tokens ? "true" : "false",
                     state_spec.empty() ? "false" : "true", disk_owned_path.c_str());
+            if (persist_on) {
+                // T23: usage bookkeeping for the persistent library. The sidecar
+                // rewrite is best-effort: on failure the previous on-disk
+                // hits/last_used survive (the entry itself is intact), so this
+                // is NOT a save failure.
+                it->hits++;
+                it->last_used = (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                persist_touches++;
+                if (persist_write_meta(*it)) {
+                    SRV_INF("persist touch: entry=%" PRIu64 " hits=%u\n", id, it->hits);
+                } else {
+                    SRV_WRN("persist touch meta rewrite failed: entry=%" PRIu64 " hits=%u\n", id, it->hits);
+                }
+            }
             return true;
         }
     }
@@ -2565,7 +3051,10 @@ bool server_prompt_cache::save_disk(
         return false;
     }
 
-    const auto & tokens = prompt.tokens.get_tokens();
+    // T23: get_tokens() asserts on mtmd-flagged prompts, and slots of multimodal
+    // servers are born has_mtmd = true even for pure-text prompts. The media gate
+    // above guarantees no media chunks here, so the text-only view is exact.
+    const llama_tokens tokens = prompt.tokens.get_text_tokens();
     const size_t token_bytes = tokens.size()*sizeof(llama_token);
     const size_t file_overhead = 3*sizeof(uint32_t) + token_bytes;
     const size_t state_size_main = llama_state_seq_get_size_ext(ctx_main, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -2581,7 +3070,23 @@ bool server_prompt_cache::save_disk(
     }
 
     const uint64_t entry_id = disk_next_id++;
-    const fs::path owned = fs::u8path(disk_owned_path);
+    // T23: persist saves live in their own entry dir (entry-<id>/) below the
+    // persistent library; per-run saves keep using the run directory. The
+    // tmp -> fsync -> chmod -> rename discipline below is shared unchanged.
+    const fs::path owned = persist_on
+        ? fs::u8path(persist_path) / ("entry-" + std::to_string(entry_id))
+        : fs::u8path(disk_owned_path);
+    const std::string owned_utf8 = server_prompt_cache_disk_path_utf8(owned);
+    if (persist_on) {
+        std::error_code mk_ec;
+        fs::create_directories(owned, mk_ec);
+        if (mk_ec || !fs::is_directory(owned)) {
+            SRV_ERR("persist entry create failed: entry=%" PRIu64 " path=%s error=%s\n",
+                    entry_id, owned_utf8.c_str(), mk_ec.message().c_str());
+            disable_disk_saves("entry-dir-create", owned_utf8);
+            return false;
+        }
+    }
     const std::string stem = "state-" + std::to_string(entry_id);
     const fs::path path_main_tmp = owned / (stem + "-target.bin.tmp");
     const fs::path path_main     = owned / (stem + "-target.bin");
@@ -2608,6 +3113,12 @@ bool server_prompt_cache::save_disk(
 
     const int64_t t_start = ggml_time_us();
 
+    // T23: CRC of the persisted bytes, computed on the durable tmp file BEFORE
+    // the rename; an unreadable/short/long file right after writing it means
+    // the storage is broken - a save failure like any other
+    uint32_t crc_main = 0;
+    uint32_t crc_drft = 0;
+
     const size_t n_main = llama_state_seq_save_file(
         ctx_main, path_main_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size());
     size_t actual_main = 0;
@@ -2617,6 +3128,11 @@ bool server_prompt_cache::save_disk(
         SRV_ERR("prompt cache disk save failed: entry=%" PRIu64 " component=target path=%s\n",
                 entry_id, path_main_tmp_utf8.c_str());
         return fail_io("target-save", path_main_tmp_utf8);
+    }
+    if (persist_on && !llama_persist_crc32_file(path_main_tmp_utf8.c_str(), (uint64_t) n_main, &crc_main)) {
+        SRV_ERR("persist crc failed: entry=%" PRIu64 " component=target bytes=%zu path=%s\n",
+                entry_id, n_main, path_main_tmp_utf8.c_str());
+        return fail_io("target-crc", path_main_tmp_utf8);
     }
 
     size_t n_drft = 0;
@@ -2630,6 +3146,11 @@ bool server_prompt_cache::save_disk(
             SRV_ERR("prompt cache disk save failed: entry=%" PRIu64 " component=draft path=%s\n",
                     entry_id, path_drft_tmp_utf8.c_str());
             return fail_io("draft-save", path_drft_tmp_utf8);
+        }
+        if (persist_on && !llama_persist_crc32_file(path_drft_tmp_utf8.c_str(), (uint64_t) n_drft, &crc_drft)) {
+            SRV_ERR("persist crc failed: entry=%" PRIu64 " component=draft bytes=%zu path=%s\n",
+                    entry_id, n_drft, path_drft_tmp_utf8.c_str());
+            return fail_io("draft-crc", path_drft_tmp_utf8);
         }
     }
 
@@ -2688,18 +3209,6 @@ bool server_prompt_cache::save_disk(
         }
     }
 
-    if (!server_prompt_cache_disk_sync_dir(disk_owned_path) ||
-        !server_prompt_cache_disk_flush_and_drop(path_main_utf8, false) ||
-        (ctx_drft && !server_prompt_cache_disk_flush_and_drop(path_drft_utf8, false))) {
-        const bool main_cleanup_ok = server_prompt_cache_disk_remove_file(path_main_utf8);
-        const bool drft_cleanup_ok = server_prompt_cache_disk_remove_file(path_drft_utf8);
-        disable_disk_saves("commit-sync", disk_owned_path);
-        if (!main_cleanup_ok || !drft_cleanup_ok) {
-            disable_disk_saves("commit-sync-cleanup", disk_owned_path);
-        }
-        return false;
-    }
-
     server_prompt_disk_state state;
     state.tokens    = prompt.tokens.clone();
     state.path_main = path_main_utf8;
@@ -2715,10 +3224,60 @@ bool server_prompt_cache::save_disk(
         state.checkpoints.push_back({ckpt.n_tokens, ckpt.pos_min, ckpt.pos_max});
     }
 
+    // T23: the sidecar is committed LAST. Until the meta rename lands, the
+    // entry is invisible to boot adoption (a crashed save leaves only tmp or
+    // bin files, which the next boot discards); after it, the bins + sidecar
+    // form one atomic entry. fsync order: data files -> meta.tmp fsync ->
+    // meta rename -> entry-dir fsync (below).
+    if (persist_on) {
+        const auto now_s = (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        state.hits       = 0;
+        state.created_at = now_s;
+        state.last_used  = now_s;
+        state.crc_main   = crc_main;
+        state.crc_drft   = crc_drft;
+
+        if (!persist_write_meta(state)) {
+            std::error_code rm_ec;
+            fs::remove_all(owned, rm_ec);
+            disable_disk_saves("meta-commit", owned_utf8);
+            if (rm_ec) {
+                disable_disk_saves("meta-commit-cleanup", owned_utf8);
+            }
+            return false;
+        }
+    }
+
+    if (!server_prompt_cache_disk_sync_dir(owned_utf8) ||
+        !server_prompt_cache_disk_flush_and_drop(path_main_utf8, false) ||
+        (ctx_drft && !server_prompt_cache_disk_flush_and_drop(path_drft_utf8, false))) {
+        disable_disk_saves("commit-sync", owned_utf8);
+        if (persist_on) {
+            // uncommitted (no sidecar survived): drop the whole entry dir
+            std::error_code rm_ec;
+            fs::remove_all(owned, rm_ec);
+            if (rm_ec) {
+                disable_disk_saves("commit-sync-cleanup", owned_utf8);
+            }
+        } else {
+            const bool main_cleanup_ok = server_prompt_cache_disk_remove_file(path_main_utf8);
+            const bool drft_cleanup_ok = server_prompt_cache_disk_remove_file(path_drft_utf8);
+            if (!main_cleanup_ok || !drft_cleanup_ok) {
+                disable_disk_saves("commit-sync-cleanup", disk_owned_path);
+            }
+        }
+        return false;
+    }
+
     disk_states.push_back(std::move(state));
     disk_size_total    += actual_total;
     disk_saves++;
     disk_bytes_written += actual_total;
+    if (persist_on) {
+        persist_saves++;
+        persist_bytes_written += actual_total;
+    }
 
     auto new_entry = std::prev(disk_states.end());
     bool reclaim_ok = true;
@@ -2743,7 +3302,31 @@ bool server_prompt_cache::save_disk(
         }
     }
 
+    // T23: with the persistent library active the victim is chosen by decayed
+    // hit score (never the just-committed entry); the per-run cache keeps the
+    // strict list-front (LRU) order as before
     while (reclaim_ok && disk_size_total > disk_limit_size) {
+        if (persist_on) {
+            const auto victim = persist_pick_victim(entry_id);
+            if (victim == disk_states.end()) {
+                // the only library entry is the one just committed: keep it and
+                // accept the transient staging headroom (spec t23 par. 4) -
+                // removing the new entry or disabling saves would defeat the
+                // library's purpose for no benefit
+                SRV_WRN("persist over-budget: entry=%" PRIu64 " bytes=%zu limit_bytes=%zu reason=no-victim\n",
+                        entry_id, disk_size_total, disk_limit_size);
+                break;
+            }
+            const uint64_t victim_id = victim->id;
+            if (!erase_disk_state(victim, true, "save-limit")) {
+                disable_disk_saves("persist-reclaim", disk_owned_path);
+                reclaim_ok = false;
+                break;
+            }
+            persist_evictions++;
+            SRV_INF("persist evict: entry=%" PRIu64 " reason=save-limit\n", victim_id);
+            continue;
+        }
         if (disk_states.begin() == new_entry) {
             SRV_ERR("prompt cache disk reclaim failed: entry=%" PRIu64 " reason=no-old-victim accounted_bytes=%zu limit_bytes=%zu path=%s\n",
                     entry_id, disk_size_total, disk_limit_size, disk_owned_path.c_str());
@@ -2766,6 +3349,10 @@ bool server_prompt_cache::save_disk(
     const double t_ms = (ggml_time_us() - t_start)/1000.0;
     SRV_INF("prompt cache disk save: entry=%" PRIu64 " tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu save_ms=%.2f path=%s\n",
             entry_id, tokens.size(), prompt.checkpoints.size(), n_main, n_drft, state_spec.size(), actual_total, t_ms, disk_owned_path.c_str());
+    if (persist_on) {
+        SRV_INF("persist save: entry=%" PRIu64 " tokens=%zu bytes=%zu save_ms=%.1f\n",
+                entry_id, tokens.size(), actual_total, t_ms);
+    }
     log_disk_state();
 
     return true;
@@ -2880,12 +3467,20 @@ bool server_prompt_cache::load_disk(
               size_t   lcp,
             uint64_t * entry_id_out,
         common_speculative_type drafter_active,
-              bool * tag_mismatch) {
+              bool * tag_mismatch,
+              double * load_ms_out,
+              size_t * n_tokens_main_out) {
     if (entry_id_out != nullptr) {
         *entry_id_out = 0;
     }
     if (tag_mismatch != nullptr) {
         *tag_mismatch = false;
+    }
+    if (load_ms_out != nullptr) {
+        *load_ms_out = 0.0;
+    }
+    if (n_tokens_main_out != nullptr) {
+        *n_tokens_main_out = 0;
     }
 
     // spec-route: an entry tagged with a different (concrete) drafter still has
@@ -2937,6 +3532,28 @@ bool server_prompt_cache::load_disk(
         return reject_entry("missing-draft-file");
     }
 
+    // T23: verify-then-load. A persisted entry is fed into the contexts only
+    // when its payload still matches the sidecar CRC; a mismatch - or an
+    // unreadable file, which counts as one - is corruption, so the whole entry
+    // is discarded instead. The draft is verified only when it is about to be
+    // loaded (a tag mismatch skips its restoration by design).
+    if (!persist_path.empty()) {
+        const uint32_t crc_main_expected = it->crc_main;
+        const uint32_t crc_drft_expected = it->crc_drft;
+        uint32_t crc = 0;
+        if (!llama_persist_crc32_file(path_main.c_str(), (uint64_t) target_bytes, &crc) || crc != crc_main_expected) {
+            SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-target\n", entry_id);
+            return reject_entry("crc-mismatch-target");
+        }
+        if (!path_drft.empty() && tag_match) {
+            crc = 0;
+            if (!llama_persist_crc32_file(path_drft.c_str(), (uint64_t) draft_bytes, &crc) || crc != crc_drft_expected) {
+                SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-draft\n", entry_id);
+                return reject_entry("crc-mismatch-draft");
+            }
+        }
+    }
+
     const int64_t t_start = ggml_time_us();
 
     llama_tokens tokens_main(n_tokens_expected);
@@ -2982,6 +3599,11 @@ bool server_prompt_cache::load_disk(
     prompt = std::move(restored);
 
     disk_bytes_read += nread_main + nread_drft;
+    if (!persist_path.empty()) {
+        // T23: payload bytes actually read from the persistent library (counted
+        // once per successful restore, here where the read happens)
+        persist_bytes_read += nread_main + nread_drft;
+    }
 
     const double t_ms = (ggml_time_us() - t_start)/1000.0;
     SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu load_ms=%.2f path=%s\n",
@@ -2990,6 +3612,12 @@ bool server_prompt_cache::load_disk(
 
     if (entry_id_out != nullptr) {
         *entry_id_out = entry_id;
+    }
+    if (load_ms_out != nullptr) {
+        *load_ms_out = t_ms;
+    }
+    if (n_tokens_main_out != nullptr) {
+        *n_tokens_main_out = n_tokens_main;
     }
     return true;
 }
@@ -3010,13 +3638,27 @@ bool server_prompt_cache::erase_disk_state(
     // Quarantine before touching either component. If only one unlink works,
     // retain the full conservative accounting and metadata for a later retry.
     it->usable = false;
-    const bool main_ok = server_prompt_cache_disk_remove_file(path_main);
-    const bool drft_ok = server_prompt_cache_disk_remove_file(path_drft);
-    if (!main_ok || !drft_ok) {
-        SRV_ERR("prompt cache disk removal failed: entry=%" PRIu64 " reason=%s target_removed=%s draft_removed=%s accounted_bytes=%zu path=%s\n",
-                entry_id, reason, main_ok ? "true" : "false", drft_ok ? "true" : "false",
-                disk_size_total, disk_owned_path.c_str());
-        return false;
+    if (!persist_path.empty()) {
+        // T23: a library entry owns a whole entry-<id>/ directory (bins +
+        // sidecar): remove it entire so no meta-only husk survives on disk
+        const fs::path entry_dir = fs::u8path(persist_path) / ("entry-" + std::to_string(entry_id));
+        const std::string entry_dir_utf8 = server_prompt_cache_disk_path_utf8(entry_dir);
+        std::error_code rm_ec;
+        fs::remove_all(entry_dir, rm_ec);
+        if (rm_ec) {
+            SRV_ERR("persist removal failed: entry=%" PRIu64 " reason=%s accounted_bytes=%zu path=%s error=%s\n",
+                    entry_id, reason, disk_size_total, entry_dir_utf8.c_str(), rm_ec.message().c_str());
+            return false;
+        }
+    } else {
+        const bool main_ok = server_prompt_cache_disk_remove_file(path_main);
+        const bool drft_ok = server_prompt_cache_disk_remove_file(path_drft);
+        if (!main_ok || !drft_ok) {
+            SRV_ERR("prompt cache disk removal failed: entry=%" PRIu64 " reason=%s target_removed=%s draft_removed=%s accounted_bytes=%zu path=%s\n",
+                    entry_id, reason, main_ok ? "true" : "false", drft_ok ? "true" : "false",
+                    disk_size_total, disk_owned_path.c_str());
+            return false;
+        }
     }
 
     if (total_bytes > disk_size_total) {
@@ -3045,6 +3687,12 @@ void server_prompt_cache::accept_disk_load(uint64_t entry_id) {
         return;
     }
 
+    // T23: take ownership of the pending stash now - it describes THIS restore
+    // (the caller hands back the id load_disk reported), and a later, unrelated
+    // accept must never be able to match stale numbers
+    const auto pending = !persist_path.empty() ? pending_load : decltype(pending_load){};
+    pending_load = {};
+
     for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
         if (it->id != entry_id || !it->usable) {
             continue;
@@ -3054,6 +3702,31 @@ void server_prompt_cache::accept_disk_load(uint64_t entry_id) {
         disk_states.splice(disk_states.end(), disk_states, it);
         SRV_INF("prompt cache disk load accepted: entry=%" PRIu64 " reusable=true path=%s\n",
                 entry_id, disk_owned_path.c_str());
+
+        // T23: cross-restart hit bookkeeping. The sidecar rewrite is best-effort
+        // (same discipline as the save-time touch: on failure the previous
+        // on-disk hits/last_used survive, the entry itself is intact). The
+        // gauges and the marker report the stashed measurements of this
+        // restore, never numbers recomputed here.
+        if (pending.valid && pending.entry_id == entry_id) {
+            it->hits++;
+            it->last_used = (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            if (persist_write_meta(*it)) {
+                SRV_INF("persist hit: entry=%" PRIu64 " hits=%u\n", entry_id, it->hits);
+            } else {
+                SRV_WRN("persist hit meta rewrite failed: entry=%" PRIu64 " hits=%u\n", entry_id, it->hits);
+            }
+
+            persist_loads++;
+            persist_hits++;
+            persist_last_restore_ms       = pending.load_ms;
+            persist_last_tokens_restored  = pending.lcp;
+            persist_last_tokens_prefilled = pending.prompt_tokens_total > pending.lcp
+                ? pending.prompt_tokens_total - pending.lcp : 0;
+            SRV_INF("persist load: entry=%" PRIu64 " restored=%zu prefilled=%zu ms=%.1f\n",
+                    entry_id, persist_last_tokens_restored, persist_last_tokens_prefilled, pending.load_ms);
+        }
         log_disk_state();
         return;
     }
@@ -3062,6 +3735,16 @@ void server_prompt_cache::accept_disk_load(uint64_t entry_id) {
 void server_prompt_cache::reject_disk_load(uint64_t entry_id, const char * reason) {
     if (entry_id == 0) {
         return;
+    }
+
+    if (!persist_path.empty()) {
+        // T23: a restore the speculative state refused is no hit - neither the
+        // gauges nor the hit counters may count it, and a pending stash for
+        // this entry must not survive into a later accept
+        if (pending_load.valid && pending_load.entry_id == entry_id) {
+            pending_load = {};
+        }
+        SRV_WRN("persist reject: entry=%" PRIu64 " reason=%s\n", entry_id, reason);
     }
 
     for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
@@ -3081,7 +3764,29 @@ void server_prompt_cache::reject_disk_load(uint64_t entry_id, const char * reaso
 }
 
 void server_prompt_cache::update_disk() {
+    const bool persist_on = !persist_path.empty();
+
     while (!disk_states.empty() && disk_size_total > disk_limit_size) {
+        if (persist_on) {
+            // T23: same decayed-hit-score victim choice as the save path -
+            // nothing is excluded here, every library entry is evictable
+            const auto victim = persist_pick_victim(0);
+            if (victim == disk_states.end()) {
+                // nothing eligible left: keep what remains and accept the
+                // transient headroom (spec t23 par. 4)
+                SRV_WRN("persist over-budget: entry=0 bytes=%zu limit_bytes=%zu reason=no-victim\n",
+                        disk_size_total, disk_limit_size);
+                break;
+            }
+            const uint64_t victim_id = victim->id;
+            if (!erase_disk_state(victim, true, "update-limit")) {
+                disable_disk_saves("persist-update-reclaim", disk_owned_path);
+                break;
+            }
+            persist_evictions++;
+            SRV_INF("persist evict: entry=%" PRIu64 " reason=update-limit\n", victim_id);
+            continue;
+        }
         if (!erase_disk_state(disk_states.begin(), true, "lru-update-limit")) {
             disable_disk_saves("update-limit-removal", disk_owned_path);
             break;
@@ -3259,9 +3964,25 @@ bool server_prompt_cache::load(
     if (it_best_disk != disk_states.end()) {
         SRV_INF(" - found better disk prompt with f_keep = %.3f, sim = %.3f, lcp = %zu\n",
                 f_keep_best, sim_best, lcp_selected);
-        const bool loaded = load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, disk_entry_id, drafter_active, tag_mismatch);
-        if (loaded && cache_hit != nullptr) {
-            *cache_hit = true;
+        double load_ms = 0.0;
+        size_t n_tokens_main = 0;
+        const bool loaded = load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, disk_entry_id, drafter_active, tag_mismatch, &load_ms, &n_tokens_main);
+        if (loaded) {
+            if (cache_hit != nullptr) {
+                *cache_hit = true;
+            }
+            if (!persist_path.empty()) {
+                // T23: stash the restore measurements here - this is the only
+                // place that knows the full new-prompt token count; the caller
+                // hands the entry id back to accept_disk_load/reject_disk_load,
+                // which consume the stash on this same thread
+                pending_load.entry_id            = disk_entry_id != nullptr ? *disk_entry_id : 0;
+                pending_load.load_ms             = load_ms;
+                pending_load.n_tokens_main       = n_tokens_main;
+                pending_load.lcp                 = lcp_selected;
+                pending_load.prompt_tokens_total = tokens_new.size();
+                pending_load.valid               = true;
+            }
         }
         return loaded;
     }

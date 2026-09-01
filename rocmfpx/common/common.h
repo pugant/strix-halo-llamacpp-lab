@@ -696,6 +696,10 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_disk_limit_mib = 8192; // disk prompt-cache limit when cache_disk_path is set
 
+    bool    cache_disk_persist         = false; // persist disk prompt-cache entries across restarts
+    int32_t cache_disk_persist_mib     = 16384; // persistent library budget (min 1024)
+    int32_t cache_disk_persist_min_tokens = 1024; // do not save shorter prompts to the library
+
     bool    ple_disk       = false; // T25: keep the qwen4exp PLE n-gram table on disk
     int32_t ple_cache_mib  = 4096;  // T25: PLE block-cache budget (MiB), requires --ple-disk
 

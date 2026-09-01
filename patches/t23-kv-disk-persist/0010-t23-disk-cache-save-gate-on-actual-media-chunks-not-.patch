@@ -1,0 +1,51 @@
+From 4df5797767108f77edefff970cce117266e17724 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 1 Sep 2026 12:50:56 +0200
+Subject: [PATCH] t23: disk-cache save gate on actual media chunks, not server
+ multimodality
+
+Slots on multimodal servers are born with has_mtmd = (mctx != nullptr), which
+disabled every disk save (per-run and persistent) even for pure-text prompts.
+Skip only when the prompt really carries media chunks (has_media()).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ tools/server/server-common.h | 5 +++++
+ tools/server/server-task.cpp | 5 ++++-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 0ed3d6111..527452347 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -203,6 +203,11 @@ public:
+ 
+     bool empty() const { return tokens.empty(); }
+ 
++    // T23: does this prompt actually carry media chunks? Distinct from has_mtmd,
++    // which is also set at slot creation on multimodal servers (mctx != nullptr)
++    // even for pure-text prompts - the disk cache must only skip real media.
++    bool has_media() const { return !map_idx_to_media.empty(); }
++
+     void clear() {
+         map_idx_to_media.clear();
+         tokens.clear();
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index dddb1d65a..18488a477 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -2958,7 +2958,10 @@ bool server_prompt_cache::save_disk(
+         return false;
+     }
+ 
+-    if (prompt.tokens.has_mtmd) {
++    // T23: skip only prompts that actually carry media chunks. The old check
++    // (has_mtmd alone) disabled every disk save on multimodal servers because
++    // slots are born with has_mtmd = (mctx != nullptr) even for pure-text prompts.
++    if (prompt.tokens.has_media()) {
+         SRV_WRN("prompt cache disk skip: reason=multimodal tokens=%zu path=%s\n",
+                 prompt.tokens.size(), disk_owned_path.c_str());
+         return false;
+-- 
+2.53.0
+
