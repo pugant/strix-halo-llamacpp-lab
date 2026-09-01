@@ -1,7 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 240" width="300" height="240">
   <!-- Strix Lean — the lab's mascot: cinched by a belt (lean!), wide-shock eyes, little legs.
        Same family as v1 (geometric amber owl); the orbital halo is gone,
        replaced by a waist belt with buckle. The belly bulges below the belt. -->
+  <!-- wings: one clean silhouette per side — fan of U-rounded feathers from the
+       shoulder hub sweeping down past the belt (as in the reference drawing);
+       single outline, no interior lines; darker amber, behind the body -->
+  <path id="wing" d="M114.0 98.0 C 92 82, 68 64, 48.6 51.1 Q 40.4 55.6 65.3 80.8 Q 40.5 74.9 35.1 81.3 Q 29.6 87.4 61.4 100.7 Q 38.6 103.4 36.0 110.0 Q 33.2 117.1 65.3 118.6 Q 46.5 128.1 46.3 134.6 Q 46.1 141.6 74.0 133.1 Q 60.0 147.8 61.9 153.7 Q 64.0 160.0 85.6 143.9 Q 77.3 162.4 81.0 167.2 Q 84.4 172.0 98.2 151.3 Q 95.3 173.2 99.9 176.5 C 93.9 168.5 112.0 148.0 114.0 126.0 Z" fill="#bf6d1c" stroke="#3d2b12" stroke-width="4.5" stroke-linejoin="round"/>
+  <path d="M114.0 98.0 C 92 82, 68 64, 48.6 51.1 Q 40.4 55.6 65.3 80.8 Q 40.5 74.9 35.1 81.3 Q 29.6 87.4 61.4 100.7 Q 38.6 103.4 36.0 110.0 Q 33.2 117.1 65.3 118.6 Q 46.5 128.1 46.3 134.6 Q 46.1 141.6 74.0 133.1 Q 60.0 147.8 61.9 153.7 Q 64.0 160.0 85.6 143.9 Q 77.3 162.4 81.0 167.2 Q 84.4 172.0 98.2 151.3 Q 95.3 173.2 99.9 176.5 C 93.9 168.5 112.0 148.0 114.0 126.0 Z" fill="#bf6d1c" stroke="#3d2b12" stroke-width="4.5" stroke-linejoin="round"
+        transform="translate(320,0) scale(-1,1)"/>
+  <g transform="translate(40,0)">
   <defs>
     <linearGradient id="owl" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#f2b544"/>
@@ -41,38 +48,42 @@
   <!-- ear tufts -->
   <path d="M78 62 L 70 36 L 96 50 Z" fill="url(#owl)" stroke="#3d2b12" stroke-width="5" stroke-linejoin="round"/>
   <path d="M162 62 L 170 36 L 144 50 Z" fill="url(#owl)" stroke="#3d2b12" stroke-width="5" stroke-linejoin="round"/>
-  <!-- eyes: wide shock, tiny pupils, raised brows -->
+  <!-- eyes: wide shock, asymmetric (right eye squished smaller by the belt), tiny pupils -->
   <g stroke="#3d2b12" stroke-width="5">
     <circle cx="97" cy="98" r="27" fill="#fdf6e3"/>
-    <circle cx="143" cy="98" r="27" fill="#fdf6e3"/>
-    <circle cx="99" cy="102" r="6" fill="#3d2b12" stroke="none"/>
-    <circle cx="141" cy="102" r="6" fill="#3d2b12" stroke="none"/>
-    <circle cx="101.5" cy="99.5" r="2.2" fill="#fdf6e3" stroke="none"/>
-    <circle cx="143.5" cy="99.5" r="2.2" fill="#fdf6e3" stroke="none"/>
+    <circle cx="140" cy="101" r="19" fill="#fdf6e3"/>
+    <circle cx="99" cy="107" r="6" fill="#3d2b12" stroke="none"/>
+    <circle cx="139.3" cy="107.5" r="4.3" fill="#3d2b12" stroke="none"/>
+    <circle cx="101.5" cy="104" r="2.2" fill="#fdf6e3" stroke="none"/>
+    <circle cx="141" cy="105.5" r="1.6" fill="#fdf6e3" stroke="none"/>
   </g>
   <g fill="none" stroke="#3d2b12" stroke-width="5" stroke-linecap="round">
     <path d="M72 62 q 16 -12 34 -6"/>
     <path d="M168 62 q -16 -12 -34 -6"/>
   </g>
-  <!-- beak: closed diamond, v1-style -->
-  <path d="M120 122 L 110 138 L 120 156 L 130 138 Z" fill="#e8632c" stroke="#3d2b12" stroke-width="4" stroke-linejoin="round"/>
-  <!-- belt + buckle + holes: snug around the waist -->
+  <!-- belt + buckle + holes: slim belt, snug around the waist -->
   <g stroke="#241708" stroke-width="4" stroke-linejoin="round">
-    <rect x="79" y="148" width="82" height="20" rx="9" fill="#4a3421"/>
-    <rect x="104" y="143" width="32" height="30" rx="6" fill="#e8b13c"/>
-    <rect x="113" y="152" width="14" height="12" rx="2" fill="#4a3421" stroke-width="3"/>
-    <circle cx="86" cy="158" r="2.5" fill="#e8b13c" stroke="none"/>
-    <circle cx="95" cy="158" r="2.5" fill="#e8b13c" stroke="none"/>
-    <circle cx="145" cy="158" r="2.5" fill="#e8b13c" stroke="none"/>
-    <circle cx="154" cy="158" r="2.5" fill="#e8b13c" stroke="none"/>
+    <rect x="79" y="148" width="82" height="15" rx="7" fill="#4a3421"/>
+    <rect x="104" y="141.5" width="32" height="28" rx="6" fill="#e8b13c"/>
+    <rect x="113" y="149.5" width="14" height="12" rx="2" fill="#4a3421" stroke-width="3"/>
+    <circle cx="86" cy="155.5" r="2.2" fill="#e8b13c" stroke="none"/>
+    <circle cx="95" cy="155.5" r="2.2" fill="#e8b13c" stroke="none"/>
+    <circle cx="145" cy="155.5" r="2.2" fill="#e8b13c" stroke="none"/>
+    <circle cx="154" cy="155.5" r="2.2" fill="#e8b13c" stroke="none"/>
   </g>
-  <!-- tension creases: three per side, vivid orange, radiating from the belt tips -->
+  <!-- beak: wide where it meets the face, pointed down; drawn IN FRONT of the
+       belt, its tip just grazing the belt's top edge (reference-drawing style) -->
+  <path d="M109 122 Q 120 115 131 122 L 120 151 Z" fill="#e8632c" stroke="#3d2b12" stroke-width="4" stroke-linejoin="round"/>
+  <!-- tension creases: four per side, vivid orange, fanning from the belt tips -->
   <g stroke="#e8632c" stroke-width="4.5" stroke-linecap="round" fill="none">
-    <path d="M76 144 l -11 -7"/>
-    <path d="M73 154 l -12 0"/>
-    <path d="M76 163 l -11 7"/>
-    <path d="M164 144 l 11 -7"/>
-    <path d="M167 154 l 12 0"/>
-    <path d="M164 163 l 11 7"/>
+    <path d="M76 136.5 l -10 -8"/>
+    <path d="M74 145.5 l -12 -3"/>
+    <path d="M74 157.5 l -12 3"/>
+    <path d="M76 166.5 l -10 8"/>
+    <path d="M164 136.5 l 10 -8"/>
+    <path d="M166 145.5 l 12 -3"/>
+    <path d="M166 157.5 l 12 3"/>
+    <path d="M164 166.5 l 10 8"/>
+  </g>
   </g>
 </svg>
