@@ -1,4 +1,4 @@
-<p align="center"><img src="logo.svg" alt="Strix Owl — strix-halo-llamacpp-lab" width="220"></p>
+<p align="center"><img src="logo.svg" alt="Strix Lean — the lab's mascot" width="220"></p>
 
 This is a llama.cpp laboratory for one machine class: AMD Strix Halo (Ryzen AI MAX+ 395, 128 GB unified memory) — the Strix Owl above is this lab's mascot. The headline is the **qwen4exp** line — Qwen3.8-Flash-Next, the 180B-class hybrid mixing gated-deltanet linear attention, 4-stream low-rank hyper-connections and a 51B-parameter PLE n-gram table. Our ROCmFP4 quant of it is 98.5 GiB and, with `--ple-disk`, runs on the same 128 GB machine **with ~36 GB of RAM to spare**: the PLE table is never loaded — its blocks are read on demand straight from the GGUF on disk, the output stays char-identical, and warm token generation costs ~3%.
 
