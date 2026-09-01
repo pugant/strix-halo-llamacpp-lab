@@ -38,6 +38,25 @@ Each line below is one measured claim; nothing is merged or projected.
 - Bound the reasoning budget without a cliff — hard thinking cap plus a warn window at 75% of the budget: in a real one-hour agent session (48 requests) every request closed naturally; the single triggered warning converged in 1.3 s; none exhausted the budget.
 - Reproduce any published number — replication guides in `docs/guide/`, raw notes and data in [`docs/experiments/`](docs/experiments/).
 
+## The engine
+
+The quants listed under [Model weights](#model-weights) load on ggml-org/llama.cpp builds only where upstream supports
+their tensor types — several of the features below exist only in our lab build.
+Arriving from a model card: that "our lab build" recommendation is this repo —
+build it from [`rocmfpx/`](rocmfpx/) or the [Vulkan
+Dockerfile](docker/Dockerfile.vulkan-rocmfpx-local), then try the feature with
+the model it was measured on. Full flag recipes (secondary flags, defaults,
+commands) live in the [Feature guide](#feature-guide) below.
+
+| Feature | Flag | What it buys | Try it with | Docs |
+|---|---|---|---|---|
+| PLE disk-offload | `--ple-disk` | ~36 GB RAM back, char-identical output | [Qwen3.8-Flash-Next](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF) | [guide](docs/guide/qwen38-flash-next-ple-disk.md) |
+| Persistent prompt cache | `--cache-disk-persist` | restarts stop costing a re-prefill (64× measured) | any model | [guide](docs/guide/qwen38-flash-next-prompt-cache-disk.md) |
+| Per-request dual-drafter routing | `--spec-type draft-mtp,draft-dflash` | +19% agentic (measured on the 27B), prose unchanged | [Qwen3.8-27B](https://huggingface.co/pugant/Qwen3.8-27B-MTP-Q4_0_ROCMFP4_STRIX_LEAN) | [replication guide](docs/guide/qwen38-27b.md) |
+| External MTP drafter | `-md <mtp.gguf>` | +108/127% deterministic decode | [Qwen3.8-Flash-Next](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF) | [note](docs/experiments/qwen38-flash-next-runtime.md) |
+| Reasoning-budget warn window | `--reasoning-budget` | budgets converge instead of exhausting | any model | [note](docs/experiments/reasoning-budget-warn75.md) |
+| qwen4exp arch + vision×MTP | — | the whole Flash-Next family, vision and drafter together | [Qwen3.8-Flash-Next](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF) | [note](docs/experiments/qwen38-flash-next-runtime.md) |
+
 # Motivations
 
 - **One machine, one physics.** Strix Halo puts 128 GB of unified memory behind a ~256 GB/s pipe. Everything that matters here — quant format, drafter choice, KV layout, what moves to disk — follows from that single bandwidth budget.
@@ -87,9 +106,9 @@ No weights live in this repo — our quants are on Hugging Face under their own 
 | Qwen3.8-27B (dense) | [`pugant/Qwen3.8-27B-MTP-Q4_0_ROCMFP4_STRIX_LEAN`](https://huggingface.co/pugant/Qwen3.8-27B-MTP-Q4_0_ROCMFP4_STRIX_LEAN) | 13.8 GiB — the lab's canonical model, MTP layer included |
 | Qwen3.8-27B imatrix | [`pugant/Qwen3.8-27B-imatrix`](https://huggingface.co/pugant/Qwen3.8-27B-imatrix) | the importance matrix behind the preset above |
 | Qwen3.8-27B Q3_0 | [`pugant/Qwen3.8-27B-MTP-Q3_0_ROCMFPX`](https://huggingface.co/pugant/Qwen3.8-27B-MTP-Q3_0_ROCMFPX) | documented **NO-GO** quant — not a true 3-bit on this hybrid arch (4.44/5.72 effective bpw, no byte savings), tg (token generation) costs 15.6% on the base preset, 31.7% on the agent-tuned preset |
-| grug-35b-v2 | [`pugant/grug-35b-v2-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/grug-35b-v2-ROCmFP4-STRIX_LEAN) | MoE 35B-A3B, reasoning/tool-call finetune |
+| grug-35b-v2 | [`pugant/grug-35b-v2-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/grug-35b-v2-ROCmFP4-STRIX_LEAN) | MoE 35B-A3B, reasoning/tool-call fine-tune |
 | Ornith-1.0-35B | [`pugant/Ornith-1.0-35B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/Ornith-1.0-35B-ROCmFP4-STRIX_LEAN) | MoE 35B-A3B, multimodal |
-| Ornith-1.5-35B | [`pugant/Ornith-1.5-35B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/Ornith-1.5-35B-ROCmFP4-STRIX_LEAN) | MoE 35B-A3B, multimodal — MTP head degraded by the finetune (pos-2 acceptance ~0.07): speculative decoding not recommended |
+| Ornith-1.5-35B | [`pugant/Ornith-1.5-35B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/Ornith-1.5-35B-ROCmFP4-STRIX_LEAN) | MoE 35B-A3B, multimodal — MTP head degraded by the fine-tune (pos-2 acceptance ~0.07): speculative decoding not recommended |
 | Nemotron-3.5-Lightning-30B-A3B | [`pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN`](https://huggingface.co/pugant/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ROCmFP4-STRIX_LEAN) | Mamba-hybrid MoE |
 | Qwen3.6-35B-A3B | [`pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX`](https://huggingface.co/pugant/Qwen3.6-35B-A3B-MTP-Q6_0_ROCMFPX) | MoE 35B-A3B at Q6_0 |
 
