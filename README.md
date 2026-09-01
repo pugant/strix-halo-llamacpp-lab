@@ -130,7 +130,7 @@ This lab adds a thin layer on top of giants' work.
 
 - **ggml-org / llama.cpp** — Georgi Gerganov and contributors. The main branch of llama.cpp is the foundation of everything here and is invaluable to the whole local-inference community. Thank you for keeping it open.
 - **charlie12345** — maintainer of the ROCmFPX fork of llama.cpp, where the ROCmFP4 / `Q4_0_ROCMFP4_STRIX_LEAN` preset, the HIP kernels and the GGUF extensions live. Most of the code this lab builds upon — and merges upstream (PRs #67–#82, ours among them) — is their work.
-- **kyuz0** — the `amd-strix-halo-toolboxes` / `docker-llm-service` containers this lab builds and runs on.
+- **kyuz0 (Donato Capitella)** — the `amd-strix-halo-toolboxes` / `docker-llm-service` containers this lab builds and runs on.
 - **The Strix Halo community** — where the ROCmFP4-STRIX_LEAN preset was born and tuned collectively; its benchmarks, feedback and hardware knowledge shaped every decision in this repo.
 - **Jian Chen** — author of the upstream DFlash2 support (llama.cpp PR #27342) that we ported onto the fork.
 - **Unsloth** — the UD quantization family and the Flash-Next reference material; our pipeline builds on their published BF16 GGUFs and write-ups.
