@@ -1,0 +1,170 @@
+From 6144779cc0b30a2f78fe52b3fb5c5f7965205967 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Wed, 2 Sep 2026 21:04:23 +0200
+Subject: [PATCH 2/2] qwen4exp: dense attention in decode when the QSA budget
+ covers the cache
+
+When n_kv is at or below indexer_top_k + compress_ratio - 1 the QSA
+selection cannot prune anything: build_qsa_top_k asks top_k for
+width = min(n_kv, budget) cells and width == n_kv returns the full cell
+set, so the mask surgery in build_attn_qsa unmasks every row and the
+final mask is self_kq_mask again. The dense build_attn path is then
+bit-identical, and the indexer chain (about 27 nodes per full-attention
+layer plus the 4-node mask surgery) drops out of the graph entirely.
+
+The shortcut applies to single-stream decode rounds only (one token per
+sequence). The indexer cache write survives via build_qsa_idx_write, so
+no key is missing when n_kv outgrows the budget and the selection comes
+back. The new input re-checks the shortcut condition in can_reuse, and
+the padded n_kv step already forces a rebuild at the regime boundary.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/models/models.h     |  6 +++
+ src/models/qwen4exp.cpp | 99 ++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 104 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/models.h b/src/models/models.h
+index 648c9ba5f..555664d65 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2014,6 +2014,12 @@ struct llama_model_qwen4exp : public llama_model_base {
+                             int * sections,
+                             int   il);
+ 
++        // QSA cache write only, for rounds where the selection cannot prune anything
++        void build_qsa_idx_write(
++  const llama_memory_hybrid_idx_context * mctx_hyb,
++                    ggml_tensor * cur,
++                            int   il);
++
+         ggml_tensor * build_layer_attn_linear(
+              llm_graph_input_rs * inp,
+                     ggml_tensor * cur,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 61ea8d2f0..2c25043f5 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -761,6 +761,55 @@ public:
+     const bool blk_bias;
+ };
+ 
++// The short-attention shortcut still owes the indexer cache its keys: when n_kv grows past
++// the budget the QSA selection must score every cell, including the ones stored while the
++// shortcut was active (a rollback can also shrink the cache back into range). This input
++// carries that write alone; the rest of the chain is skipped because at this size the
++// selection cannot prune anything.
++class llm_graph_input_qsa_idx : public llm_graph_input_i {
++public:
++    llm_graph_input_qsa_idx(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, uint32_t top_k) :
++        mctx(mctx), ratio(ratio), top_k(top_k) {}
++    virtual ~llm_graph_input_qsa_idx() = default;
++
++    void set_input(const llama_ubatch * ubatch) override {
++        mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
++    }
++
++    // same discipline as llm_graph_input_qsa: dynamic_cast or rebuild, then re-check every
++    // quantity the shortcut depends on (decode shape, one stream, budget covering the
++    // cache), so a graph built short is never reused for a round that needs the selection
++    bool can_reuse(const llm_graph_params & params) override {
++        const auto * mctx = dynamic_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
++
++        if (!mctx) {
++            return false;
++        }
++
++        this->mctx = mctx;
++
++        const llama_kv_cache_context * mctx_idx = mctx->get_idx();
++
++        if (!mctx_idx) {
++            return false;
++        }
++
++        if (!params.ubatch.equal_seqs() || params.ubatch.n_seq_tokens != 1 || mctx->get_n_stream() != 1) {
++            return false;
++        }
++
++        return k_idxs->ne[0] == params.ubatch.n_tokens &&
++            (int64_t) mctx_idx->get_n_kv() <= (int64_t) top_k + ratio - 1;
++    }
++
++    ggml_tensor * k_idxs = nullptr;   // I64 [n_tokens] (llama_kv_cache::build_input_k_idxs)
++
++    const llama_memory_hybrid_idx_context * mctx;
++
++    const uint32_t ratio;
++    const uint32_t top_k;
++};
++
+ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         const llama_memory_hybrid_idx_context * mctx_hyb,
+         ggml_tensor *                           cur,
+@@ -893,6 +942,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     return top_k;
+ }
+ 
++// The cache half of build_qsa_top_k: project the raw keys and store them, so the
++// short-attention shortcut in build_layer_attn stays transparent to the rounds that
++// run the full selection.
++void llama_model_qwen4exp::graph::build_qsa_idx_write(
++        const llama_memory_hybrid_idx_context * mctx_hyb,
++        ggml_tensor *                           cur,
++        int                                     il) {
++    const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
++
++    const int64_t idx_dim = hparams.indexer_head_size;
++
++    auto inp = std::make_unique<llm_graph_input_qsa_idx>(mctx_hyb,
++            hparams.attn_compress_ratio[il], hparams.indexer_top_k);
++
++    inp->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
++
++    llm_graph_input_qsa_idx * inp_ptr = inp.get();
++    res->add_input(std::move(inp));
++
++    // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
++    ggml_tensor * k_raw = build_lora_mm(model.layers[il].indexer_k_proj, cur);
++    k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
++    cb(k_raw, "indexer_k_raw", il);
++
++    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp_ptr->k_idxs, il));
++}
++
+ // Dense GQA self-attention restricted to the cells that top_k names.
+ // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
+ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -994,7 +1070,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
+     const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.attn_compress_ratio[il] > 0;
+ 
+-    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
++    // Short-attention shortcut: with n_kv at or below the budget the selection cannot
++    // prune anything. build_qsa_top_k asks top_k for width = min(n_kv, indexer_top_k +
++    // ratio - 1) cells, and width == n_kv returns the full cell set, so the mask surgery
++    // in build_attn_qsa unmasks every row and the final mask is self_kq_mask again: the
++    // dense build_attn path below is bit-identical without the indexer chain. Decode
++    // only (one token per sequence, single stream): that is where the chain's node count
++    // dominates the launch overhead. The indexer cache write survives via
++    // build_qsa_idx_write, so no key is missing when the budget is outgrown.
++    const int64_t idx_budget = (int64_t) hparams.indexer_top_k + hparams.attn_compress_ratio[il] - 1;
++
++    const bool qsa_short = qsa
++        && ubatch.equal_seqs() && ubatch.n_seq_tokens == 1
++        && mctx_hyb->get_n_stream() == 1
++        && (int64_t) mctx_hyb->get_idx()->get_n_kv() <= idx_budget;
++
++    ggml_tensor * top_k = nullptr;
++
++    if (qsa && !qsa_short) {
++        top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il);
++    } else if (qsa) {
++        build_qsa_idx_write(mctx_hyb, cur, il);
++    }
+ 
+     // Qwen3Next uses a single Q projection that outputs query + gate
+     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+-- 
+2.53.0
+

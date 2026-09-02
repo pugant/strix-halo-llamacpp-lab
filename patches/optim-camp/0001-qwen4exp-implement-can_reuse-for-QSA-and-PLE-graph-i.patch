@@ -1,0 +1,164 @@
+From c7c523ee1ab4d5779165bdd93d12a7f5520a5ae3 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Wed, 2 Sep 2026 20:35:01 +0200
+Subject: [PATCH 1/2] qwen4exp: implement can_reuse for QSA and PLE graph
+ inputs
+
+The two model-specific graph inputs returned false from the base
+can_reuse, so every tg round rebuilt the whole graph (graphs reused=0
+on qwen4exp). Gate both on the shapes set_input writes:
+
+- QSA: k_idxs [n_tokens], cell_blk [n_kv, n_stream], blk_cells
+  [ratio*n_blocks, n_stream], blk_pos [4*n_blocks*n_stream] and bias
+  [n_blocks|n_kv, n_tps, n_stream], with n_kv and n_stream read from
+  the current batch's indexer-cache context. The bucketed n_kv padding
+  keeps these stable across rounds and the gate catches each bucket
+  step. blk_bias needs no check of its own: it is a pure function of
+  the kq mask shape, causal_attn and use_alibi, which the hybrid
+  attention input and allow_reuse already gate on the same graph.
+- PLE: rows [ple_n_heads*n_tokens] or, with --ple-disk, gathered
+  [ple_head_dim, ple_n_heads*n_tokens]; the hash inputs are re-read
+  from the ubatch and the cache on every set_input, so only the shape
+  has to hold.
+
+Both refresh the stored memory context to the current batch's, like
+every other can_reuse, and fall back to a rebuild on any context they
+cannot verify (dynamic_cast plus null guards).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/models/qwen4exp.cpp | 103 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 102 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index aa94b9510..61ea8d2f0 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -691,8 +691,64 @@ public:
+         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+     }
+ 
++    // reuse only needs the shapes to hold: set_input rewrites every tensor from the current
++    // cache state each round, and the consumers downstream (the blk_cells gather, the pooled
++    // block reshapes, the top_k width) are all fixed by them. n_kv moves in padded steps, so
++    // the block count moves with it and the gate catches the step. The ratio is fixed per
++    // layer at load, and blk_bias is a pure function of the kq mask shape, causal_attn and
++    // use_alibi, all of which other gates on the same graph already cover (the hybrid
++    // attention input and allow_reuse): a change there forces a rebuild, which recomputes
++    // blk_bias together with the rest.
++    bool can_reuse(const llm_graph_params & params) override {
++        // dynamic_cast, not the build-time static_cast: this is a gate, and a wrong or null
++        // context must fall back to a rebuild, never to a stale graph
++        const auto * mctx = dynamic_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
++
++        if (!mctx) {
++            return false;
++        }
++
++        // refresh first, like every can_reuse: the stored context belongs to a previous batch
++        this->mctx = mctx;
++
++        const llama_kv_cache_context * mctx_idx = mctx->get_idx();
++        if (!mctx_idx) {
++            return false;
++        }
++
++        const int64_t n_tokens = params.ubatch.n_tokens;
++        const int64_t n_kv     = mctx_idx->get_n_kv();
++        const int64_t n_stream = mctx->get_n_stream();
++        const int64_t r        = ratio;
++
++        if (r < 1 || n_stream < 1 || n_tokens % n_stream != 0) {
++            return false;
++        }
++
++        const int64_t n_tps    = n_tokens/n_stream;
++        const int64_t n_blocks = (n_kv + r - 1)/r;
++
++        bool res = true;
++
++        res &= k_idxs->ne[0] == n_tokens;
++
++        res &= cell_blk->ne[0] == n_kv;
++        res &= cell_blk->ne[1] == n_stream;
++
++        res &= blk_cells->ne[0] == r*n_blocks;
++        res &= blk_cells->ne[1] == n_stream;
++
++        res &= blk_pos->ne[0] == 4*n_blocks*n_stream;
++
++        res &= bias->ne[0] == (blk_bias ? n_blocks : n_kv);
++        res &= bias->ne[1] == n_tps;
++        res &= bias->ne[2] == n_stream;
++
++        return res;
++    }
++
+     // per stream: a cell index names a different token in each stream
+-    ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
++    ggml_tensor * k_idxs    = nullptr;   // I64 [n_tokens] (llama_kv_cache::build_input_k_idxs)
+     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
+     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
+     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
+@@ -1203,6 +1259,7 @@ public:
+     virtual ~llm_graph_input_ple() = default;
+ 
+     void set_input(const llama_ubatch * ubatch) override;
++    bool can_reuse(const llm_graph_params & params) override;
+ 
+     ggml_tensor * rows = nullptr;     // I32 [ple_n_heads * n_tokens]   (mode off)
+     ggml_tensor * gathered = nullptr; // F32 [ple_head_dim, ple_n_heads * n_tokens] (mode on)
+@@ -1295,6 +1352,50 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+     }
+ }
+ 
++// everything the hash reads (the ubatch tokens, the cache predecessors) is re-read by
++// set_input on each round, so reuse only needs the row tensor to hold its shape: the head
++// count and the row width are model constants, leaving n_tokens as the only variable
++bool llm_graph_input_ple::can_reuse(const llm_graph_params & params) {
++    // dynamic_cast, not the build-time static_cast: this is a gate, and a wrong or null
++    // context must fall back to a rebuild, never to a stale graph
++    const auto * mctx_hyb = dynamic_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
++
++    if (!mctx_hyb) {
++        return false;
++    }
++
++    // refresh first, like every can_reuse: set_input reads the predecessor tokens through
++    // the attention cache context of the current batch
++    mctx = mctx_hyb->get_attn();
++
++    if (!mctx) {
++        return false;
++    }
++
++    const int64_t n_rows = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
++
++    bool res = true;
++
++    if (disk) {
++        // the gathered block is the only graph input: it must carry the rows the
++        // ggml_get_rows path would have gathered, at the table's fixed row width
++        if (!gathered) {
++            return false;
++        }
++
++        res &= gathered->ne[0] == pmodel.hparams.ple_head_dim;
++        res &= gathered->ne[1] == n_rows;
++    } else {
++        if (!rows) {
++            return false;
++        }
++
++        res &= rows->ne[0] == n_rows;
++    }
++
++    return res;
++}
++
+ // Read a conv history out of its own recurrent row and write the new tail back.
+ // The shared build_conv_state cannot do this: qwen4exp has two such rows per layer.
+ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+-- 
+2.53.0
+
