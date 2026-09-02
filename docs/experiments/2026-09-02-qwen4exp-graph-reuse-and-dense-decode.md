@@ -210,7 +210,7 @@ would not be.
 Coverage, stated as measured rather than generalized:
 
 - **ppl gates are same-backend by construction.** The two backends read −3.4% apart on
-  this corpus at baseline (34.9777 Vulkan vs 33.7892 HIP) and identical on
+  this corpus at baseline (34.9777 Vulkan vs 33.7892 HIP) and within 0.1% on
   wikitext-2 (17.2724 / 17.2847); cross-backend ppl is never a valid comparison on
   this stack. Every ppl number in the table above is HIP, before/after on the same
   build chain. On Vulkan, the reuse step gated wikitext-2 ppl (17.2724, identical to
