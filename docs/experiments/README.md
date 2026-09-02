@@ -112,6 +112,7 @@ Timeline:
 - `2026-08-31` **PLE disk-offload deployed** — `--ple-disk`: the 35.76 GiB PLE table is read on demand from the GGUF itself, ~36 GB of RAM freed, output char-identical; guide: [`docs/guide/qwen38-flash-next-ple-disk.md`](../guide/qwen38-flash-next-ple-disk.md).
 - `2026-09-01` **Persistent prompt cache deployed** — `--cache-disk-persist` (ds4-inspired): the on-SSD prompt library outlives the process; after a restart a 107k-token context restores in 1.57 s — end-to-end 14.3 s vs a 920 s cold re-prefill (**64×**) — deterministically (char-identical 111/111). Structural limit kept honest: with the MTP drafter the restore needs a token-exact boundary — raw verbatim replays restore, chat-template history replays do not; guide: [`docs/guide/qwen38-flash-next-prompt-cache-disk.md`](../guide/qwen38-flash-next-prompt-cache-disk.md).
 - `2026-09-02` **PLE disk-offload learns FP2 + the production model becomes a true BF16 requant** — `--ple-disk` extended to the 2-bit PLE table (on-disk vs in-RAM lookup: 0-byte divergence, ≤4% tg gap), and the production STRIX_LEAN file replaced in place by a requant from the native BF16 export with the full unsloth imatrix (measured ppl −0.6% Italian / −4.9% English); note: [2026-09-02-flashnext-fp2-64gb-and-lean-requant.md](2026-09-02-flashnext-fp2-64gb-and-lean-requant.md).
+- `2026-09-02` **Graph reuse + dense decode in the round loop** — the two production runtime speedups of the optimization campaign: the QSA/PLE graph inputs learned `can_reuse` (rebuilds 1025 → 6) and decode goes dense when the indexer budget covers the cache; plain tg512 +18.6% HIP / +32.5% Vulkan with bit-identical greedy fingerprints; note: [2026-09-02-qwen4exp-graph-reuse-and-dense-decode.md](2026-09-02-qwen4exp-graph-reuse-and-dense-decode.md).
 
 ### Outcome (dedicated GPU, 98.5 GiB target + 3.85 GiB Q8_0 drafter, ctx 8192, median of 3)
 
@@ -125,7 +126,7 @@ Draft acceptance 95.7% of tokens (mean accepted length 3.24 at n=3; still 5.20 o
 
 The flagship note for this thread is [qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md); the quant comparison on this model is [2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md).
 
-**What shipped:** [`patches/qwen4exp-mtp/`](../../patches/qwen4exp-mtp/) (20 commits), [`patches/t25-ple-disk/`](../../patches/t25-ple-disk/) (15 patches), [`patches/t23-kv-disk-persist/`](../../patches/t23-kv-disk-persist/) (12 patches), the [98.5 GiB HF card](https://huggingface.co/pugant/Qwen3.8-Flash-Next-ROCMFP4_STRIX_LEAN-GGUF), and the production server running all of it since 2026-08-31 and 09-01.
+**What shipped:** [`patches/qwen4exp-mtp/`](../../patches/qwen4exp-mtp/) (20 commits), [`patches/t25-ple-disk/`](../../patches/t25-ple-disk/) (15 patches), [`patches/t23-kv-disk-persist/`](../../patches/t23-kv-disk-persist/) (12 patches), [`patches/optim-camp/`](../../patches/optim-camp/) (2 patches), the [98.5 GiB HF card](https://huggingface.co/pugant/Qwen3.8-Flash-Next-ROCMFP4_STRIX_LEAN-GGUF), and the production server running all of it since 2026-08-31, 09-01 and 09-03.
 
 ## pi-stack
 
