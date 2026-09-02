@@ -125,7 +125,7 @@ Draft acceptance 95.7% of tokens (mean accepted length 3.24 at n=3; still 5.20 o
 
 The flagship note for this thread is [qwen38-flash-next-runtime.md](qwen38-flash-next-runtime.md); the quant comparison on this model is [2026-08-29-t22-lean-vs-ud-quant.md](2026-08-29-t22-lean-vs-ud-quant.md).
 
-**What shipped:** [`patches/qwen4exp-mtp/`](../../patches/qwen4exp-mtp/) (20 commits), [`patches/t25-ple-disk/`](../../patches/t25-ple-disk/) (15 patches), [`patches/t23-kv-disk-persist/`](../../patches/t23-kv-disk-persist/) (12 patches), the [98.5 GiB HF card](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF), and the production server running all of it since 2026-08-31 and 09-01.
+**What shipped:** [`patches/qwen4exp-mtp/`](../../patches/qwen4exp-mtp/) (20 commits), [`patches/t25-ple-disk/`](../../patches/t25-ple-disk/) (15 patches), [`patches/t23-kv-disk-persist/`](../../patches/t23-kv-disk-persist/) (12 patches), the [98.5 GiB HF card](https://huggingface.co/pugant/Qwen3.8-Flash-Next-ROCMFP4_STRIX_LEAN-GGUF), and the production server running all of it since 2026-08-31 and 09-01.
 
 ## pi-stack
 
