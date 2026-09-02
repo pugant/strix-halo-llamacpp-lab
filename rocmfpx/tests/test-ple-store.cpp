@@ -1,7 +1,9 @@
 // Unit tests for the T25 PLE disk store. Zero GPU, zero llama runtime:
-// a synthetic Q5_1 table is quantized in-process, written to a temp file
+// a synthetic table is quantized in-process, written to a temp file
 // with a nonzero leading offset, and fetched through ple_store. The
 // reference for bit-exactness is CPU ggml_get_rows on the same data.
+// The whole battery runs twice: Q5_1 (v1 regression) and Q2_0_ROCMFPX
+// (the T27 FP2 PLE table, 10 B per 32-element block).
 
 #include "../src/llama-ple-store.h"
 
@@ -25,14 +27,19 @@ static const int64_t HEAD_DIM = 160;
 
 static std::string g_tmp_path;
 
-// build the synthetic table, quantize to Q5_1, write [pad][table] to file
+// build the synthetic table, quantize, write [pad][table] to file
 static std::vector<uint8_t> g_quant; // table bytes as in the file
+static enum ggml_type g_type = GGML_TYPE_Q5_1;
+
+static size_t fixture_row_bytes() {
+    return HEAD_DIM / ggml_blck_size(g_type) * ggml_type_size(g_type);
+}
 
 static void build_fixture(int64_t n_rows, uint64_t pad_bytes, uint64_t & out_offset) {
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
 
-    const size_t row_bytes = HEAD_DIM / 32 * 24;
+    const size_t row_bytes = fixture_row_bytes();
     g_quant.resize(n_rows * row_bytes);
 
     std::vector<float> row(HEAD_DIM);
@@ -40,7 +47,7 @@ static void build_fixture(int64_t n_rows, uint64_t pad_bytes, uint64_t & out_off
         for (auto & v : row) v = dist(rng);
         float * src = row.data();
         // nrows = 1: ggml_quantize_chunk quantizes nrows * n_per_row floats (signature ggml.h:2855)
-        const size_t nb = ggml_quantize_chunk(GGML_TYPE_Q5_1, src, g_quant.data() + r * row_bytes,
+        const size_t nb = ggml_quantize_chunk(g_type, src, g_quant.data() + r * row_bytes,
                                               0, 1, HEAD_DIM, nullptr);
         (void) nb;
         assert(nb == row_bytes);
@@ -59,15 +66,15 @@ static void build_fixture(int64_t n_rows, uint64_t pad_bytes, uint64_t & out_off
     out_offset = pad_bytes;
 }
 
-// reference: CPU ggml_get_rows on a Q5_1 tensor holding g_quant
+// reference: CPU ggml_get_rows on a table of g_type holding g_quant
 static void reference_get_rows(const std::vector<int32_t> & rows, std::vector<float> & out) {
-    const int64_t n_rows = (int64_t) (g_quant.size() / (HEAD_DIM / 32 * 24));
+    const int64_t n_rows = (int64_t) (g_quant.size() / fixture_row_bytes());
 
     ggml_init_params ip = {/*.mem_size   =*/ 96u << 20, /*.mem_buffer =*/ nullptr, /*.no_alloc   =*/ false};
     ggml_context * ctx = ggml_init(ip);
     assert(ctx);
 
-    ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_Q5_1, HEAD_DIM, n_rows);
+    ggml_tensor * table = ggml_new_tensor_2d(ctx, g_type, HEAD_DIM, n_rows);
     memcpy(table->data, g_quant.data(), g_quant.size()); // CPU ctx: data lives in the pool
 
     ggml_tensor * rows_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) rows.size());
@@ -91,18 +98,22 @@ static int g_failures = 0;
     if (!(cond)) { printf("FAIL: %s\n", msg); g_failures++; } \
 } while (0)
 
-int main() {
-    // 70 full blocks + partial final block 70 (rows 8960-8969, 1200 B on disk —
-    // fixture generality: the production table divides evenly). Shard 0 owns
-    // blocks {0,16,32,48,64}.
+static int run_battery(enum ggml_type type, const char * label) {
+    g_type = type;
+    const int failures_before = g_failures;
+
+    // 70 full blocks + partial final block 70 (rows 8960-8969, a partial
+    // block on disk — fixture generality: the production table divides
+    // evenly). Shard 0 owns blocks {0,16,32,48,64}.
     const int64_t N_ROWS = 128 * 70 + 10;
     uint64_t offset = 0;
     build_fixture(N_ROWS, 4096, offset);
 
-    // budget = 16 shards x 2 blocks x 15360 B = 491520 B (2 blocks per shard)
-    const uint64_t BUDGET = 16ull * 2 * 15360;
+    // budget = 16 shards x 2 blocks x block_bytes (2 blocks per shard)
+    const uint64_t BLOCK_BYTES = PLE_STORE_ROWS_PER_BLOCK * fixture_row_bytes();
+    const uint64_t BUDGET = 16ull * 2 * BLOCK_BYTES;
     char err[512];
-    ple_store * s = ple_store_open(g_tmp_path.c_str(), offset, GGML_TYPE_Q5_1,
+    ple_store * s = ple_store_open(g_tmp_path.c_str(), offset, g_type,
                                    HEAD_DIM, N_ROWS, BUDGET, err, sizeof(err));
     CHECK(s != nullptr, "open with 2-blocks-per-shard budget");
 
@@ -156,7 +167,7 @@ int main() {
     //     so the failure can only come from the fstat size check, as the message claims) ---
     {
         std::string short_path = g_tmp_path + ".short";
-        const size_t cut = offset + 2 * 15360 + 100; // stops into block 2
+        const size_t cut = offset + 2 * BLOCK_BYTES + 100; // stops into block 2
         FILE * src = fopen(g_tmp_path.c_str(), "rb");
         FILE * dst = fopen(short_path.c_str(), "wb");
         assert(src && dst);
@@ -166,7 +177,7 @@ int main() {
         fclose(src); fclose(dst);
 
         char err2[512];
-        ple_store * s2 = ple_store_open(short_path.c_str(), offset, GGML_TYPE_Q5_1,
+        ple_store * s2 = ple_store_open(short_path.c_str(), offset, g_type,
                                         HEAD_DIM, N_ROWS, BUDGET, err2, sizeof(err2));
         CHECK(s2 == nullptr, "open on truncated file fails (size check)");
     }
@@ -191,10 +202,19 @@ int main() {
     unlink(g_tmp_path.c_str());
     unlink((g_tmp_path + ".short").c_str());
 
-    if (g_failures == 0) {
+    const int mine = g_failures - failures_before;
+    printf("test-ple-store: %s (%s): %s\n", label, ggml_type_name(g_type), mine == 0 ? "PASS" : "FAIL");
+    return mine;
+}
+
+int main() {
+    int failures = 0;
+    failures += run_battery(GGML_TYPE_Q5_1,          "v1 regression");
+    failures += run_battery(GGML_TYPE_Q2_0_ROCMFPX, "T27 FP2 PLE table");
+    if (failures == 0) {
         printf("test-ple-store: ALL PASS\n");
         return 0;
     }
-    printf("test-ple-store: %d FAILURES\n", g_failures);
+    printf("test-ple-store: %d FAILURES\n", failures);
     return 1;
 }

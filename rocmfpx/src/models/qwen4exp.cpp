@@ -135,10 +135,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             // T25: the table stays on disk; the store serves rows on demand.
             // The tensor is deliberately NOT created: the loader skips it
             // (done_getting_tensors is called with partial=true for this arch).
-            GGML_ASSERT(ple_w->tensor->type == GGML_TYPE_Q5_1 && "T25 v1 supports a Q5_1 PLE table only");
+            GGML_ASSERT((ple_w->tensor->type == GGML_TYPE_Q5_1 ||
+                         ple_w->tensor->type == GGML_TYPE_Q2_0_ROCMFPX) &&
+                        "T25 v2 supports Q5_1 and Q2_0_ROCMFPX PLE tables");
             char err[512];
+            const enum ggml_type ple_type = (enum ggml_type) ple_w->tensor->type;
             ple_store_handle = ple_store_open(ml.file_path(ple_w->idx).c_str(), ple_w->offs,
-                                              (enum ggml_type) ple_w->tensor->type,
+                                              ple_type,
                                               hparams.ple_head_dim, ple_rows,
                                               (uint64_t) params.ple_cache_mib * 1024ull * 1024ull,
                                               err, sizeof(err));
@@ -150,10 +153,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             // skip in llama_model_loader::create_tensor), or size_done never reaches
             // size_data and the final progress_callback(1.0f)/unmap tail is skipped.
             ml.size_data -= ggml_nbytes(ple_w->tensor);
-            const double row_bytes = hparams.ple_head_dim / 32.0 * 24.0; // Q5_1: 24 B per 32 elements
-            LLAMA_LOG_INFO("%s: PLE table disk-resident: %.2f GiB externalized (Q5_1, %lld rows), cache %.2f GiB\n",
-                    __func__, ple_rows * row_bytes / (1024.0 * 1024.0 * 1024.0), (long long) ple_rows,
-                    params.ple_cache_mib / 1024.0);
+            // bytes per row from the ggml type layout (24 B / 32 el Q5_1, 10 B / 32 el Q2_0_ROCMFPX)
+            const double row_bytes = (double) (hparams.ple_head_dim / ggml_blck_size(ple_type) * ggml_type_size(ple_type));
+            LLAMA_LOG_INFO("%s: PLE table disk-resident: %.2f GiB externalized (%s, %lld rows), cache %.2f GiB\n",
+                    __func__, ple_rows * row_bytes / (1024.0 * 1024.0 * 1024.0), ggml_type_name(ple_type),
+                    (long long) ple_rows, params.ple_cache_mib / 1024.0);
         } else {
             per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                                { hparams.ple_head_dim, ple_rows }, 0);
@@ -687,8 +691,64 @@ public:
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
     }
 
+    // reuse only needs the shapes to hold: set_input rewrites every tensor from the current
+    // cache state each round, and the consumers downstream (the blk_cells gather, the pooled
+    // block reshapes, the top_k width) are all fixed by them. n_kv moves in padded steps, so
+    // the block count moves with it and the gate catches the step. The ratio is fixed per
+    // layer at load, and blk_bias is a pure function of the kq mask shape, causal_attn and
+    // use_alibi, all of which other gates on the same graph already cover (the hybrid
+    // attention input and allow_reuse): a change there forces a rebuild, which recomputes
+    // blk_bias together with the rest.
+    bool can_reuse(const llm_graph_params & params) override {
+        // dynamic_cast, not the build-time static_cast: this is a gate, and a wrong or null
+        // context must fall back to a rebuild, never to a stale graph
+        const auto * mctx = dynamic_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+        if (!mctx) {
+            return false;
+        }
+
+        // refresh first, like every can_reuse: the stored context belongs to a previous batch
+        this->mctx = mctx;
+
+        const llama_kv_cache_context * mctx_idx = mctx->get_idx();
+        if (!mctx_idx) {
+            return false;
+        }
+
+        const int64_t n_tokens = params.ubatch.n_tokens;
+        const int64_t n_kv     = mctx_idx->get_n_kv();
+        const int64_t n_stream = mctx->get_n_stream();
+        const int64_t r        = ratio;
+
+        if (r < 1 || n_stream < 1 || n_tokens % n_stream != 0) {
+            return false;
+        }
+
+        const int64_t n_tps    = n_tokens/n_stream;
+        const int64_t n_blocks = (n_kv + r - 1)/r;
+
+        bool res = true;
+
+        res &= k_idxs->ne[0] == n_tokens;
+
+        res &= cell_blk->ne[0] == n_kv;
+        res &= cell_blk->ne[1] == n_stream;
+
+        res &= blk_cells->ne[0] == r*n_blocks;
+        res &= blk_cells->ne[1] == n_stream;
+
+        res &= blk_pos->ne[0] == 4*n_blocks*n_stream;
+
+        res &= bias->ne[0] == (blk_bias ? n_blocks : n_kv);
+        res &= bias->ne[1] == n_tps;
+        res &= bias->ne[2] == n_stream;
+
+        return res;
+    }
+
     // per stream: a cell index names a different token in each stream
-    ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
+    ggml_tensor * k_idxs    = nullptr;   // I64 [n_tokens] (llama_kv_cache::build_input_k_idxs)
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
@@ -699,6 +759,55 @@ public:
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
+};
+
+// The short-attention shortcut still owes the indexer cache its keys: when n_kv grows past
+// the budget the QSA selection must score every cell, including the ones stored while the
+// shortcut was active (a rollback can also shrink the cache back into range). This input
+// carries that write alone; the rest of the chain is skipped because at this size the
+// selection cannot prune anything.
+class llm_graph_input_qsa_idx : public llm_graph_input_i {
+public:
+    llm_graph_input_qsa_idx(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, uint32_t top_k) :
+        mctx(mctx), ratio(ratio), top_k(top_k) {}
+    virtual ~llm_graph_input_qsa_idx() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+    }
+
+    // same discipline as llm_graph_input_qsa: dynamic_cast or rebuild, then re-check every
+    // quantity the shortcut depends on (decode shape, one stream, budget covering the
+    // cache), so a graph built short is never reused for a round that needs the selection
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto * mctx = dynamic_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+        if (!mctx) {
+            return false;
+        }
+
+        this->mctx = mctx;
+
+        const llama_kv_cache_context * mctx_idx = mctx->get_idx();
+
+        if (!mctx_idx) {
+            return false;
+        }
+
+        if (!params.ubatch.equal_seqs() || params.ubatch.n_seq_tokens != 1 || mctx->get_n_stream() != 1) {
+            return false;
+        }
+
+        return k_idxs->ne[0] == params.ubatch.n_tokens &&
+            (int64_t) mctx_idx->get_n_kv() <= (int64_t) top_k + ratio - 1;
+    }
+
+    ggml_tensor * k_idxs = nullptr;   // I64 [n_tokens] (llama_kv_cache::build_input_k_idxs)
+
+    const llama_memory_hybrid_idx_context * mctx;
+
+    const uint32_t ratio;
+    const uint32_t top_k;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -833,6 +942,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     return top_k;
 }
 
+// The cache half of build_qsa_top_k: project the raw keys and store them, so the
+// short-attention shortcut in build_layer_attn stays transparent to the rounds that
+// run the full selection.
+void llama_model_qwen4exp::graph::build_qsa_idx_write(
+        const llama_memory_hybrid_idx_context * mctx_hyb,
+        ggml_tensor *                           cur,
+        int                                     il) {
+    const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
+
+    const int64_t idx_dim = hparams.indexer_head_size;
+
+    auto inp = std::make_unique<llm_graph_input_qsa_idx>(mctx_hyb,
+            hparams.attn_compress_ratio[il], hparams.indexer_top_k);
+
+    inp->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+
+    llm_graph_input_qsa_idx * inp_ptr = inp.get();
+    res->add_input(std::move(inp));
+
+    // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
+    ggml_tensor * k_raw = build_lora_mm(model.layers[il].indexer_k_proj, cur);
+    k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
+    cb(k_raw, "indexer_k_raw", il);
+
+    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp_ptr->k_idxs, il));
+}
+
 // Dense GQA self-attention restricted to the cells that top_k names.
 // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
@@ -934,7 +1070,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.attn_compress_ratio[il] > 0;
 
-    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+    // Short-attention shortcut: with n_kv at or below the budget the selection cannot
+    // prune anything. build_qsa_top_k asks top_k for width = min(n_kv, indexer_top_k +
+    // ratio - 1) cells, and width == n_kv returns the full cell set, so the mask surgery
+    // in build_attn_qsa unmasks every row and the final mask is self_kq_mask again: the
+    // dense build_attn path below is bit-identical without the indexer chain. Decode
+    // only (one token per sequence, single stream): that is where the chain's node count
+    // dominates the launch overhead. The indexer cache write survives via
+    // build_qsa_idx_write, so no key is missing when the budget is outgrown.
+    const int64_t idx_budget = (int64_t) hparams.indexer_top_k + hparams.attn_compress_ratio[il] - 1;
+
+    const bool qsa_short = qsa
+        && ubatch.equal_seqs() && ubatch.n_seq_tokens == 1
+        && mctx_hyb->get_n_stream() == 1
+        && (int64_t) mctx_hyb->get_idx()->get_n_kv() <= idx_budget;
+
+    ggml_tensor * top_k = nullptr;
+
+    if (qsa && !qsa_short) {
+        top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il);
+    } else if (qsa) {
+        build_qsa_idx_write(mctx_hyb, cur, il);
+    }
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
@@ -1199,6 +1356,7 @@ public:
     virtual ~llm_graph_input_ple() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * rows = nullptr;     // I32 [ple_n_heads * n_tokens]   (mode off)
     ggml_tensor * gathered = nullptr; // F32 [ple_head_dim, ple_n_heads * n_tokens] (mode on)
@@ -1289,6 +1447,50 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     } else {
         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size() * ggml_element_size(rows));
     }
+}
+
+// everything the hash reads (the ubatch tokens, the cache predecessors) is re-read by
+// set_input on each round, so reuse only needs the row tensor to hold its shape: the head
+// count and the row width are model constants, leaving n_tokens as the only variable
+bool llm_graph_input_ple::can_reuse(const llm_graph_params & params) {
+    // dynamic_cast, not the build-time static_cast: this is a gate, and a wrong or null
+    // context must fall back to a rebuild, never to a stale graph
+    const auto * mctx_hyb = dynamic_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+    if (!mctx_hyb) {
+        return false;
+    }
+
+    // refresh first, like every can_reuse: set_input reads the predecessor tokens through
+    // the attention cache context of the current batch
+    mctx = mctx_hyb->get_attn();
+
+    if (!mctx) {
+        return false;
+    }
+
+    const int64_t n_rows = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+
+    bool res = true;
+
+    if (disk) {
+        // the gathered block is the only graph input: it must carry the rows the
+        // ggml_get_rows path would have gathered, at the table's fixed row width
+        if (!gathered) {
+            return false;
+        }
+
+        res &= gathered->ne[0] == pmodel.hparams.ple_head_dim;
+        res &= gathered->ne[1] == n_rows;
+    } else {
+        if (!rows) {
+            return false;
+        }
+
+        res &= rows->ne[0] == n_rows;
+    }
+
+    return res;
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.

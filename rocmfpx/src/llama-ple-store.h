@@ -28,7 +28,7 @@ struct ple_store_stats {
 
 // path:     GGUF (or any file) containing the tensor data
 // offset:   byte offset of the tensor inside path
-// type:     on-disk ggml type (only GGML_TYPE_Q5_1 supported in v1)
+// type:     on-disk ggml type (GGML_TYPE_Q5_1 or GGML_TYPE_Q2_0_ROCMFPX in v2)
 // head_dim: elements per row (160 for the LEAN table)
 // n_rows:   total rows (320'001'536 for the LEAN table)
 // cache_bytes: LRU budget, allocated up front, never exceeded

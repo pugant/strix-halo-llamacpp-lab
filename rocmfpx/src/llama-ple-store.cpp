@@ -17,47 +17,16 @@
 #include <unistd.h>
 
 // ---------------------------------------------------------------------------
-// Q5_1 dequantization, copied verbatim (same operation order) from
-// ggml/src/ggml-quants.c dequantize_row_q5_1, with GGML_FP16_TO_FP32 replaced
-// by the public ggml_fp16_to_fp32() (same conversion) and block fields
-// spelled out locally. Validated bit-exact against CPU ggml_get_rows by
-// tests/test-ple-store.cpp.
+// Row dequantization goes through the ggml type traits' to_float, resolved
+// once at open. That is the exact function CPU ggml_get_rows calls per row
+// (ggml_compute_forward_get_rows_q), so the store is bit-exact vs the in-RAM
+// gather by construction for both supported types: Q5_1 (dequantize_row_q5_1,
+// the function v1 kept as a local verbatim copy) and Q2_0_ROCMFPX
+// (rocmfpx_dequantize_row_fp2). Validated bit-exact against CPU ggml_get_rows
+// for both types by tests/test-ple-store.cpp.
 // ---------------------------------------------------------------------------
 
 namespace {
-
-struct block_q5_1_local {
-    ggml_fp16_t d;
-    ggml_fp16_t m;
-    uint8_t     qh[4];
-    uint8_t     qs[16];
-};
-
-static_assert(sizeof(block_q5_1_local) == 24, "block_q5_1 must be 24 bytes");
-
-void dequant_row_q5_1(const uint8_t * row_bytes, float * dst, int64_t head_dim) {
-    const int nb = head_dim / 32;
-    for (int b = 0; b < nb; b++) {
-        const block_q5_1_local & blk = *(const block_q5_1_local *) (row_bytes + b * sizeof(block_q5_1_local));
-
-        const float d = ggml_fp16_to_fp32(blk.d);
-        const float m = ggml_fp16_to_fp32(blk.m);
-
-        uint32_t qh;
-        memcpy(&qh, blk.qh, sizeof(qh));
-
-        for (int j = 0; j < 32 / 2; ++j) {
-            const uint8_t xh_0 = ((qh >> (j +  0)) << 4) & 0x10;
-            const uint8_t xh_1 = ((qh >> (j + 12))     ) & 0x10;
-
-            const int x0 = (blk.qs[j] & 0x0F) | xh_0;
-            const int x1 = (blk.qs[j] >>   4) | xh_1;
-
-            dst[b * 32 + j + 0 ] = x0 * d + m;
-            dst[b * 32 + j + 16] = x1 * d + m;
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // LRU cache of whole 128-row blocks, sharded; each shard owns a fixed byte
@@ -82,6 +51,7 @@ struct shard {
 struct ple_store {
     int fd = -1;
     enum ggml_type type = GGML_TYPE_F32;
+    ggml_to_float_t dequant = nullptr; // ggml type traits to_float, resolved at open
     int64_t head_dim = 0;
     int64_t n_rows = 0;
     uint64_t row_bytes = 0;
@@ -106,12 +76,13 @@ ple_store * ple_store_open(const char * path, uint64_t offset,
                            enum ggml_type type, int64_t head_dim,
                            int64_t n_rows, uint64_t cache_bytes,
                            char * err, size_t errlen) {
-    if (type != GGML_TYPE_Q5_1) {
-        snprintf(err, errlen, "ple_store: unsupported type %s (v1 supports Q5_1 only)", ggml_type_name(type));
+    if (type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q2_0_ROCMFPX) {
+        snprintf(err, errlen, "ple_store: unsupported type %s (v2 supports Q5_1 and Q2_0_ROCMFPX)", ggml_type_name(type));
         return nullptr;
     }
-    if (head_dim <= 0 || head_dim % 32 != 0) {
-        snprintf(err, errlen, "ple_store: head_dim must be a positive multiple of 32, got %lld", (long long) head_dim);
+    if (head_dim <= 0 || head_dim % ggml_blck_size(type) != 0) {
+        snprintf(err, errlen, "ple_store: head_dim must be a positive multiple of %lld, got %lld",
+                 (long long) ggml_blck_size(type), (long long) head_dim);
         return nullptr;
     }
     if (n_rows <= 0) {
@@ -121,9 +92,10 @@ ple_store * ple_store_open(const char * path, uint64_t offset,
 
     ple_store * s = new ple_store();
     s->type = type;
+    s->dequant = ggml_get_type_traits(type)->to_float;
     s->head_dim = head_dim;
     s->n_rows = n_rows;
-    s->row_bytes = head_dim / 32 * sizeof(block_q5_1_local); // Q5_1: 24 B per 32 elements
+    s->row_bytes = head_dim / ggml_blck_size(type) * ggml_type_size(type); // 24 B / 32 el (Q5_1), 10 B / 32 el (Q2_0_ROCMFPX)
     s->block_bytes = s->row_bytes * s->block_rows;
     s->tensor_bytes = (uint64_t) n_rows * s->row_bytes;
     s->file_offset = offset;
@@ -362,7 +334,7 @@ bool ple_store_fetch(ple_store * s, const int32_t * rows, int64_t n,
         for (uint32_t j = start[k]; j < start[k + 1]; j++) {
             const int64_t i = row_idx[j];
             const uint64_t in_block = (uint64_t) (rows[i] % (int64_t) s->block_rows);
-            dequant_row_q5_1(base + in_block * s->row_bytes, dst_host + i * dst_stride_elems, s->head_dim);
+            s->dequant(base + in_block * s->row_bytes, dst_host + i * dst_stride_elems, s->head_dim);
         }
     }
 
