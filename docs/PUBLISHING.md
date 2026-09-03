@@ -12,6 +12,10 @@ Reusable checklist for every feature release of this lab. Three blocks, in order
 - [ ] EN write-up (dated note in `docs/experiments/` or a new thread) and/or a
       `docs/guide/` replication guide; link it from `docs/experiments/README.md`.
 - [ ] README: credits and capability lines updated when the feature ships.
+- [ ] New experiment notes carry the bare-metal footer:
+      `*Measured on the lab's [bare-metal Strix Halo](../../BARE-METAL.md), configuration as of the note's date.*`
+      (render-check the footer link). Machine config changes → update `BARE-METAL.md`
+      (Current + changelog row) in the same push.
 - [ ] Push GitHub (`git push origin main`) AND the Gitea mirror
       (`git -c credential.helper=store push gitea main`) in the same step.
 

@@ -8,7 +8,7 @@ We are an unofficial community lab, not a vendor. We publish the measurements, t
 
 ## Supported
 
-- **Hardware** — AMD Strix Halo: Ryzen AI MAX+ 395, 128 GB unified LPDDR5X (~256 GB/s of UMA bandwidth — the budget everything here is tuned against), Radeon 8060S iGPU (gfx1151, RDNA 3.5).
+- **Hardware** — AMD Strix Halo: Ryzen AI MAX+ 395, 128 GB unified LPDDR5X (~256 GB/s of UMA bandwidth — the budget everything here is tuned against), Radeon 8060S iGPU (gfx1151, RDNA 3.5) — [full dated configuration](BARE-METAL.md).
 - **Backends** — Vulkan (RADV/Mesa, our primary) and ROCm/HIP 7.2.4.
 - **Models** — the quants published by this lab, plus community GGUFs; see [Model weights](#model-weights) below.
 
