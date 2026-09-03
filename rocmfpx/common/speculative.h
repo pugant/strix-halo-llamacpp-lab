@@ -137,6 +137,10 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
 bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 bool common_speculative_state_required(const common_speculative * spec);
 
+// F4 partial-reject reset: clears the draft-sync bookkeeping WITHOUT invalidating
+// the cache-facing boundary (get_state) — see common_speculative_impl::draft_sync_reset
+void common_speculative_draft_sync_reset(common_speculative * spec, llama_seq_id seq_id);
+
 // (optional) rewind the internal state to a previously seen position, so that
 // processing can resume from there after the target/draft memories rolled back
 // (bounded prompt-cache boundary salvage). Returns false when the position is

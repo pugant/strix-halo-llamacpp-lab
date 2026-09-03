@@ -4492,11 +4492,14 @@ private:
                 // PI F4 fix (T20/F4, ipotesi H1 confermata dal banco 29/08): al partial-reject il
                 // rollback di memoria non ripulisce lo stato della head MTP e il round successivo
                 // parte con token fantasma (P(p0-reject|prec-reject) 0,272 vs 0,099 base; con reset
-                // head 0,161, acc-len condizionato 1,51->1,73). Il reset del solo drafter (blob
-                // vuoto, stesso primitivo dei cold-fallback) riallinea il round successivo tramite
-                // la neutral resync di process().
+                // head 0,161, acc-len condizionato 1,51->1,73). Il reset del solo drafter riallinea
+                // il round successivo tramite la neutral resync di process().
+                // F4-boundary (run7 03/09): reset draft-sync ONLY — the cache-facing boundary
+                // must survive, or a task whose final round is a partial reject goes idle with
+                // get_state() empty and prompt_save skips ("required speculative state
+                // unavailable"): 5 skipped saves, 3 full re-prefills (82k/87k/114k).
                 if (ids.size() < n_draft + 1) {
-                    common_speculative_set_state(spec.get(), slot.id, {});
+                    common_speculative_draft_sync_reset(spec.get(), slot.id);
                     metrics.on_spec_state_reset();
                 }
 

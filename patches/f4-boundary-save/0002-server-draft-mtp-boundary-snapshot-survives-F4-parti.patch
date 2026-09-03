@@ -1,0 +1,120 @@
+From 7d54c4bd2c061d92189372e6e41296048a2d89df Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 3 Sep 2026 16:54:15 +0200
+Subject: [PATCH 2/2] server: draft-mtp boundary snapshot survives F4
+ partial-reject resets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The production drafter for qwen4exp MTP (common_speculative_state_draft_mtp,
+selected by --spec-type draft-mtp — NOT eagle3, gap caught in code review)
+has the same save-skip: its get_state gates on pending_h_valid, which the F4
+reset clears via set_state({}) → reset_seq_state. Same fix shape adapted to
+its ring-based state: draft_sync_reset() snapshots the accepted-boundary blob
+(coherent right after accept()) before clearing; get_state serves it while
+the live state is in the F4 window; set_state and shift_state drop it. The
+eagle3 impl keeps the boundary_* pair split from the previous commit.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ common/speculative.cpp | 48 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index b2cab83b2..38f0aa784 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1776,6 +1776,15 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+     std::vector<uint32_t> ring_len;              // [n_seq]
+     std::vector<uint32_t> ring_head;             // [n_seq] next write slot
+ 
++    // F4-boundary (run7 03/09): snapshot of the last get_state()-valid blob,
++    // captured by draft_sync_reset() right before the partial-reject reset
++    // clears the live state. A task whose final verify round is a partial
++    // reject goes idle with pending_h_valid == 0; prompt_save must still
++    // succeed or the slot holds the ONLY copy of the history (5 skipped
++    // saves → full re-prefills). Cleared whenever the live state is restored
++    // or fully invalidated (set_state) or positions shift (shift_state).
++    std::vector<std::vector<uint8_t>> boundary_snapshot; // [n_seq]
++
+     common_speculative_state_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
+         , params(params.draft)
+@@ -1866,6 +1875,8 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+         ring_len.assign(n_seq, 0);
+         ring_head.assign(n_seq, 0);
+ 
++        boundary_snapshot.assign(n_seq, std::vector<uint8_t>());
++
+         process_boundary_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+         process_boundary_valid.assign(n_seq, 0);
+         process_boundary_pos.assign(n_seq, -1);
+@@ -2585,7 +2596,16 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+ 
+     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+         data.clear();
+-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !pending_h_valid[seq_id]) {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
++            return false;
++        }
++        if (!pending_h_valid[seq_id]) {
++            // F4 window: serve the snapshot captured at the partial-reject
++            // reset (the accepted-boundary blob) — see boundary_snapshot
++            if (!boundary_snapshot[seq_id].empty()) {
++                data = boundary_snapshot[seq_id];
++                return true;
++            }
+             return false;
+         }
+ 
+@@ -2630,6 +2650,10 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+             return false;
+         }
+ 
++        // the live state becomes authoritative (restored) or the KV is gone
++        // (empty data) — either way the F4-window snapshot no longer applies
++        boundary_snapshot[seq_id].clear();
++
+         reset_seq_state(seq_id);
+         if (data.empty() || data.size() < MTP_STATE_HEADER) {
+             return false;
+@@ -2698,6 +2722,10 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+             return;
+         }
+ 
++        // the snapshot's embedded positions cannot be rewritten in place —
++        // drop it (a save in this window skips, as before the split)
++        boundary_snapshot[seq_id].clear();
++
+         if (pending_h_valid[seq_id]) {
+             pending_h_pos[seq_id] += delta;
+         }
+@@ -2717,6 +2745,24 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
+         }
+     }
+ 
++    // F4: reset the draft-sync state the next round would misuse (ghost rows)
++    // while keeping the cache boundary available — snapshot the accepted-
++    // boundary blob (the live state right after accept() is coherent with it)
++    // just before clearing. The live state re-arms on the next process() and
++    // get_state serves fresh data again.
++    void draft_sync_reset(llama_seq_id seq_id) override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
++            return;
++        }
++
++        std::vector<uint8_t> snap;
++        if (get_state(seq_id, snap)) {
++            boundary_snapshot[seq_id] = std::move(snap);
++        }
++
++        reset_seq_state(seq_id);
++    }
++
+     bool need_embd() const override {
+         return false;
+     }
+-- 
+2.53.0
+

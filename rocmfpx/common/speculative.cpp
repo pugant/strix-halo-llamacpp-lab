@@ -205,6 +205,14 @@ struct common_speculative_impl {
     virtual bool state_required() const { return false; }
     virtual void shift_state(llama_seq_id /*seq_id*/, llama_pos /*delta*/) {}
 
+    // (optional) partial-reject draft-sync reset: clear the round bookkeeping the
+    // next draft() would misuse (ghost rows) while keeping any cache-facing
+    // boundary valid for get_state(). Default = full set_state({}) — i.e. exactly
+    // the pre-split behavior; only eagle3 overrides (its boundary must survive).
+    virtual void draft_sync_reset(llama_seq_id seq_id) {
+        set_state(seq_id, {});
+    }
+
     // (optional) rewind the per-seq state to a previously seen position after a
     // bounded memory rollback; see common_speculative_rollback_state
     virtual bool rollback_state(llama_seq_id /*seq_id*/, llama_pos /*pos*/) { return false; }
@@ -511,6 +519,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     std::vector<std::vector<float>> pending_g_last;
     std::vector<llama_pos>          pending_pos_last;
 
+    // [per-seq] cache-facing boundary state — same row pending_* holds at quiescent
+    // points, but NOT cleared by draft_sync_reset (F4 partial-reject). A task whose
+    // final verify round is a partial reject goes idle with the draft-sync pair
+    // empty; prompt_save must still succeed or the slot holds the ONLY copy of the
+    // history (run7 03/09: 5 skipped saves → full re-prefills).
+    std::vector<std::vector<float>> boundary_g_last;
+    std::vector<llama_pos>          boundary_pos_last;
+
     // [per-seq] snapshot of the most recent process()'s encoder output
     std::vector<std::vector<float>> verify_g;         // [n_seq][n_rows * n_embd_dec]
     std::vector<llama_pos>          verify_pos_first; // [n_seq] — pos of verify_g[seq][0]
@@ -587,6 +603,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
         pending_g_last.assign(n_seq, std::vector<float>(n_embd_dec, 0.0f));
         pending_pos_last.assign(n_seq, -1);
+
+        boundary_g_last.assign(n_seq, std::vector<float>(n_embd_dec, 0.0f));
+        boundary_pos_last.assign(n_seq, -1);
 
         verify_g.assign(n_seq, std::vector<float>());
         verify_pos_first.assign(n_seq, -1);
@@ -762,6 +781,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             verify_g[seq_id].resize((size_t) n_rows * n_embd_dec, 0.0f);
             std::memcpy(verify_g[seq_id].data(),       g_embd + (size_t) beg * n_embd_dec, row_bytes * n_rows);
             std::memcpy(pending_g_last[seq_id].data(), g_embd + (size_t) end * n_embd_dec, row_bytes);
+
+            // refresh the cache-facing boundary at the same position
+            boundary_pos_last[seq_id] = batch_in.pos[end];
+            std::memcpy(boundary_g_last[seq_id].data(), g_embd + (size_t) end * n_embd_dec, row_bytes);
         }
 
         if (batch.n_tokens > 0) {
@@ -926,6 +949,13 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         std::memcpy(pending_g_last[seq_id].data(),
                     verify_g[seq_id].data() + (size_t) i_g * n_embd_dec,
                     (size_t) n_embd_dec * sizeof(float));
+
+        // the accepted row is the cache-facing boundary (a save right after this
+        // partial rejection — e.g. at task end — must still serve get_state)
+        boundary_pos_last[seq_id] = pending_pos_last[seq_id];
+        std::memcpy(boundary_g_last[seq_id].data(),
+                    verify_g[seq_id].data() + (size_t) i_g * n_embd_dec,
+                    (size_t) n_embd_dec * sizeof(float));
     }
 
     // we only need to stash the deferred boundary's g_embd row for recurrent/hybrid targets:
@@ -939,12 +969,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (!need_boundary_stash()) {
             return false;
         }
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos_last[seq_id] < 0) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || boundary_pos_last[seq_id] < 0) {
             return false;
         }
 
-        const llama_pos          pos = pending_pos_last[seq_id];
-        const std::vector<float> & g = pending_g_last[seq_id];
+        const llama_pos          pos = boundary_pos_last[seq_id];
+        const std::vector<float> & g = boundary_g_last[seq_id];
 
         data.resize(sizeof(llama_pos) + g.size() * sizeof(float));
         std::memcpy(data.data(),                     &pos,     sizeof(llama_pos));
@@ -962,6 +992,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             verify_g[seq_id].clear();
             verify_pos_first[seq_id] = -1;
             verify_g_rows[seq_id] = 0;
+            boundary_pos_last[seq_id] = -1;
+            std::fill(boundary_g_last[seq_id].begin(), boundary_g_last[seq_id].end(), 0.0f);
             return !need_boundary_stash();
         }
         if (!need_boundary_stash()) {
@@ -977,11 +1009,30 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         pending_pos_last[seq_id] = pos;
         pending_g_last[seq_id].resize(n_embd_dec);
         std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
+
+        boundary_pos_last[seq_id] = pos;
+        boundary_g_last[seq_id].resize(n_embd_dec);
+        std::memcpy(boundary_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
         return true;
     }
 
     bool state_required() const override {
         return need_boundary_stash();
+    }
+
+    // F4: clear only the draft-sync pair; the cache boundary survives a
+    // partial-reject reset (prompt_save at idle must still succeed — see the
+    // boundary_* members' note). set_state({}) remains the FULL invalidation
+    // for cold-fallback paths where the KV itself is gone.
+    void draft_sync_reset(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        pending_pos_last[seq_id] = -1;
+        std::fill(pending_g_last[seq_id].begin(), pending_g_last[seq_id].end(), 0.0f);
+        verify_g[seq_id].clear();
+        verify_pos_first[seq_id] = -1;
+        verify_g_rows[seq_id] = 0;
     }
 
     void shift_state(llama_seq_id seq_id, llama_pos delta) override {
@@ -994,6 +1045,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
         if (verify_pos_first[seq_id] >= 0) {
             verify_pos_first[seq_id] += delta;
+        }
+        if (boundary_pos_last[seq_id] >= 0) {
+            boundary_pos_last[seq_id] += delta;
         }
     }
 
@@ -1722,6 +1776,15 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     std::vector<uint32_t> ring_len;              // [n_seq]
     std::vector<uint32_t> ring_head;             // [n_seq] next write slot
 
+    // F4-boundary (run7 03/09): snapshot of the last get_state()-valid blob,
+    // captured by draft_sync_reset() right before the partial-reject reset
+    // clears the live state. A task whose final verify round is a partial
+    // reject goes idle with pending_h_valid == 0; prompt_save must still
+    // succeed or the slot holds the ONLY copy of the history (5 skipped
+    // saves → full re-prefills). Cleared whenever the live state is restored
+    // or fully invalidated (set_state) or positions shift (shift_state).
+    std::vector<std::vector<uint8_t>> boundary_snapshot; // [n_seq]
+
     common_speculative_state_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1811,6 +1874,8 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         ring_pos.assign(n_seq, std::vector<llama_pos>(RING_N, -1));
         ring_len.assign(n_seq, 0);
         ring_head.assign(n_seq, 0);
+
+        boundary_snapshot.assign(n_seq, std::vector<uint8_t>());
 
         process_boundary_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
         process_boundary_valid.assign(n_seq, 0);
@@ -2531,7 +2596,16 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
         data.clear();
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !pending_h_valid[seq_id]) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        if (!pending_h_valid[seq_id]) {
+            // F4 window: serve the snapshot captured at the partial-reject
+            // reset (the accepted-boundary blob) — see boundary_snapshot
+            if (!boundary_snapshot[seq_id].empty()) {
+                data = boundary_snapshot[seq_id];
+                return true;
+            }
             return false;
         }
 
@@ -2575,6 +2649,10 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return false;
         }
+
+        // the live state becomes authoritative (restored) or the KV is gone
+        // (empty data) — either way the F4-window snapshot no longer applies
+        boundary_snapshot[seq_id].clear();
 
         reset_seq_state(seq_id);
         if (data.empty() || data.size() < MTP_STATE_HEADER) {
@@ -2644,6 +2722,10 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        // the snapshot's embedded positions cannot be rewritten in place —
+        // drop it (a save in this window skips, as before the split)
+        boundary_snapshot[seq_id].clear();
+
         if (pending_h_valid[seq_id]) {
             pending_h_pos[seq_id] += delta;
         }
@@ -2661,6 +2743,24 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
                 p += delta;
             }
         }
+    }
+
+    // F4: reset the draft-sync state the next round would misuse (ghost rows)
+    // while keeping the cache boundary available — snapshot the accepted-
+    // boundary blob (the live state right after accept() is coherent with it)
+    // just before clearing. The live state re-arms on the next process() and
+    // get_state serves fresh data again.
+    void draft_sync_reset(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        std::vector<uint8_t> snap;
+        if (get_state(seq_id, snap)) {
+            boundary_snapshot[seq_id] = std::move(snap);
+        }
+
+        reset_seq_state(seq_id);
     }
 
     bool need_embd() const override {
@@ -4056,6 +4156,20 @@ bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     }
 
     return ok;
+}
+
+void common_speculative_draft_sync_reset(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->draft_sync_reset(seq_id);
+    }
+
+    if (seq_id >= 0 && seq_id < (llama_seq_id) spec->dparams.size()) {
+        spec->dparams[seq_id].drafting = false;
+    }
 }
 
 bool common_speculative_state_required(const common_speculative * spec) {

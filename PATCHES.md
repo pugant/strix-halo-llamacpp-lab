@@ -1,6 +1,6 @@
 # Patches
 
-Every feature of this lab is carried as a `git am`-clean series under [`patches/`](patches/) — but you rarely need to apply anything: the [`rocmfpx/`](rocmfpx/) snapshot **already contains every merged series** (it is the fork at `6144779cc`, buildable as-is — see the [README build section](README.md#build)). The patches exist to read the history, cherry-pick a single feature, or re-create a branch.
+Every feature of this lab is carried as a `git am`-clean series under [`patches/`](patches/) — but you rarely need to apply anything: the [`rocmfpx/`](rocmfpx/) snapshot **already contains every merged series** (it is the fork at `7d54c4bd2`, buildable as-is — see the [README build section](README.md#build)). The patches exist to read the history, cherry-pick a single feature, or re-create a branch.
 
 Apply notes — the non-obvious ones:
 
@@ -8,7 +8,8 @@ Apply notes — the non-obvious ones:
 - [`patches/drafter-routing/0001-drafter-routing-mtp-dflash-per-request.patch`](patches/drafter-routing/0001-drafter-routing-mtp-dflash-per-request.patch) is **one file containing the full 14-commit series** — `git am` splits it back into its 14 commits.
 - [`patches/upstream-llamacpp/0001-server-reasoning-budget-forced-newline.patch`](patches/upstream-llamacpp/0001-server-reasoning-budget-forced-newline.patch) is a **plain diff for `git apply`** against **ggml-org master `3dc7285`**, not the fork — see its [README](patches/upstream-llamacpp/README.md).
 - [`patches/t25-ple-disk/`](patches/t25-ple-disk/) applied on fork `main` yields `bc85fcb1d`; [`patches/t23-kv-disk-persist/`](patches/t23-kv-disk-persist/) applied on top yields `f629365da` — the snapshot state before the `t27` and `optim-camp` series.
-- [`patches/optim-camp/`](patches/optim-camp/) applied on `dadc23e44` reproduces the **tree** of `6144779cc` — the commit the [`rocmfpx/`](rocmfpx/) snapshot in this repo matches. The patch messages carry a `Co-Authored-By` trailer, so the shas after `git am` differ from the fork's; the tree does not.
+- [`patches/optim-camp/`](patches/optim-camp/) applied on `dadc23e44` reproduces the **tree** of `6144779cc` — the snapshot state before `f4-boundary-save`. The patch messages carry a `Co-Authored-By` trailer, so the shas after `git am` differ from the fork's; the tree does not.
+- [`patches/f4-boundary-save/`](patches/f4-boundary-save/) applied on `6144779cc` (i.e. `optim-camp` applied on `dadc23e44`) reproduces the **tree** of `7d54c4bd2` — the state the snapshot in this repo now matches. Same trailer idiom: the shas after `git am` differ, the tree does not.
 
 ## Patch index
 
@@ -29,6 +30,7 @@ Apply notes — the non-obvious ones:
 | [`t25-ple-disk/`](patches/t25-ple-disk/) | fork `main` → result `bc85fcb1d` | PLE n-gram table disk offload — `--ple-disk` reads table blocks on demand from the GGUF itself (15 patches: 12 base + 3 v2) | not submitted |
 | [`t27-ple-store-v2-0001-*.patch`](patches/) | `f629365da` → result `dadc23e44` | ple-store v2: `--ple-disk` extended to the 2-bit `Q2_0_ROCMFPX` PLE (generic row-bytes via ggml traits, dual-type allowlist, bit-exact test battery) — required to serve the ROCmFP2MIX-64GB build | not submitted |
 | [`optim-camp/`](patches/optim-camp/) | `dadc23e44` → tree of `6144779cc` | Per-round graph reuse (QSA/PLE custom inputs learn `can_reuse`: rebuilds 1025 → 6) + dense decode when the QSA budget covers the cache — plain tg512 +18.6% HIP / +32.5% Vulkan, ppl unchanged to the 4th decimal, bit-identical greedy fingerprints | not submitted |
+| [`f4-boundary-save/`](patches/f4-boundary-save/) | `6144779cc` → tree of `7d54c4bd2` | Keep the speculative boundary state alive across F4 partial-reject resets — the boundary snapshot survives `draft_sync_reset`, so prompt-cache saves don't skip (root cause of the 2026-09-03 full-re-prefill cluster on the pi stack, chain A) | not submitted |
 | [`t23-kv-disk-persist/`](patches/t23-kv-disk-persist/) | fork `main` @ `bc85fcb1d` → result `f629365da` (the `rocmfpx/` snapshot before `t27`/`optim-camp`) | Persistent cross-restart prompt-cache library — `--cache-disk-persist`: ds4-inspired entries with hit-decay eviction (6 h half-life), crash-safe commit-by-rename (sidecar written last), boot adoption/GC, CRC verify-then-load (12 patches: 9 base + 3 multimodal save-path fixes) | not submitted |
 
 ## The 9-patch `spec-cache-trailing-rollback` series
