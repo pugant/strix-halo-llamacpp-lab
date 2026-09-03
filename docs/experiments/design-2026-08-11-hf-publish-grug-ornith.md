@@ -159,7 +159,7 @@ Section structure (inspired by unsloth, adapted Strix-specific):
 5. **Benchmarks** — tg128/pp512 table (grug ROCmFP4: 70.92 vs grug Q4_K_M 61.18, +16%; Ornith ROCmFP4: 66.68; grug size 17.31 GiB vs Q4_K_M 19.70 GiB, -12%). On Strix Halo Ryzen AI Max+ 395, 128 GB LPDDR5X. Methodology: `llama-bench -ngl 999 -fa on -p 512 -n 128 -mmap 0`. Production reference: Qwen3.6-35B-A3B ROCmFP4-STRIX_LEAN 63 tok/s. Sources: `docs/benchmarks/bench-grug-{rocmfp4,q4_k_m}.txt`, `logs/bench-ornith-vs-grug.log`.
 
    **System configuration at bench time** (declared for reproducibility):
-   - **Bare metal host**: Bosgame BeyondMax Series (`bosgame-m5`), Ubuntu 24.04.4 LTS, kernel 7.0.0-28-generic
+   - **Bare metal host**: Bosgame BeyondMax Series, Ubuntu 24.04.4 LTS, kernel 7.0.0-28-generic
    - **CPU power profile**: `balanced` (`powerprofilesctl get`) — default configuration, **NOT forced to `performance`**. Representative of an out-of-the-box setup.
    - **CPU scaling driver**: `amd-pstate-epp`, scaling_governor `performance` (amd-pstate-epp default), EPP `performance`
    - **IOMMU/iGPU power**: auto (no manual tuning)

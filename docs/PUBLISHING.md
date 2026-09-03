@@ -45,6 +45,9 @@ Reusable checklist for every feature release of this lab. Three blocks, in order
 
 ## 3. Cross-checks (final)
 
+- [ ] Sensitive-pattern gate on the tree and on every card diff (grep must return nothing):
+      `grep -rInE 'bosgame|192\.168\.|hf_[A-Za-z0-9]{20}|ghp_|github_pat_|:8193|:8195|:8081' .`
+      (known benign exceptions: upstream `rocmfpx/` vendored docs, `localhost:1234` examples).
 - [ ] Bidirectional links: card → lab `main`; lab engine table → cards; guides.
 - [ ] Sensitive scan of every diff: no home paths, internal ports, private names.
 - [ ] Two-stage review (numbers-vs-sources, then EN pass).
