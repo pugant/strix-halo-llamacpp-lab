@@ -30,7 +30,7 @@ untouched F32/F16/Q5_K/Q6_K/FAST tensors — 1224 total, byte-exact against the 
 
 Reading: the v1's damage was not quantization noise — it was PLE recall loss. Q5_1
 restores it fully (Dante ×18.3), and the FP4/Q3 trunk costs −5.5% tg128 while bringing
-EN ppl below even the LEAN's. A 76 GiB file that holds ~56 GiB of RAM: the delta is
+EN ppl within ~2% of the current LEAN's (3.27 vs 3.1961; below the pre-09-02 LEAN's 3.3601). A 76 GiB file that holds ~56 GiB of RAM: the delta is
 the disk-resident PLE.
 
 ## Where it runs
