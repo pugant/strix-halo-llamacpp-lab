@@ -57,6 +57,7 @@ commands) live in the [Feature guide](#feature-guide) below.
 | Reasoning-budget warn window | `--reasoning-budget` | budgets converge instead of exhausting | any model | [note](docs/experiments/reasoning-budget-warn75.md) |
 | qwen4exp arch + vision×MTP | — | the whole Flash-Next family, vision and drafter together | [Qwen3.8-Flash-Next](https://huggingface.co/pugant/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_STRIX_LEAN-GGUF) | [note](docs/experiments/qwen38-flash-next-runtime.md) |
 | Graph reuse + dense decode | — | plain tg512 +18.6% HIP / +32.5% Vulkan, identical outputs | [Qwen3.8-Flash-Next](https://huggingface.co/pugant/Qwen3.8-Flash-Next-ROCMFP4_STRIX_LEAN-GGUF) | [note](docs/experiments/2026-09-02-qwen4exp-graph-reuse-and-dense-decode.md) |
+| Boundary save guard | — | partial-reject final rounds stop costing a full re-prefill (0 skipped saves over 479 resets) | any model with a drafter | [note](docs/experiments/2026-09-03-f4-boundary-save-fix.md) |
 
 # Motivations
 
