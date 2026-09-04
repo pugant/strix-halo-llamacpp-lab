@@ -59,9 +59,9 @@ ggml-org/llama.cpp (main)
                     │  snapshots of its states (34a127168 → 62416acd3 → bc85fcb1d → f629365da)
                     ▼
   pugant/strix-nebulosa  ← THIS REPO — the full fork source
-                                    included in rocmfpx/ (buildable),
-                                    plus the same work as git am-able
-                                    patches, docs and replication scripts
+                         included in rocmfpx/ (buildable),
+                         plus the same work as git am-able
+                         patches, docs and replication scripts
 ```
 
 What is merged where:
