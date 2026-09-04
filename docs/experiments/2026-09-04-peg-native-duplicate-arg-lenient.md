@@ -118,11 +118,18 @@ failures; the new test was RED against the unfixed code.
 The production deployment (`qwen4exp-mtp-vk-optim3`) then met the real workload:
 the pi session resumed (a 118,689-token cold prefill — the client's resume
 serialization is not a prefix of any disk entry, so the persistent cache could not
-serve it) and the very rewrite turn that had died twice completed cleanly. The
-third generation of that file happened to be well-formed — the slip is stochastic,
-not deterministic — so the marker's first *natural* hit is still pending
-observation; the unit test already asserts the full path (tolerance, last-wins,
-marker) against the production grammar builder. Zero `unparsed peg-native` lines
-since the swap.
+serve it) and the very rewrite turn that had died twice completed cleanly — the
+third generation of that file happened to be well-formed; the slip is stochastic,
+not deterministic. Two hours later the marker earned its keep on its own:
+
+```
+13:29:11.252 W peg-native: leniency-hit: duplicate param 'path' tolerated (last-wins)
+13:29:11.487 I slot release: task 49642 | stop processing: n_tokens = 85353, truncated = 0
+13:29:16.414 I slot launch_slot_: task 49844 …  (session continues, no intervention)
+```
+
+The third occurrence of the slip — the same duplicated `path` in a `write` —
+tolerated, resolved last-wins, delivered 235 ms later, session uninterrupted.
+The two pre-fix occurrences of the same slip had each killed a four-minute turn.
 
 *Measured on the lab's [bare-metal Strix Halo](../../BARE-METAL.md), configuration as of the note's date.*
