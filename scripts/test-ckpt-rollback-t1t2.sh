@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Part of strix-halo-llamacpp-lab — see README.md.
+# Part of strix-nebulosa — see README.md.
 # Replication scripts for the Qwen3.8-27B ROCmFP4-STRIX_LEAN pipeline.
 # Env: LLMODELS_DIR (default $HOME/llmodels), HF_TOKEN (downloads/uploads).
 # T1/T2 from test-plan 2026-08-16-spec-cache-checkpoint-rollback-test.md (internal plan, not included in this repo)

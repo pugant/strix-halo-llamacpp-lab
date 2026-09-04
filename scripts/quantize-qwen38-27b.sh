@@ -1,5 +1,5 @@
 #!/bin/bash
-# Part of strix-halo-llamacpp-lab — see README.md.
+# Part of strix-nebulosa — see README.md.
 # Replication scripts for the Qwen3.8-27B ROCmFP4-STRIX_LEAN pipeline.
 # Env: LLMODELS_DIR (default $HOME/llmodels), HF_TOKEN (downloads/uploads).
 # quantize-qwen38-27b.sh — Qwen3.8-27B BF16 → Q4_0_ROCMFP4_STRIX_LEAN

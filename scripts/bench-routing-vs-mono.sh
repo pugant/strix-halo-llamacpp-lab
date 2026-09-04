@@ -1,5 +1,5 @@
 #!/bin/bash
-# Part of strix-halo-llamacpp-lab — see README.md.
+# Part of strix-nebulosa — see README.md.
 # Replication scripts for the Qwen3.8-27B ROCmFP4-STRIX_LEAN pipeline.
 # Env: LLMODELS_DIR (default $HOME/llmodels), HF_TOKEN (downloads/uploads).
 # bench-routing-vs-mono.sh — T4 A/B: dual routing (policy) vs MONO-MTP6 on Qwen3.8-27B STRIX_LEAN

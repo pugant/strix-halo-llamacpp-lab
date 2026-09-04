@@ -58,7 +58,7 @@ ggml-org/llama.cpp (main)
               (routing, DFlash2 port, reasoning budget, cache salvage)
                     │  snapshots of its states (34a127168 → 62416acd3 → bc85fcb1d → f629365da)
                     ▼
-  pugant/strix-halo-llamacpp-lab  ← THIS REPO — the full fork source
+  pugant/strix-nebulosa  ← THIS REPO — the full fork source
                                     included in rocmfpx/ (buildable),
                                     plus the same work as git am-able
                                     patches, docs and replication scripts

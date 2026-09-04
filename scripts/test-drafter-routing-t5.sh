@@ -1,5 +1,5 @@
 #!/bin/bash
-# Part of strix-halo-llamacpp-lab — see README.md.
+# Part of strix-nebulosa — see README.md.
 # Replication scripts for the Qwen3.8-27B ROCmFP4-STRIX_LEAN pipeline.
 # Env: LLMODELS_DIR (default $HOME/llmodels), HF_TOKEN (downloads/uploads).
 # test-drafter-routing-t5.sh — T5 numerical spot-check (Task 10 of the T7-f2 plan — internal plan, not included in this repo — RS cycle 20/08)
