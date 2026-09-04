@@ -408,13 +408,22 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
             args_seq = args_seq + required_parsers[i];
         }
 
-        // Build optional args with flexible ordering
-        if (!optional_parsers.empty()) {
-            common_peg_parser any_opt = p.choice();
-            for (const auto & opt : optional_parsers) {
-                any_opt |= opt;
+        // Leniency (pi_agent ack 04/09): after the required sequence, tolerate
+        // ANY arg repeated in any order — a model may re-emit a required
+        // parameter at the end of a long generation (04/09 task 29340: write
+        // emitted path, content, path). The mapper resolves duplicates
+        // last-wins and logs a marker; rejecting the whole tool call instead
+        // would throw away the generation ("does not match the expected
+        // peg-native format").
+        if (!required_parsers.empty() || !optional_parsers.empty()) {
+            common_peg_parser any_arg = p.choice();
+            for (const auto & req : required_parsers) {
+                any_arg |= req;
             }
-            args_seq = args_seq + p.repeat(p.space() + any_opt, 0, -1);
+            for (const auto & opt : optional_parsers) {
+                any_arg |= opt;
+            }
+            args_seq = args_seq + p.repeat(p.space() + any_arg, 0, -1);
         }
 
         if (!arguments.start.empty()) {

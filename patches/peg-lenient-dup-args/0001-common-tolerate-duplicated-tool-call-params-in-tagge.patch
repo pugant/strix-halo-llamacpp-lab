@@ -1,0 +1,393 @@
+From 068329cbdb6a8b8bbf700904831d05f46e34b55b Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Fri, 4 Sep 2026 11:39:31 +0200
+Subject: [PATCH] common: tolerate duplicated tool-call params in tagged
+ peg-native grammar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A model may re-emit a required parameter at the end of a long generation
+(04/09 task 29340: write emitted path, content, path). The tagged grammar
+admitted each required arg exactly once, so the whole tool call failed to
+parse and the server threw the generation away ("does not match the
+expected peg-native format") — 4m19s of work lost, manual intervention.
+
+- grammar: after the required sequence, any arg may now repeat (optional
+  args already could)
+- mapper: duplicates resolve last-wins (previous pair surgically removed,
+  other keys and their order preserved) and emit a greppable warning
+  "peg-native: leniency-hit: duplicate param '<name>' tolerated (last-wins)"
+  so the format-slip signal stays observable (pi_agent ack 04/09 11:00)
+
+Test: tagged_duplicate_required_param (identical dup, divergent dup
+last-wins, marker logged via captured log). Suites green:
+test-chat-auto-parser 71/420, test-chat-peg-parser 32/198.
+
+Co-Authored-By: GLM by z.ai <noreply@z.ai>
+---
+ AI_CHANGES.md                         |  36 +++++++
+ common/chat-auto-parser-generator.cpp |  19 +++-
+ common/chat-peg-parser.cpp            |  46 ++++++--
+ common/chat-peg-parser.h              |   3 +-
+ tests/test-chat-auto-parser.cpp       | 146 ++++++++++++++++++++++++++
+ 5 files changed, 237 insertions(+), 13 deletions(-)
+
+diff --git a/AI_CHANGES.md b/AI_CHANGES.md
+index e5acbf932..852d3cc51 100644
+--- a/AI_CHANGES.md
++++ b/AI_CHANGES.md
+@@ -178,6 +178,42 @@ byte 2: v2[5:4] | v3[5:0]<<2
+ | Python/shell syntax checks | passed |
+ | DiffusionGemma BF16 → ROCmFP4 coherent agent quant | passed, `13,764.94 MiB / 4.57 BPW` |
+ 
++## Session 003 — 2026-09-04
++
++**Scope:** peg-native tagged tool calls rejected a duplicated required parameter, throwing away whole generations; made the grammar lenient (any arg may repeat after the required sequence) and the mapper duplicate-aware (last-wins + logged marker).
++
++### `common/chat-auto-parser-generator.cpp`
++
++| Fix | Line(s) | Detail |
++|-----|---------|-------|
++| Grammar leniency | 411-428 | The trailing repeat after the required-arg sequence now admits ANY arg (required included), not just optionals. A model re-emitting a required parameter at the end of a long generation (write emitted `path`, `content`, `path`) previously failed the whole tool-call rule. |
++
++### `common/chat-peg-parser.h`
++
++| Fix | Line(s) | Detail |
++|-----|---------|-------|
++| Mapper state | 29 | New `arg_pair_pos` (emitted pairs: start offset + name) to detect and resolve duplicate args; reset per tool open. |
++
++### `common/chat-peg-parser.cpp`
++
++| Fix | Line(s) | Detail |
++|-----|---------|-------|
++| Last-wins on duplicates | 348-395 | `is_arg_name` (marker at :366): a duplicate name logs `peg-native: leniency-hit: duplicate param '<name>' tolerated (last-wins)` and surgically removes the previous pair (other keys and their order preserved; leading-comma cleanup when the first pair is removed). Previously a duplicate produced a JSON string with a duplicate key (for grammar-allowed optional repeats) or a hard parse failure (required repeats). |
++
++### `tests/test-chat-auto-parser.cpp`
++
++| Fix | Line(s) | Detail |
++|-----|---------|-------|
++| Regression test | 2145+ | `tagged_duplicate_required_param`: drives the production builder `build_tool_parser_tag_tagged` with the Qwen-style tagged syntax — identical duplicate parses to the same args as the clean call; divergent duplicate resolves last-wins (equal to a clean call carrying the last value); the marker is asserted via a captured log file. |
++
++### Validation
++
++| Check | Result |
++|-------|--------|
++| `test-chat-auto-parser` | 71 tests / 420 assertions / 0 failures (includes the new test, RED before the fix) |
++| `test-chat-peg-parser` | 32 tests / 198 assertions / 0 failures |
++| Deploy smoke (production image) | pending at log time — image `qwen4exp-mtp-vk-optim3` in build; result recorded in the lab's deploy plan `2026-09-04-peg-lenient-dup-args-deploy-optim3.md` |
++
+ <!-- TEMPLATE FOR FUTURE AI SESSIONS:
+ 
+ ## Session NNN — YYYY-MM-DD
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index 276963584..7d587677a 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -408,13 +408,22 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+             args_seq = args_seq + required_parsers[i];
+         }
+ 
+-        // Build optional args with flexible ordering
+-        if (!optional_parsers.empty()) {
+-            common_peg_parser any_opt = p.choice();
++        // Leniency (pi_agent ack 04/09): after the required sequence, tolerate
++        // ANY arg repeated in any order — a model may re-emit a required
++        // parameter at the end of a long generation (04/09 task 29340: write
++        // emitted path, content, path). The mapper resolves duplicates
++        // last-wins and logs a marker; rejecting the whole tool call instead
++        // would throw away the generation ("does not match the expected
++        // peg-native format").
++        if (!required_parsers.empty() || !optional_parsers.empty()) {
++            common_peg_parser any_arg = p.choice();
++            for (const auto & req : required_parsers) {
++                any_arg |= req;
++            }
+             for (const auto & opt : optional_parsers) {
+-                any_opt |= opt;
++                any_arg |= opt;
+             }
+-            args_seq = args_seq + p.repeat(p.space() + any_opt, 0, -1);
++            args_seq = args_seq + p.repeat(p.space() + any_arg, 0, -1);
+         }
+ 
+         if (!arguments.start.empty()) {
+diff --git a/common/chat-peg-parser.cpp b/common/chat-peg-parser.cpp
+index c3364af9e..c3feb3710 100644
+--- a/common/chat-peg-parser.cpp
++++ b/common/chat-peg-parser.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "chat-auto-parser.h"
+ #include "ggml.h"
++#include "log.h"
+ #include "peg-parser.h"
+ 
+ #include <nlohmann/json.hpp>
+@@ -306,6 +307,7 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
+         current_tool          = &pending_tool_call.value();
+         arg_count             = 0;
+         args_buffer.clear();
++        arg_pair_pos.clear();
+         closing_quote_pending = false;
+     }
+ 
+@@ -348,18 +350,48 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
+     }
+ 
+     if (is_arg_name && current_tool) {
+-        std::string arg_entry;
+-        if (arg_count > 0) {
+-            arg_entry = ",";
+-        }
+-        arg_entry += ordered_json(trim(node.text)).dump() + ":";
+-        ++arg_count;
++        const std::string name(trim(node.text));
+ 
+         auto & target = args_target();
+         if (target.empty()) {
+             target = "{";
+         }
+-        target += arg_entry;
++
++        for (auto it = arg_pair_pos.begin(); it != arg_pair_pos.end(); ++it) {
++            if (it->second == name) {
++                // Tolerated duplicate (grammar leniency, see analyze_tools):
++                // surgically remove the previous pair for this name so the LAST
++                // value wins, then re-emit. Keep this loud — a duplicated
++                // parameter is a model format slip worth observing.
++                LOG_WRN("peg-native: leniency-hit: duplicate param '%s' tolerated (last-wins)\n", name.c_str());
++                const auto   nit = std::next(it);
++                const size_t end = nit != arg_pair_pos.end() ? nit->first : target.size();
++                const size_t len = end - it->first;
++                target.erase(it->first, len);
++                for (auto jt = nit; jt != arg_pair_pos.end(); ++jt) {
++                    jt->first -= len;
++                }
++                arg_pair_pos.erase(it);
++                // erasing the FIRST pair leaves its successor's leading comma dangling
++                if (target.size() > 1 && target[1] == ',') {
++                    target.erase(1, 1);
++                    for (auto & pp : arg_pair_pos) {
++                        if (pp.first > 1) {
++                            pp.first -= 1;
++                        }
++                    }
++                }
++                break;
++            }
++        }
++
++        const size_t pair_start = target.size();
++        if (pair_start > 1) {
++            target += ",";
++        }
++        target += ordered_json(name).dump() + ":";
++        ++arg_count;
++        arg_pair_pos.push_back({ pair_start, name });
+     }
+ 
+     if ((is_arg_value || is_arg_string_value) && current_tool) {
+diff --git a/common/chat-peg-parser.h b/common/chat-peg-parser.h
+index b3ffd7de2..d3d5ed636 100644
+--- a/common/chat-peg-parser.h
++++ b/common/chat-peg-parser.h
+@@ -3,8 +3,8 @@
+ #include "chat.h"
+ #include "peg-parser.h"
+ 
+-#include <map>
+ #include <optional>
++#include <utility>
+ #include <vector>
+ 
+ class common_chat_peg_mapper {
+@@ -26,6 +26,7 @@ class common_chat_peg_mapper {
+       int                                  arg_count             = 0;
+       bool                                 closing_quote_pending = false;
+       std::string                          args_buffer;  // Buffer to delay arguments until tool name is known
++      std::vector<std::pair<size_t, std::string>> arg_pair_pos;  // emitted pairs (start offset, name), for last-wins on duplicates
+ 
+       // Returns a reference to the active argument destination string.
+       // Before tool_name is known, writes go to args_buffer; after, to current_tool->arguments.
+diff --git a/tests/test-chat-auto-parser.cpp b/tests/test-chat-auto-parser.cpp
+index 8fc7ce4b4..dec01c6a6 100644
+--- a/tests/test-chat-auto-parser.cpp
++++ b/tests/test-chat-auto-parser.cpp
+@@ -2,9 +2,11 @@
+ #include "chat-auto-parser.h"
+ #include "chat-peg-parser.h"
+ #include "chat.h"
++#include "log.h"
+ #include "peg-parser.h"
+ #include "testing.h"
+ 
++#include <cstdio>
+ #include <fstream>
+ #include <iostream>
+ #include <sstream>
+@@ -95,6 +97,9 @@ static void test_normalize_quotes_with_embedded_quotes(testing & t);
+ // TAG_WITH_TAGGED argument parsing tests
+ static void test_tagged_args_with_embedded_quotes(testing & t);
+ 
++// TAG_WITH_TAGGED leniency: duplicated required parameter (04/09 task 29340)
++static void test_tagged_duplicate_required_param(testing & t);
++
+ int main(int argc, char * argv[]) {
+     testing t(std::cout);
+     t.verbose = true;
+@@ -121,6 +126,7 @@ int main(int argc, char * argv[]) {
+     t.test("standard_json_tools", test_standard_json_tools_formats);
+     t.test("normalize_quotes_to_json", test_normalize_quotes_to_json);
+     t.test("tagged_args_embedded_quotes", test_tagged_args_with_embedded_quotes);
++    t.test("tagged_duplicate_required_param", test_tagged_duplicate_required_param);
+ 
+     return t.summary();
+ }
+@@ -2129,3 +2135,143 @@ static void test_tagged_args_with_embedded_quotes(testing & t) {
+         }
+     }
+ }
++
++// peg-native leniency (pi_agent ack 04/09 11:00): a tagged tool call with a
++// DUPLICATED required parameter must parse instead of throwing "does not match
++// the expected peg-native format" (04/09 task 29340: write emitted
++// path, content, path). Semantics: last-wins, and the tolerated case must emit
++// a greppable "leniency-hit" warning so the model-behavior signal stays
++// observable.
++static void test_tagged_duplicate_required_param(testing & t) {
++    json tools = json::array({json{
++        {"type", "function"},
++        {"function", json{
++            {"name", "write"},
++            {"parameters", json{
++                {"type", "object"},
++                {"properties", json{
++                    {"path",    json{{"type", "string"}}},
++                    {"content", json{{"type", "string"}}},
++                }},
++                {"required", json::array({"path", "content"})},
++            }},
++        }},
++    }});
++
++    // Production grammar builder with the Qwen4exp-style tagged syntax
++    auto build_arena = [&]() {
++        return build_chat_peg_parser([&](common_chat_peg_builder & p) {
++            generation_params     inputs;
++            inputs.tools = tools;
++            parser_build_context ctx(p, inputs);
++
++            analyze_tools at;
++            at.format.mode            = tool_format::TAG_WITH_TAGGED;
++            at.format.per_call_start  = "<tool_call>";
++            at.format.per_call_end    = "</tool_call>";
++            at.function.name_prefix   = "<function=";
++            at.function.name_suffix   = ">";
++            at.function.close         = "</function>";
++            at.arguments.name_prefix  = "<parameter=";
++            at.arguments.name_suffix  = ">";
++            at.arguments.value_suffix = "</parameter>";
++            return at.build_parser(ctx);
++        });
++    };
++
++    auto parse_with = [&](const std::string & input, common_chat_msg & msg) {
++        auto                    arena = build_arena();
++        common_peg_parse_context ctx(input);
++        auto                    result = arena.parse(ctx);
++        if (result.fail()) {
++            return false;
++        }
++        auto mapper = common_chat_peg_mapper(msg);
++        mapper.from_ast(ctx.ast, result);
++        return true;
++    };
++
++    const std::string head = "<tool_call>\n<function=write>\n";
++    const std::string pA   = "<parameter=path>\n/workspace/A.ts\n</parameter>\n";
++    const std::string pB   = "<parameter=path>\n/workspace/B.ts\n</parameter>\n";
++    const std::string c1   = "<parameter=content>\n/** body */\n</parameter>\n";
++    const std::string tail = "</function>\n</tool_call>";
++
++    // json is ordered_json here: compare objects key-by-key (the duplicate is
++    // re-emitted last, so key ORDER differs — irrelevant for tool arguments)
++    auto objects_equal = [](const json & a, const json & b) {
++        if (a.size() != b.size()) {
++            return false;
++        }
++        for (auto it = a.begin(); it != a.end(); ++it) {
++            if (!b.contains(it.key()) || b.at(it.key()) != it.value()) {
++                return false;
++            }
++        }
++        return true;
++    };
++
++    t.test("identical_duplicate", [&](testing & t) {
++        common_chat_msg clean, dup;
++        if (!t.assert_true("clean call parses", parse_with(head + pA + c1 + tail, clean))) {
++            return;
++        }
++        if (!t.assert_true("duplicate required param tolerated",
++                           parse_with(head + pA + c1 + pA + tail, dup))) {
++            return;
++        }
++        t.assert_equal("tool calls count", 1u, dup.tool_calls.size());
++        if (dup.tool_calls.empty() || clean.tool_calls.empty()) {
++            return;
++        }
++        try {
++            json args_dup   = json::parse(dup.tool_calls[0].arguments);
++            json args_clean = json::parse(clean.tool_calls[0].arguments);
++            // key ORDER may differ (the duplicate is re-emitted last): compare per key
++            t.assert_true("identical dup: args equal clean call (per key)", objects_equal(args_dup, args_clean));
++        } catch (const std::exception & e) {
++            t.assert_true(std::string("args must be valid JSON: ") + e.what(), false);
++        }
++    });
++
++    t.test("divergent_duplicate_last_wins", [&](testing & t) {
++        common_chat_msg control_b, dup;
++        if (!t.assert_true("clean call with last path parses", parse_with(head + pB + c1 + tail, control_b))) {
++            return;
++        }
++        if (!t.assert_true("divergent duplicate tolerated",
++                           parse_with(head + pA + c1 + pB + tail, dup))) {
++            return;
++        }
++        if (!t.assert_true("tool call present", !dup.tool_calls.empty()) ||
++            !t.assert_true("control tool call present", !control_b.tool_calls.empty())) {
++            return;
++        }
++        try {
++            json args_dup    = json::parse(dup.tool_calls[0].arguments);
++            json args_ctrl_b = json::parse(control_b.tool_calls[0].arguments);
++            t.assert_true("last value wins (dup args == clean call with the LAST path)",
++                          objects_equal(args_dup, args_ctrl_b));
++            t.assert_true("content preserved",
++                          args_dup.value("content", std::string()).find("/** body */") != std::string::npos);
++        } catch (const std::exception & e) {
++            t.assert_true(std::string("args must be valid JSON: ") + e.what(), false);
++        }
++    });
++
++    t.test("leniency_marker_logged", [&](testing & t) {
++        const std::string log_path = "/tmp/test-peg-leniency-marker.log";
++        std::remove(log_path.c_str());
++        common_log_set_file(common_log_main(), log_path.c_str());
++
++        common_chat_msg dup;
++        const bool parsed = parse_with(head + pA + c1 + pA + tail, dup);
++        common_log_flush(common_log_main());
++
++        std::ifstream        f(log_path);
++        std::string          logged((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++        t.assert_true("duplicate tolerated for marker test", parsed);
++        t.assert_true("leniency-hit marker logged", logged.find("leniency-hit") != std::string::npos);
++        t.assert_true("duplicated param named in marker", logged.find("path") != std::string::npos);
++    });
++}
+-- 
+2.53.0
+

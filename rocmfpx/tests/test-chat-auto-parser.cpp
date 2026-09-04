@@ -2,9 +2,11 @@
 #include "chat-auto-parser.h"
 #include "chat-peg-parser.h"
 #include "chat.h"
+#include "log.h"
 #include "peg-parser.h"
 #include "testing.h"
 
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -95,6 +97,9 @@ static void test_normalize_quotes_with_embedded_quotes(testing & t);
 // TAG_WITH_TAGGED argument parsing tests
 static void test_tagged_args_with_embedded_quotes(testing & t);
 
+// TAG_WITH_TAGGED leniency: duplicated required parameter (04/09 task 29340)
+static void test_tagged_duplicate_required_param(testing & t);
+
 int main(int argc, char * argv[]) {
     testing t(std::cout);
     t.verbose = true;
@@ -121,6 +126,7 @@ int main(int argc, char * argv[]) {
     t.test("standard_json_tools", test_standard_json_tools_formats);
     t.test("normalize_quotes_to_json", test_normalize_quotes_to_json);
     t.test("tagged_args_embedded_quotes", test_tagged_args_with_embedded_quotes);
+    t.test("tagged_duplicate_required_param", test_tagged_duplicate_required_param);
 
     return t.summary();
 }
@@ -2128,4 +2134,144 @@ static void test_tagged_args_with_embedded_quotes(testing & t) {
             t.assert_true(std::string("arguments should be valid JSON: ") + e.what(), false);
         }
     }
+}
+
+// peg-native leniency (pi_agent ack 04/09 11:00): a tagged tool call with a
+// DUPLICATED required parameter must parse instead of throwing "does not match
+// the expected peg-native format" (04/09 task 29340: write emitted
+// path, content, path). Semantics: last-wins, and the tolerated case must emit
+// a greppable "leniency-hit" warning so the model-behavior signal stays
+// observable.
+static void test_tagged_duplicate_required_param(testing & t) {
+    json tools = json::array({json{
+        {"type", "function"},
+        {"function", json{
+            {"name", "write"},
+            {"parameters", json{
+                {"type", "object"},
+                {"properties", json{
+                    {"path",    json{{"type", "string"}}},
+                    {"content", json{{"type", "string"}}},
+                }},
+                {"required", json::array({"path", "content"})},
+            }},
+        }},
+    }});
+
+    // Production grammar builder with the Qwen4exp-style tagged syntax
+    auto build_arena = [&]() {
+        return build_chat_peg_parser([&](common_chat_peg_builder & p) {
+            generation_params     inputs;
+            inputs.tools = tools;
+            parser_build_context ctx(p, inputs);
+
+            analyze_tools at;
+            at.format.mode            = tool_format::TAG_WITH_TAGGED;
+            at.format.per_call_start  = "<tool_call>";
+            at.format.per_call_end    = "</tool_call>";
+            at.function.name_prefix   = "<function=";
+            at.function.name_suffix   = ">";
+            at.function.close         = "</function>";
+            at.arguments.name_prefix  = "<parameter=";
+            at.arguments.name_suffix  = ">";
+            at.arguments.value_suffix = "</parameter>";
+            return at.build_parser(ctx);
+        });
+    };
+
+    auto parse_with = [&](const std::string & input, common_chat_msg & msg) {
+        auto                    arena = build_arena();
+        common_peg_parse_context ctx(input);
+        auto                    result = arena.parse(ctx);
+        if (result.fail()) {
+            return false;
+        }
+        auto mapper = common_chat_peg_mapper(msg);
+        mapper.from_ast(ctx.ast, result);
+        return true;
+    };
+
+    const std::string head = "<tool_call>\n<function=write>\n";
+    const std::string pA   = "<parameter=path>\n/workspace/A.ts\n</parameter>\n";
+    const std::string pB   = "<parameter=path>\n/workspace/B.ts\n</parameter>\n";
+    const std::string c1   = "<parameter=content>\n/** body */\n</parameter>\n";
+    const std::string tail = "</function>\n</tool_call>";
+
+    // json is ordered_json here: compare objects key-by-key (the duplicate is
+    // re-emitted last, so key ORDER differs — irrelevant for tool arguments)
+    auto objects_equal = [](const json & a, const json & b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (auto it = a.begin(); it != a.end(); ++it) {
+            if (!b.contains(it.key()) || b.at(it.key()) != it.value()) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    t.test("identical_duplicate", [&](testing & t) {
+        common_chat_msg clean, dup;
+        if (!t.assert_true("clean call parses", parse_with(head + pA + c1 + tail, clean))) {
+            return;
+        }
+        if (!t.assert_true("duplicate required param tolerated",
+                           parse_with(head + pA + c1 + pA + tail, dup))) {
+            return;
+        }
+        t.assert_equal("tool calls count", 1u, dup.tool_calls.size());
+        if (dup.tool_calls.empty() || clean.tool_calls.empty()) {
+            return;
+        }
+        try {
+            json args_dup   = json::parse(dup.tool_calls[0].arguments);
+            json args_clean = json::parse(clean.tool_calls[0].arguments);
+            // key ORDER may differ (the duplicate is re-emitted last): compare per key
+            t.assert_true("identical dup: args equal clean call (per key)", objects_equal(args_dup, args_clean));
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("args must be valid JSON: ") + e.what(), false);
+        }
+    });
+
+    t.test("divergent_duplicate_last_wins", [&](testing & t) {
+        common_chat_msg control_b, dup;
+        if (!t.assert_true("clean call with last path parses", parse_with(head + pB + c1 + tail, control_b))) {
+            return;
+        }
+        if (!t.assert_true("divergent duplicate tolerated",
+                           parse_with(head + pA + c1 + pB + tail, dup))) {
+            return;
+        }
+        if (!t.assert_true("tool call present", !dup.tool_calls.empty()) ||
+            !t.assert_true("control tool call present", !control_b.tool_calls.empty())) {
+            return;
+        }
+        try {
+            json args_dup    = json::parse(dup.tool_calls[0].arguments);
+            json args_ctrl_b = json::parse(control_b.tool_calls[0].arguments);
+            t.assert_true("last value wins (dup args == clean call with the LAST path)",
+                          objects_equal(args_dup, args_ctrl_b));
+            t.assert_true("content preserved",
+                          args_dup.value("content", std::string()).find("/** body */") != std::string::npos);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("args must be valid JSON: ") + e.what(), false);
+        }
+    });
+
+    t.test("leniency_marker_logged", [&](testing & t) {
+        const std::string log_path = "/tmp/test-peg-leniency-marker.log";
+        std::remove(log_path.c_str());
+        common_log_set_file(common_log_main(), log_path.c_str());
+
+        common_chat_msg dup;
+        const bool parsed = parse_with(head + pA + c1 + pA + tail, dup);
+        common_log_flush(common_log_main());
+
+        std::ifstream        f(log_path);
+        std::string          logged((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        t.assert_true("duplicate tolerated for marker test", parsed);
+        t.assert_true("leniency-hit marker logged", logged.find("leniency-hit") != std::string::npos);
+        t.assert_true("duplicated param named in marker", logged.find("path") != std::string::npos);
+    });
 }

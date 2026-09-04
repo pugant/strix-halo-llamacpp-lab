@@ -3,8 +3,8 @@
 #include "chat.h"
 #include "peg-parser.h"
 
-#include <map>
 #include <optional>
+#include <utility>
 #include <vector>
 
 class common_chat_peg_mapper {
@@ -26,6 +26,7 @@ class common_chat_peg_mapper {
       int                                  arg_count             = 0;
       bool                                 closing_quote_pending = false;
       std::string                          args_buffer;  // Buffer to delay arguments until tool name is known
+      std::vector<std::pair<size_t, std::string>> arg_pair_pos;  // emitted pairs (start offset, name), for last-wins on duplicates
 
       // Returns a reference to the active argument destination string.
       // Before tool_name is known, writes go to args_buffer; after, to current_tool->arguments.

@@ -178,6 +178,42 @@ byte 2: v2[5:4] | v3[5:0]<<2
 | Python/shell syntax checks | passed |
 | DiffusionGemma BF16 → ROCmFP4 coherent agent quant | passed, `13,764.94 MiB / 4.57 BPW` |
 
+## Session 003 — 2026-09-04
+
+**Scope:** peg-native tagged tool calls rejected a duplicated required parameter, throwing away whole generations; made the grammar lenient (any arg may repeat after the required sequence) and the mapper duplicate-aware (last-wins + logged marker).
+
+### `common/chat-auto-parser-generator.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|-------|
+| Grammar leniency | 411-428 | The trailing repeat after the required-arg sequence now admits ANY arg (required included), not just optionals. A model re-emitting a required parameter at the end of a long generation (write emitted `path`, `content`, `path`) previously failed the whole tool-call rule. |
+
+### `common/chat-peg-parser.h`
+
+| Fix | Line(s) | Detail |
+|-----|---------|-------|
+| Mapper state | 29 | New `arg_pair_pos` (emitted pairs: start offset + name) to detect and resolve duplicate args; reset per tool open. |
+
+### `common/chat-peg-parser.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|-------|
+| Last-wins on duplicates | 348-395 | `is_arg_name` (marker at :366): a duplicate name logs `peg-native: leniency-hit: duplicate param '<name>' tolerated (last-wins)` and surgically removes the previous pair (other keys and their order preserved; leading-comma cleanup when the first pair is removed). Previously a duplicate produced a JSON string with a duplicate key (for grammar-allowed optional repeats) or a hard parse failure (required repeats). |
+
+### `tests/test-chat-auto-parser.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|-------|
+| Regression test | 2145+ | `tagged_duplicate_required_param`: drives the production builder `build_tool_parser_tag_tagged` with the Qwen-style tagged syntax — identical duplicate parses to the same args as the clean call; divergent duplicate resolves last-wins (equal to a clean call carrying the last value); the marker is asserted via a captured log file. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| `test-chat-auto-parser` | 71 tests / 420 assertions / 0 failures (includes the new test, RED before the fix) |
+| `test-chat-peg-parser` | 32 tests / 198 assertions / 0 failures |
+| Deploy smoke (production image) | pending at log time — image `qwen4exp-mtp-vk-optim3` in build; result recorded in the lab's deploy plan `2026-09-04-peg-lenient-dup-args-deploy-optim3.md` |
+
 <!-- TEMPLATE FOR FUTURE AI SESSIONS:
 
 ## Session NNN — YYYY-MM-DD
