@@ -23,9 +23,9 @@ As of 2026-09-03.
 ### Unified memory kernel parameters
 
 Out of the box the amdgpu driver caps GPU-addressable memory well below what this
-machine physically has. Every number this lab publishes assumes the following
-kernel parameters, set in `/etc/default/grub` (`GRUB_CMDLINE_LINUX_DEFAULT`) on
-2026-08-30 and active since:
+machine physically has. Every number measured since 2026-08-30 assumes the
+following kernel parameters, set in `/etc/default/grub`
+(`GRUB_CMDLINE_LINUX_DEFAULT`) and active since:
 
 | Parameter | Value | Effect |
 |---|---|---|
@@ -41,7 +41,7 @@ runtime:
 
 ```console
 $ cat /sys/class/drm/card*/device/mem_info_gtt_total
-124.0 GiB   ← measured 2026-09-04
+133143986176   ← 124.0 GiB, measured 2026-09-04
 ```
 
 Settings of this kind are documented in:
