@@ -14,7 +14,7 @@ end-token logit. Per-request via reasoning_pressure_* keys. clone()
 now carries the full sampler state (fixes latent force_pos/remaining/
 matcher-pos gaps). Spec: docs/superpowers/specs/2026-08-17-reasoning-pressure-design.md
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  common/arg.cpp                  |  31 ++++++
  common/common.h                 |   6 +

@@ -8,7 +8,7 @@ Pure observation, env-gated. Logs per verify row: draft/argmax/sampled
 token, p_target(draft_tok) and target entropy from the full softmax.
 For the typical-acceptance feasibility study (filone 2, passo 0).
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  common/sampling.cpp | 58 +++++++++++++++++++++++++++++++++++++++++++++
  1 file changed, 58 insertions(+)

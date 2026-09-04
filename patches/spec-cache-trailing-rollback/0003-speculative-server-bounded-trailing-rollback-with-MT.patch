@@ -18,7 +18,7 @@ kept position via the ring and reprocess only the remaining tokens.
 Entries whose divergence exceeds the RS snapshot bound or the ring keep
 falling back to cold reprocessing as before.
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  common/common.cpp               |   7 --
  common/common.h                 |   4 -

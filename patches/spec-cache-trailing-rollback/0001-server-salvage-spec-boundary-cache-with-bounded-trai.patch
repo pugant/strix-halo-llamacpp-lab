@@ -21,7 +21,7 @@ server_prompt_cache::load() now also accepts entries with a shorter
 common prefix when both contexts support trailing removal and the delta
 fits the RS snapshot bound.
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  tools/server/server-context.cpp | 54 ++++++++++++++++++++++++++-------
  tools/server/server-task.cpp    | 36 ++++++++++++++++++----

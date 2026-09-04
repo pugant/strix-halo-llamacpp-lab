@@ -12,7 +12,7 @@ matching hard cap and the server default always applied.
 Fall back to the vLLM name before the server default. Exact name and
 default behavior unchanged.
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  tools/server/server-common.cpp | 5 +++++
  1 file changed, 5 insertions(+)

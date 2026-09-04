@@ -337,7 +337,7 @@ Initialize it to COMMON_SPECULATIVE_TYPE_NONE (pre-routing behavior:
 every implementation eligible to draft) in server-context.cpp and
 speculative-simple.cpp.
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  examples/speculative-simple/speculative-simple.cpp | 4 ++++
  tools/server/server-context.cpp                    | 4 ++++
@@ -383,7 +383,7 @@ Date: Wed, 19 Aug 2026 14:51:36 +0200
 Subject: [PATCH 03/14] server: dual draft contexts (MTP nextn + external
  DFlash) and both-ctx trim
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  tools/server/server-context.cpp | 92 ++++++++++++++++++++++++---------
  1 file changed, 67 insertions(+), 25 deletions(-)
@@ -919,7 +919,7 @@ Date: Wed, 19 Aug 2026 17:09:39 +0200
 Subject: [PATCH 05/14] server: drafter-tagged prompt cache, boot fallback,
  spec-route logging and metrics
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  common/common.cpp               |   5 +
  common/common.h                 |   6 +

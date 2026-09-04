@@ -14,7 +14,7 @@ boundary, cascading into a cold fallback (spec-boundary-mismatch).
 Include the leading '\n' in the forced sequence in both the server and
 CLI call sites so the emitted text matches the re-rendered template.
 
-Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: GLM by z.ai <glm@z.ai>
 ---
  tools/cli/cli.cpp            | 5 ++++-
  tools/server/server-task.cpp | 6 +++++-
