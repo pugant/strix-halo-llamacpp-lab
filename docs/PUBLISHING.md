@@ -16,8 +16,8 @@ Reusable checklist for every feature release of this lab. Three blocks, in order
       `*Measured on the lab's [bare-metal Strix Halo](../../BARE-METAL.md), configuration as of the note's date.*`
       (render-check the footer link). Machine config changes → update `BARE-METAL.md`
       (Current + changelog row) in the same push.
-- [ ] Push GitHub (`git push origin main`) AND the Gitea mirror
-      (`git -c credential.helper=store push gitea main`) in the same step.
+- [ ] Push GitHub (`git push origin main`) and the private mirror in the
+      same step.
 
 ## 2. Model cards (Hugging Face)
 
@@ -45,9 +45,11 @@ Reusable checklist for every feature release of this lab. Three blocks, in order
 
 ## 3. Cross-checks (final)
 
-- [ ] Sensitive-pattern gate on the tree and on every card diff (grep must return nothing):
-      `grep -rInE 'bosgame|192\.168\.|hf_[A-Za-z0-9]{20}|ghp_|github_pat_|:8193|:8195|:8081' .`
-      (known benign exceptions: upstream `rocmfpx/` vendored docs, `localhost:1234` examples).
+- [ ] Sensitive-pattern gate on the tree and on every card diff — grep for the
+      lab's internal pattern list (old hostnames, LAN ranges, token prefixes,
+      internal service ports). The list lives in the lab's local runbook, not in
+      this repo. The gate must return nothing (known benign exceptions: upstream
+      `rocmfpx/` vendored docs, `localhost:1234` examples).
 - [ ] Bidirectional links: card → lab `main`; lab engine table → cards; guides.
 - [ ] Sensitive scan of every diff: no home paths, internal ports, private names.
 - [ ] Two-stage review (numbers-vs-sources, then EN pass).
