@@ -17,8 +17,38 @@ As of 2026-09-03.
 | ROCm | 7.2.4 (HIP backend) |
 | Docker | server 29.7.2 |
 | Power profile | balanced (never forced to performance during measurements) |
-| UMA / VRAM | VRAM partition 512 MB; HIP inference requires `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` (source: nemotron note) |
+| UMA / VRAM | VRAM partition 512 MB; HIP inference requires `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` (source: nemotron note); GPU-addressable unified memory via kernel parameters — see [below](#unified-memory-kernel-parameters) |
 | Clock behavior | sustained ~2220 MHz plateau under decode load (source: `docs/experiments/vulkan-nommap-backend.md`) |
+
+### Unified memory kernel parameters
+
+Out of the box the amdgpu driver caps GPU-addressable memory well below what this
+machine physically has. Every number this lab publishes assumes the following
+kernel parameters, set in `/etc/default/grub` (`GRUB_CMDLINE_LINUX_DEFAULT`) on
+2026-08-30 and active since:
+
+| Parameter | Value | Effect |
+|---|---|---|
+| `amdgpu.gttsize` | `126976` | GTT size in MB — 124 GiB of unified memory GPU-addressable |
+| `ttm.pages_limit` | `32505856` | TTM page limit (× 4 KiB ≈ 124 GiB) |
+| `ttm.page_pool_size` | `32505856` | TTM page pool (× 4 KiB ≈ 124 GiB) |
+| `amd_iommu` | `off` | IOMMU off — part of the toolboxes' recommended baseline for these workloads |
+| `amdgpu.lockup_timeout` | `60000` | GPU lockup timeout raised to 60 s |
+| `amdgpu.timeout_fatal_disable` | `1` | GPU timeouts do not escalate to fatal resets |
+
+To apply: edit `/etc/default/grub`, run `sudo update-grub`, reboot. Verify at
+runtime:
+
+```console
+$ cat /sys/class/drm/card*/device/mem_info_gtt_total
+124.0 GiB   ← measured 2026-09-04
+```
+
+Settings of this kind are documented in:
+- Donato Capitella's Strix Halo configuration video — <https://www.youtube.com/watch?v=sMacAPpgXhQ>
+- Strix Halo toolboxes — <https://strix-halo-toolboxes.com/>
+- Frame.work community guide (Fedora 42) — <https://community.frame.work/t/amd-strix-halo-llama-cpp-installation-guide-for-fedora-42/75856>
+- kyuz0/amd-strix-halo-llm-finetuning — <https://github.com/kyuz0/amd-strix-halo-llm-finetuning>
 
 ## How every number in this lab is measured
 
@@ -37,6 +67,7 @@ As of 2026-09-03.
 | 2026-08-12 | Power profile `balanced` observed (not forced) | `docs/experiments/results-2026-08-12-publish.md` |
 | 2026-08-22 | Kernel 7.0.0-30-generic installed via apt | system apt history (`/var/log/apt/history.log.1.gz`) |
 | 2026-08-29 | Production switched to Vulkan + `--no-mmap` + KV q8_0 | `docs/experiments/vulkan-nommap-backend.md` |
+| 2026-08-30 | Unified-memory kernel parameters applied (`amdgpu.gttsize=126976`, TTM limits) — GTT 124 GiB verified at runtime | `/etc/default/grub`; `mem_info_gtt_total` |
 
 OS/point-release history predates the lab's notes; the kernel row reflects the package
 install dates, not first boot.
