@@ -1,0 +1,544 @@
+From 1ae8e7a60eeef2f6c6a47061562f525338def64b Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sat, 5 Sep 2026 09:06:20 +0200
+Subject: [PATCH 1/2] common: accept out-of-order tool-call params in tagged
+ peg-native grammar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The 04/09 leniency only tolerated duplicates AFTER the required sequence;
+a model emitting required parameters OUT OF SCHEMA ORDER still killed the
+whole tool call (05/09 task 190228, 21:17:56Z: write emitted content then
+path — turn lost, 109.7s re-prefill to resume).
+
+The PEG star is possessive, so "each required at least once, in any order"
+cannot be expressed in the grammar:
+
+- grammar: the required-in-schema-order sequence becomes a repeat of ANY
+  parameter (any order, any count; duplicates already resolve last-wins)
+- required-ness moves to a post-parse completeness check in
+  common_chat_peg_parse, keyed by a new arena sidecar (tool_required_args)
+  that survives save/load — the server ships the parser as a string
+  (optional "tool_required" JSON field; empty sidecar serializes identical
+  to before, previously saved arenas stay loadable)
+- a missing required param still rejects the call with the same
+  "does not match the expected peg-native format" error as before, now
+  with an observable marker "rejected: required param '<name>' missing"
+  (parity with the strict sequence this replaces)
+- unknown parameter names still fail the grammar (05/09 task 181152:
+  write with <parameter=command>) — that remains a hard failure
+
+Test: tagged_reordered_required_params (reversed order, optional before
+required, reorder+duplicate last-wins, missing-required rejection with
+marker, sidecar save/load roundtrip, autoparser wiring via the real Hy3
+template — verified RED with the population disabled). Suites green:
+test-chat-auto-parser 78/441, test-chat-peg-parser 32/198.
+NOT deployed: prepared only, joint test live on optim3.
+
+Co-Authored-By: GLM by z.ai <noreply@z.ai>
+---
+ AI_CHANGES.md                         |  43 +++++
+ common/chat-auto-parser-generator.cpp |  45 +++--
+ common/chat.cpp                       |  30 ++++
+ common/peg-parser.cpp                 |  24 ++-
+ common/peg-parser.h                   |  10 ++
+ tests/test-chat-auto-parser.cpp       | 230 ++++++++++++++++++++++++++
+ 6 files changed, 365 insertions(+), 17 deletions(-)
+
+diff --git a/AI_CHANGES.md b/AI_CHANGES.md
+index 852d3cc51..f237232f4 100644
+--- a/AI_CHANGES.md
++++ b/AI_CHANGES.md
+@@ -214,6 +214,49 @@ byte 2: v2[5:4] | v3[5:0]<<2
+ | `test-chat-peg-parser` | 32 tests / 198 assertions / 0 failures |
+ | Deploy smoke (production image) | pending at log time — image `qwen4exp-mtp-vk-optim3` in build; result recorded in the lab's deploy plan `2026-09-04-peg-lenient-dup-args-deploy-optim3.md` |
+ 
++## Session 004 — 2026-09-05
++
++**Scope:** peg-native tagged tool calls also failed when required parameters arrived out of schema order (05/09 task 190228: write emitted `content`, `path`); made the tagged grammar order-free and moved required-ness to a post-parse completeness check keyed by a serialized arena sidecar. Unknown parameter names still fail the grammar (05/09 task 181152: write with `<parameter=command>`).
++
++### `common/peg-parser.h`
++
++| Fix | Line(s) | Detail |
++|-----|---------|--------|
++| Arena sidecar | 310-316 | New public `tool_required_args` (tool name → required param names). The order-free grammar cannot express "each required at least once" (the PEG star is possessive), so required-ness travels with the parser arena instead. |
++
++### `common/peg-parser.cpp`
++
++| Fix | Line(s) | Detail |
++|-----|---------|--------|
++| Sidecar serialization | to_json/from_json | Optional `tool_required` field: emitted only when non-empty (arenas without it serialize byte-identical to before); read back if present (previously saved arenas stay loadable). Needed because the server ships the parser between threads as a string (`server-task.cpp` `parser.load(...)`). |
++
++### `common/chat-auto-parser-generator.cpp`
++
++| Fix | Line(s) | Detail |
++|-----|---------|--------|
++| Order-free grammar | 402-421 | The required-in-schema-order arg sequence is gone; args are a repeat of ANY parameter in any order/number. Required-ness is enforced post-parse instead (see chat.cpp). Unknown names still match no rule, so garbage params still fail the whole tool call. |
++| Sidecar population | build_parser | After building the arena, tools in TAG_WITH_TAGGED mode get their required params recorded on `arena.tool_required_args` (same gating as the tool grammar itself). |
++
++### `common/chat.cpp`
++
++| Fix | Line(s) | Detail |
++|-----|---------|--------|
++| Completeness check | common_chat_peg_parse | After mapping (non-partial only): a tool call missing a required param logs `common_chat_peg_parse: rejected: required param '<name>' missing for tool '<tool>' (order-free leniency)` and throws the same "does not match the expected ... format" error the strict grammar used to raise — behavior parity for genuinely incomplete calls. |
++
++### `tests/test-chat-auto-parser.cpp`
++
++| Fix | Line(s) | Detail |
++|-----|---------|--------|
++| Regression test | tagged_reordered_required_params | Reversed required order parses to the same args as the clean call; optional-before-required parses; reorder+duplicate resolves last-wins; missing required still rejected with the logged marker; sidecar survives save/load; autoparser populates the sidecar through the real Hy3 template (wiring verified RED with the population disabled). |
++
++### Validation
++
++| Check | Result |
++|-------|--------|
++| `test-chat-auto-parser` | 78 tests / 441 assertions / 0 failures (new test RED before the fix: 5 sub-tests failing) |
++| `test-chat-peg-parser` | 32 tests / 198 assertions / 0 failures |
++| Deploy | NOT deployed — prepared only; the joint π test is live on `qwen4exp-mtp-vk-optim3` and a restart would cost the running session a ~20 min cold re-prefill |
++
+ <!-- TEMPLATE FOR FUTURE AI SESSIONS:
+ 
+ ## Session NNN — YYYY-MM-DD
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index 7d587677a..ac14a314f 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -98,7 +98,7 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs) cons
+     if (!analysis_complete) {
+         throw std::invalid_argument("Cannot call build_parser on autoparser without performing analysis first, call analyze_template(...)");
+     }
+-    return build_chat_peg_parser([&](common_chat_peg_builder & p) {
++    common_peg_arena arena = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+         parser_build_context ctx(p, inputs);
+         bool                 extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+ 
+@@ -130,6 +130,25 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs) cons
+         }
+         return pure_content ? p.prefix(inputs.generation_prompt, reasoning.start) + parser : p.prefix(inputs.generation_prompt, reasoning.start) << parser;
+     });
++
++    // Order-free tagged grammar (05/09): record each tool's required params so
++    // common_chat_peg_parse can enforce them post-parse — the grammar accepts
++    // any order and cannot express "each required at least once" itself.
++    if (tools.format.mode == tool_format::TAG_WITH_TAGGED && inputs.tools.is_array() && !inputs.tools.empty() &&
++        inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && jinja_caps.supports_tool_calls) {
++        foreach_function(inputs.tools, [&](const json & tool) {
++            const auto & func   = tool.at("function");
++            const auto & params = func.contains("parameters") ? func.at("parameters") : json::object();
++            std::set<std::string> required;
++            if (params.contains("required")) {
++                params.at("required").get_to(required);
++            }
++            if (!required.empty()) {
++                arena.tool_required_args[func.at("name")] = std::move(required);
++            }
++        });
++    }
++    return arena;
+ }
+ 
+ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) const {
+@@ -399,22 +418,16 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+             }
+         }
+ 
+-        // Build required arg sequence in definition order
++        // Order-free leniency (05/09 task 190228): accept parameters in ANY
++        // order and number — a model may emit required args out of schema order
++        // (04→05/09 night: write emitted content, path at 21:17:56Z; the old
++        // required-in-schema-order sequence rejected the whole tool call and
++        // the server threw the generation away). Duplicates resolve last-wins
++        // in the mapper (pi_agent ack 04/09).
++        // The PEG star is possessive, so "each required at least once" cannot
++        // be expressed grammatically: required-ness is enforced post-parse in
++        // common_chat_peg_parse, keyed by arena.tool_required_args.
+         common_peg_parser args_seq = p.eps();
+-        for (size_t i = 0; i < required_parsers.size(); i++) {
+-            if (i > 0) {
+-                args_seq = args_seq + p.space();
+-            }
+-            args_seq = args_seq + required_parsers[i];
+-        }
+-
+-        // Leniency (pi_agent ack 04/09): after the required sequence, tolerate
+-        // ANY arg repeated in any order — a model may re-emit a required
+-        // parameter at the end of a long generation (04/09 task 29340: write
+-        // emitted path, content, path). The mapper resolves duplicates
+-        // last-wins and logs a marker; rejecting the whole tool call instead
+-        // would throw away the generation ("does not match the expected
+-        // peg-native format").
+         if (!required_parsers.empty() || !optional_parsers.empty()) {
+             common_peg_parser any_arg = p.choice();
+             for (const auto & req : required_parsers) {
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 58a193f77..9d499a20d 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -2428,6 +2428,36 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+     }
+     mapper->from_ast(ctx.ast, result);
+ 
++    // Order-free tagged grammar (05/09): the grammar accepts parameters in any
++    // order, so a tool call that OMITTED a required parameter parses fine —
++    // reject it here exactly like a grammar failure would (parity with the
++    // strict in-order sequence this leniency replaced). Keyed by the arena
++    // sidecar, which survives the save/load hop the server makes.
++    if (!is_partial && !parser.tool_required_args.empty()) {
++        for (const auto & tool_call : msg.tool_calls) {
++            const auto required_it = parser.tool_required_args.find(tool_call.name);
++            if (required_it == parser.tool_required_args.end()) {
++                continue;
++            }
++            json args = json::object();
++            if (!tool_call.arguments.empty()) {
++                try {
++                    args = json::parse(tool_call.arguments);
++                } catch (const std::exception &) {
++                    args = json::object();
++                }
++            }
++            for (const auto & required : required_it->second) {
++                if (!args.contains(required)) {
++                    LOG_WRN("%s: rejected: required param '%s' missing for tool '%s' (order-free leniency)\n", __func__,
++                            required.c_str(), tool_call.name.c_str());
++                    throw std::runtime_error(std::string("The model produced output that does not match the expected ") +
++                                             common_chat_format_name(params.format) + " format");
++                }
++            }
++        }
++    }
++
+     if (ctx.is_debug()) {
+         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());
+         fflush(stderr);
+diff --git a/common/peg-parser.cpp b/common/peg-parser.cpp
+index d4b491a80..bbec51e19 100644
+--- a/common/peg-parser.cpp
++++ b/common/peg-parser.cpp
+@@ -1927,11 +1927,20 @@ nlohmann::json common_peg_arena::to_json() const {
+     for (const auto & parser : parsers_) {
+         parsers.push_back(serialize_parser_variant(parser));
+     }
+-    return nlohmann::json{
++    auto j = nlohmann::json{
+         {"parsers", parsers},
+         {"rules", rules_},
+         {"root", root_}
+     };
++    // Optional so arenas without the sidecar serialize byte-identical to before
++    if (!tool_required_args.empty()) {
++        auto required = nlohmann::json::object();
++        for (const auto & [tool, params] : tool_required_args) {
++            required[tool] = params;
++        }
++        j["tool_required"] = required;
++    }
++    return j;
+ }
+ 
+ static common_peg_parser_variant deserialize_parser_variant(const nlohmann::json & j) {
+@@ -2125,6 +2134,19 @@ common_peg_arena common_peg_arena::from_json(const nlohmann::json & j) {
+         throw std::runtime_error("Root references invalid parser ID: " + std::to_string(arena.root_));
+     }
+ 
++    // Optional for backward compatibility with previously saved arenas
++    if (j.contains("tool_required") && j["tool_required"].is_object()) {
++        for (auto it = j["tool_required"].begin(); it != j["tool_required"].end(); ++it) {
++            std::set<std::string> params;
++            if (it.value().is_array()) {
++                for (const auto & name : it.value()) {
++                    params.insert(name.get<std::string>());
++                }
++            }
++            arena.tool_required_args[it.key()] = std::move(params);
++        }
++    }
++
+     return arena;
+ }
+ 
+diff --git a/common/peg-parser.h b/common/peg-parser.h
+index b6bb05214..9ecdada0b 100644
+--- a/common/peg-parser.h
++++ b/common/peg-parser.h
+@@ -2,7 +2,9 @@
+ 
+ #include <nlohmann/json_fwd.hpp>
+ 
++#include <map>
+ #include <memory>
++#include <set>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <string>
+@@ -305,6 +307,14 @@ class common_peg_arena {
+     common_peg_parser_id root_ = COMMON_PEG_INVALID_PARSER_ID;
+ 
+   public:
++    // Required-arg sidecar for chat tool calls: the tagged grammar accepts
++    // parameters in any order, so required-ness cannot be expressed in the
++    // grammar itself — common_chat_peg_parse checks it post-parse, keyed by
++    // this map (tool name -> required param names). Serialized as an optional
++    // "tool_required" field so it survives save/load (the server ships the
++    // parser between threads as a string).
++    std::map<std::string, std::set<std::string>> tool_required_args;
++
+     const common_peg_parser_variant & get(common_peg_parser_id id) const { return parsers_.at(id); }
+     common_peg_parser_variant & get(common_peg_parser_id id) { return parsers_.at(id); }
+ 
+diff --git a/tests/test-chat-auto-parser.cpp b/tests/test-chat-auto-parser.cpp
+index dec01c6a6..4dd542d7d 100644
+--- a/tests/test-chat-auto-parser.cpp
++++ b/tests/test-chat-auto-parser.cpp
+@@ -100,6 +100,10 @@ static void test_tagged_args_with_embedded_quotes(testing & t);
+ // TAG_WITH_TAGGED leniency: duplicated required parameter (04/09 task 29340)
+ static void test_tagged_duplicate_required_param(testing & t);
+ 
++// TAG_WITH_TAGGED leniency: required parameters emitted out of schema order
++// (05/09 task 190228)
++static void test_tagged_reordered_required_params(testing & t);
++
+ int main(int argc, char * argv[]) {
+     testing t(std::cout);
+     t.verbose = true;
+@@ -127,6 +131,7 @@ int main(int argc, char * argv[]) {
+     t.test("normalize_quotes_to_json", test_normalize_quotes_to_json);
+     t.test("tagged_args_embedded_quotes", test_tagged_args_with_embedded_quotes);
+     t.test("tagged_duplicate_required_param", test_tagged_duplicate_required_param);
++    t.test("tagged_reordered_required_params", test_tagged_reordered_required_params);
+ 
+     return t.summary();
+ }
+@@ -2275,3 +2280,228 @@ static void test_tagged_duplicate_required_param(testing & t) {
+         t.assert_true("duplicated param named in marker", logged.find("path") != std::string::npos);
+     });
+ }
++
++// peg-native order-free leniency (05/09 task 190228): a tagged tool call whose
++// required parameters are emitted OUT OF SCHEMA ORDER must parse instead of
++// throwing "does not match the expected peg-native format" (04→05/09 night:
++// write emitted content, path at 21:17:56Z — turn lost + 109.7s re-prefill).
++// The PEG star is possessive, so "each required at least once, in any order"
++// cannot be expressed in the grammar: required-ness moves to a post-parse
++// completeness check in common_chat_peg_parse, keyed by an arena sidecar that
++// must survive save/load (the server ships the parser as a string).
++static void test_tagged_reordered_required_params(testing & t) {
++    json tools = json::array({
++        json{
++            {"type", "function"},
++            {"function", json{
++                {"name", "write"},
++                {"parameters", json{
++                    {"type", "object"},
++                    {"properties", json{
++                        {"path",    json{{"type", "string"}}},
++                        {"content", json{{"type", "string"}}},
++                    }},
++                    {"required", json::array({"path", "content"})},
++                }},
++            }},
++        },
++        json{
++            {"type", "function"},
++            {"function", json{
++                {"name", "read"},
++                {"parameters", json{
++                    {"type", "object"},
++                    {"properties", json{
++                        {"path",   json{{"type", "string"}}},
++                        {"offset", json{{"type", "integer"}}},
++                        {"limit",  json{{"type", "integer"}}},
++                    }},
++                    {"required", json::array({"path"})},
++                }},
++            }},
++        },
++    });
++
++    // Production grammar builder with the Qwen4exp-style tagged syntax
++    auto build_arena = [&]() {
++        return build_chat_peg_parser([&](common_chat_peg_builder & p) {
++            generation_params     inputs;
++            inputs.tools = tools;
++            parser_build_context ctx(p, inputs);
++
++            analyze_tools at;
++            at.format.mode            = tool_format::TAG_WITH_TAGGED;
++            at.format.per_call_start  = "<tool_call>";
++            at.format.per_call_end    = "</tool_call>";
++            at.function.name_prefix   = "<function=";
++            at.function.name_suffix   = ">";
++            at.function.close         = "</function>";
++            at.arguments.name_prefix  = "<parameter=";
++            at.arguments.name_suffix  = ">";
++            at.arguments.value_suffix = "</parameter>";
++            return at.build_parser(ctx);
++        });
++    };
++
++    auto parse_with = [&](const std::string & input, common_chat_msg & msg) {
++        auto                    arena = build_arena();
++        common_peg_parse_context ctx(input);
++        auto                    result = arena.parse(ctx);
++        if (result.fail()) {
++            return false;
++        }
++        auto mapper = common_chat_peg_mapper(msg);
++        mapper.from_ast(ctx.ast, result);
++        return true;
++    };
++
++    const std::string w_head     = "<tool_call>\n<function=write>\n";
++    const std::string w_tail     = "</function>\n</tool_call>";
++    const std::string w_path     = "<parameter=path>\n/workspace/A.ts\n</parameter>\n";
++    const std::string w_content1 = "<parameter=content>\n/** body v1 */\n</parameter>\n";
++    const std::string w_content2 = "<parameter=content>\n/** body v2 */\n</parameter>\n";
++
++    // json is ordered_json here: compare objects key-by-key (out-of-order
++    // emission changes key ORDER — irrelevant for tool arguments)
++    auto objects_equal = [](const json & a, const json & b) {
++        if (a.size() != b.size()) {
++            return false;
++        }
++        for (auto it = a.begin(); it != a.end(); ++it) {
++            if (!b.contains(it.key()) || b.at(it.key()) != it.value()) {
++                return false;
++            }
++        }
++        return true;
++    };
++
++    t.test("reordered_required", [&](testing & t) {
++        common_chat_msg clean, rev;
++        if (!t.assert_true("clean call parses (schema order)", parse_with(w_head + w_path + w_content1 + w_tail, clean))) {
++            return;
++        }
++        if (!t.assert_true("reversed required order tolerated (content, path — 05/09 task 190228)",
++                           parse_with(w_head + w_content1 + w_path + w_tail, rev))) {
++            return;
++        }
++        t.assert_equal("tool calls count", 1u, rev.tool_calls.size());
++        if (rev.tool_calls.empty() || clean.tool_calls.empty()) {
++            return;
++        }
++        try {
++            json args_rev   = json::parse(rev.tool_calls[0].arguments);
++            json args_clean = json::parse(clean.tool_calls[0].arguments);
++            t.assert_true("reordered args equal clean call (per key)", objects_equal(args_rev, args_clean));
++        } catch (const std::exception & e) {
++            t.assert_true(std::string("args must be valid JSON: ") + e.what(), false);
++        }
++    });
++
++    t.test("optional_before_required", [&](testing & t) {
++        const std::string r_head = "<tool_call>\n<function=read>\n";
++        const std::string r_tail = "</function>\n</tool_call>";
++        common_chat_msg   msg;
++        if (!t.assert_true("optional args before required tolerated (offset, path, limit)",
++                           parse_with(r_head + "<parameter=offset>10</parameter>\n<parameter=path>\n/a.ts\n</parameter>\n<parameter=limit>5</parameter>\n" + r_tail, msg))) {
++            return;
++        }
++        t.assert_equal("tool calls count", 1u, msg.tool_calls.size());
++        if (msg.tool_calls.empty()) {
++            return;
++        }
++        try {
++            json args = json::parse(msg.tool_calls[0].arguments);
++            // string values keep their surrounding newlines (until-based capture,
++            // pre-existing mapper behavior) — assert by containment, not equality
++            t.assert_true("path parsed", args.value("path", std::string()).find("/a.ts") != std::string::npos);
++            t.assert_true("offset parsed", args.value("offset", 0) == 10);
++            t.assert_true("limit parsed", args.value("limit", 0) == 5);
++        } catch (const std::exception & e) {
++            t.assert_true(std::string("args must be valid JSON: ") + e.what(), false);
++        }
++    });
++
++    t.test("reorder_plus_duplicate", [&](testing & t) {
++        common_chat_msg msg;
++        if (!t.assert_true("reorder with duplicate content tolerated (content, path, content)",
++                           parse_with(w_head + w_content1 + w_path + w_content2 + w_tail, msg))) {
++            return;
++        }
++        if (msg.tool_calls.empty()) {
++            return;
++        }
++        try {
++            json args = json::parse(msg.tool_calls[0].arguments);
++            t.assert_true("last content wins", args.value("content", std::string()).find("v2") != std::string::npos);
++            t.assert_true("path preserved", args.value("path", std::string()).find("/workspace/A.ts") != std::string::npos);
++        } catch (const std::exception & e) {
++            t.assert_true(std::string("args must be valid JSON: ") + e.what(), false);
++        }
++    });
++
++    t.test("missing_required_still_rejected", [&](testing & t) {
++        auto arena = build_arena();
++        arena.tool_required_args = {{"write", {"path", "content"}}, {"read", {"path"}}};
++
++        common_chat_parser_params params;
++        params.format = COMMON_CHAT_FORMAT_PEG_NATIVE;
++        params.parser = arena;
++
++        const std::string log_path = "/tmp/test-peg-missing-required.log";
++        std::remove(log_path.c_str());
++        common_log_set_file(common_log_main(), log_path.c_str());
++
++        bool threw = false;
++        try {
++            common_chat_peg_parse(arena, w_head + w_content1 + w_tail, false, params);
++        } catch (const std::exception &) {
++            threw = true;
++        }
++        common_log_flush(common_log_main());
++
++        std::ifstream f(log_path);
++        std::string   logged((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++        t.assert_true("missing required param still rejected", threw);
++        t.assert_true("rejection marker logged", logged.find("required param 'path' missing") != std::string::npos);
++    });
++
++    t.test("sidecar_survives_serialization", [&](testing & t) {
++        auto arena = build_arena();
++        arena.tool_required_args = {{"write", {"path", "content"}}};
++
++        common_peg_arena restored;
++        restored.load(arena.save());
++
++        t.assert_true("required sidecar survives save/load", restored.tool_required_args == arena.tool_required_args);
++    });
++
++    t.test("sidecar_populated_by_autoparser", [&](testing & t) {
++        // Production wiring: autoparser::build_parser must record each tool's
++        // required params on the arena it returns (a real TAG_WITH_TAGGED
++        // template — Hy3 shares the tagged builder with the Qwen-style syntax).
++        common_chat_template tmpl = load_template(t, "models/templates/tencent-Hy3.jinja");
++
++        struct autoparser analysis;
++        analysis.analyze_template(tmpl);
++        if (!t.assert_equal("tool mode tagged (precondition)", tool_format::TAG_WITH_TAGGED, analysis.tools.format.mode)) {
++            return;
++        }
++
++        ::autoparser::generation_params inputs;
++        inputs.tools            = tools;
++        inputs.tool_choice      = COMMON_CHAT_TOOL_CHOICE_AUTO;
++        inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
++
++        auto parser = analysis.build_parser(inputs);
++        t.assert_true("write required recorded", parser.tool_required_args.count("write") == 1);
++        if (parser.tool_required_args.count("write") == 1) {
++            t.assert_true("write required = {path, content}",
++                          parser.tool_required_args.at("write") == std::set<std::string>({"path", "content"}));
++        }
++        t.assert_true("read required recorded", parser.tool_required_args.count("read") == 1);
++        if (parser.tool_required_args.count("read") == 1) {
++            t.assert_true("read required = {path}",
++                          parser.tool_required_args.at("read") == std::set<std::string>({"path"}));
++        }
++    });
++}
+-- 
+2.53.0
+
